@@ -281,6 +281,8 @@ impl Default for StrategiesConfig {
 pub struct BtcArbConfig {
     /// Price feed symbols to trade, as the venue names them.
     pub symbols: Vec<String>,
+    /// Exact round duration to trade. None preserves all venue cadences.
+    pub round_interval_secs: Option<u32>,
     /// Model value minus cost and fee required to buy, in price units.
     pub min_edge: f64,
     pub order_usd: f64,
@@ -290,10 +292,21 @@ pub struct BtcArbConfig {
     pub vol_floor: f64,
 }
 
+impl BtcArbConfig {
+    /// Reject zero before connecting to a venue or starting the strategy.
+    pub fn ensure_round_interval(&self) -> Result<()> {
+        if self.round_interval_secs == Some(0) {
+            bail!("strategies.btc_arb.round_interval_secs must be a positive integer or null");
+        }
+        Ok(())
+    }
+}
+
 impl Default for BtcArbConfig {
     fn default() -> Self {
         Self {
             symbols: vec!["BTCUSDT".into()],
+            round_interval_secs: None,
             min_edge: 0.03,
             order_usd: 5.0,
             min_secs_left: 30,
@@ -588,6 +601,7 @@ impl AppConfig {
             })?;
         let mut cfg: AppConfig =
             serde_json::from_str(&raw).context("parsing config.json")?;
+        cfg.strategies.btc_arb.ensure_round_interval()?;
 
         // Credentials file is optional — without it we can still run in mock mode.
         if credentials_path.exists() {
@@ -644,4 +658,52 @@ impl AppConfig {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn btc_round_interval_defaults_to_all_and_accepts_positive_durations() {
+        let omitted: BtcArbConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.round_interval_secs, None);
+        assert_eq!(BtcArbConfig::default().round_interval_secs, None);
+        for interval in [None, Some(1), Some(300), Some(900), Some(3600), Some(u32::MAX)] {
+            let parsed: BtcArbConfig = serde_json::from_value(serde_json::json!({
+                "round_interval_secs": interval
+            })).unwrap();
+            assert_eq!(parsed.round_interval_secs, interval);
+            parsed.ensure_round_interval().unwrap();
+        }
+    }
+
+    #[test]
+    fn btc_round_interval_rejects_invalid_numbers_and_zero() {
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5),
+            serde_json::json!(4294967296_u64), serde_json::json!("300")] {
+            assert!(serde_json::from_value::<BtcArbConfig>(serde_json::json!({
+                "round_interval_secs": invalid
+            })).is_err());
+        }
+        let zero: BtcArbConfig = serde_json::from_str(r#"{"round_interval_secs":0}"#).unwrap();
+        assert!(zero.ensure_round_interval().unwrap_err().to_string().contains("round_interval_secs"));
+    }
+
+    #[test]
+    fn app_load_rejects_zero_before_reading_credentials() {
+        let mut public: serde_json::Value =
+            serde_json::from_str(include_str!("../config.json")).unwrap();
+        public["strategies"]["btc_arb"]["round_interval_secs"] = serde_json::json!(0);
+        let path = std::env::temp_dir().join(format!(
+            "btc-round-interval-zero-{}-{}.json", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, public.to_string()).unwrap();
+        // This is JSON, not credentials YAML: reaching credential parsing would
+        // produce a different error. No real credential file is opened.
+        let error = AppConfig::load(&path, &path).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("round_interval_secs"), "{error:#}");
+    }
 }
