@@ -12,6 +12,7 @@
 //! the feeds differ by enough to swamp a small edge.
 
 pub mod replay;
+pub mod history;
 
 use crate::bot::quoting::Known;
 use crate::bot::runtime::{drive, shares_for, Ctx, Strategy, TakeResult};
