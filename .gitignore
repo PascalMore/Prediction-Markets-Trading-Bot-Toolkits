@@ -13,3 +13,8 @@ config.yaml
 
 # Cargo.lock IS tracked: this is a binary crate, so the lockfile is what makes
 # release builds and `cargo build --locked` reproducible across machines and CI.
+
+# Predict.fun SDK local environment, downloaded wheels, and Python caches.
+/tools/predictfun/.venv/
+/tools/predictfun/.artifacts/
+/tools/predictfun/**/__pycache__/

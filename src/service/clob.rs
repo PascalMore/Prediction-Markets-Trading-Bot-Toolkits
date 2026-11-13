@@ -762,6 +762,9 @@ impl OrderVenue for ClobClient {
             taker_amount: signed.taker_amount.clone(),
             order_id: None,
             filled_shares: None,
+            signed_hash: None,
+            local_attempt_id: None,
+            execution: None,
         };
         if live {
             let resp = self.post_order(signed, planned.order_type).await?;

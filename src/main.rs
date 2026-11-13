@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "polymarket-toolkits")]
 #[command(about = "Multi-venue prediction-market trading toolkit.", long_about = None)]
 struct Cli {
@@ -26,6 +26,23 @@ struct Cli {
     /// Venue to trade. Overrides `venue` in the config.
     #[arg(long, value_enum)]
     venue: Option<VenueArg>,
+
+    /// Confirm this run's budget for one Predict.fun account:
+    /// `chain:address:mode`, with mode `eoa` or `predict-account`.
+    ///
+    /// It is a declaration that a human looked at the account's risk and
+    /// accepts the budget already configured. It overrides no health check and
+    /// carries no amount. Without it a live Predict.fun run stays blocked.
+    #[arg(long)]
+    predict_budget_confirmation: Option<String>,
+
+    /// An order hash the operator says they explained. Repeatable.
+    #[arg(long)]
+    predict_reconciled_order: Vec<String>,
+
+    /// Explicit read-only RPC endpoint. Never logged or read from configuration.
+    #[arg(long)]
+    predict_rpc_url: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -102,14 +119,56 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("polymarket_toolkits=info,info")),
+                .unwrap_or_else(|_| EnvFilter::new("polymarket_toolkits=info,info"))
+                .add_directive("reqwest=off".parse()?)
+                .add_directive("hyper=off".parse()?)
+                .add_directive("hyper_util=off".parse()?)
+                .add_directive("tower_http=off".parse()?),
         )
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
-    let mut cfg = AppConfig::load(&cli.config, &cli.credentials)
-        .context("loading configuration")?;
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(_) => anyhow::bail!("INVALID_INPUT/CLI_ARGUMENTS"),
+    };
+
+    // The confirmation is parsed before any credential is read, and it holds
+    // no secret: it is a declaration about one account.
+    let confirmation = match cli.predict_budget_confirmation.as_deref() {
+        Some(raw) => {
+            let mut confirmation =
+                predict_fun::account::parse_confirmation(raw).map_err(|e| anyhow::anyhow!(e))?;
+            confirmation.reconciled_orders = cli.predict_reconciled_order.clone();
+            Some(confirmation)
+        }
+        None => None,
+    };
+
+    let rpc_url = cli
+        .predict_rpc_url
+        .as_deref()
+        .map(predict_fun::account::parse_rpc_url)
+        .transpose()?;
+    for hash in &cli.predict_reconciled_order {
+        predict_fun::account::validate_order_hash(hash)?;
+    }
+    let run_context = predict_fun::account::RunContext {
+        confirmation,
+        reconciled_orders: cli.predict_reconciled_order,
+        rpc_url,
+    };
+
+    let mut cfg =
+        AppConfig::load(&cli.config, &cli.credentials).context("loading configuration")?;
     if let Some(venue) = cli.venue {
         cfg.venue = venue.into();
     }
@@ -129,6 +188,12 @@ async fn main() -> Result<()> {
         );
     }
 
+    if cfg.live_trading_allowed()
+        && cfg.venue == VenueId::PredictFun
+        && !matches!(cli.command, Some(Command::CheckVenue { .. }))
+    {
+        predict_fun::account::run_confirmation_slot().install_context(run_context);
+    }
     match cli.command {
         Some(Command::Run { bot: kind }) => bot::run(kind.into(), cfg).await,
         Some(Command::CheckVenue { sign_in }) => match cfg.venue {

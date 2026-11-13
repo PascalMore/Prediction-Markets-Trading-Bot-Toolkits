@@ -133,5 +133,36 @@ To go back to dry run, set the flags back and restart.
 ## If something goes wrong
 
 - **Orders rejected:** the venue's reason is in the log. Common causes are missing approvals, no balance, the wrong `signature_type`, or a restricted region.
-- **A fill looks wrong:** trust the venue's site over the bot's log. If the bot can't confirm a fill, it says so and assumes the planned size.
+- **A fill looks wrong:** stop adding risk and reconcile the original order. Unknown or incomplete fills must not be replaced with the planned size. The live-foundation changes are still awaiting independent verification; do not enable live trading based on compilation or this document alone.
 - **Found a bug in the live path?** [Open an issue](https://github.com/tarpboi/Prediction-Markets-Trading-Bot-Toolkits/issues) with the log, with keys removed. Reports from real runs are especially useful, as none exist yet.
+
+## Official SDK thin operations tool (live-foundation candidate)
+
+`tools/predictfun/cli.py` reuses **predict-sdk==0.0.22** for one explicit
+approval or redemption. It is not a second bot, wallet platform, daemon or
+Rust execution bridge. See [tool instructions](../tools/predictfun/README.md)
+for isolated hash-pinned dependencies, target-digest confirmation, finite
+ERC20 amounts versus full ERC1155 operator permissions, and the standard
+CT full-selected-index-set limitation.
+
+- `plan` is signer/provider-free; `check` is signer-free and needs explicit
+  RPC/account/market context. Missing or unreadable context is an error,
+  never a healthy zero. No default key, business config or `.env` is read.
+- `approve`/`redeem` require explicit execution, the matching plan digest,
+  target/route/read checks and a caller-supplied non-stdio signer descriptor.
+  This implementation cycle uses only fake signer/provider dependencies.
+- Signing and broadcasting remain inside the official SDK. Local dependency
+  wrappers retain the transaction hash before send and never replay a send;
+  receipt success alone is not proof of the expected allowance or payout.
+- Standard SDK redemption ignores the amount argument. The tool therefore
+  rejects partial standard redemptions, requires explicit full-set consent
+  and rereads the selected set balance before signing. This is not a protocol
+  amount cap or protection against concurrent external deposits.
+- Never run this tool concurrently with a bot on the same wallet. It has no
+  cross-process locking, durable journal or automatic restart recovery.
+
+**Status:** offline candidate implementation/self-tests only. Independent
+Verify/Review, real account checks, real signing, orders, on-chain approvals,
+redemptions and payout confirmation have not been performed or authorized.
+The legacy switch-on examples above are not permission to activate this
+candidate, nor evidence of profitability or live-trading readiness.

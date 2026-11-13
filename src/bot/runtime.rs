@@ -16,9 +16,10 @@ use crate::service::eligibility::{self, Eligibility};
 use crate::service::market_cache::MarketInfo;
 use crate::service::predict_fun::{PredictFunClient, PredictFunTrader};
 use crate::service::venue::{
-    LimitOrder, LimitVenue, MarketData, MarketQuery, MarketSource, OrderVenue, TradableMarket,
+    AttemptPhase, AttemptRecord, LimitOrder, LimitVenue, MarketData, MarketQuery, MarketSource,
+    OrderVenue, TradableMarket,
 };
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -26,6 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+pub mod live;
 
 /// The venue's minimum order value.
 pub const MIN_ORDER_USD: f64 = 1.0;
@@ -131,11 +134,13 @@ pub struct Summary {
     pub open_cost: f64,
     pub holdings: usize,
     pub resting: usize,
+    /// Displayed live fees already included in net cash/cost.
+    pub fees_in_cash: f64,
 }
 
 impl Summary {
     pub fn equity(&self) -> f64 {
-        self.realized - self.fees + self.unrealized
+        self.realized - self.fees + self.fees_in_cash + self.unrealized
     }
 }
 
@@ -152,6 +157,8 @@ struct State {
     fees: f64,
     halted: bool,
     next_paper_id: u64,
+    /// The live path's reservations, cumulative facts and tombstones.
+    live: live::LiveState,
 }
 
 impl State {
@@ -165,16 +172,49 @@ impl State {
         let resting: f64 = self
             .resting
             .values()
-            .filter(|r| r.market_id == market_id)
+            .filter(|r| {
+                r.market_id == market_id
+                    && !self.live.attempts.values().any(|handle| {
+                        handle.lock().identity.signed_hash.as_deref() == Some(r.hash.as_str())
+                    })
+            })
             .map(Resting::committed_usd)
             .sum();
-        held + resting + self.inherited.get(&market_id).copied().unwrap_or(0.0)
+        held + resting
+            + self.inherited.get(&market_id).copied().unwrap_or(0.0)
+            + self
+                .live
+                .reservations
+                .iter()
+                .filter(|(id, _)| {
+                    self.live
+                        .attempts
+                        .get(id)
+                        .is_some_and(|handle| handle.lock().identity.market_id == market_id)
+                })
+                .map(|(_, amount)| live::wei_to_shares(*amount))
+                .sum::<f64>()
     }
 
     fn total_exposure(&self) -> f64 {
         self.holdings.values().map(|h| h.cost).sum::<f64>()
-            + self.resting.values().map(Resting::committed_usd).sum::<f64>()
+            + self
+                .resting
+                .values()
+                .filter(|r| {
+                    !self.live.attempts.values().any(|handle| {
+                        handle.lock().identity.signed_hash.as_deref() == Some(r.hash.as_str())
+                    })
+                })
+                .map(Resting::committed_usd)
+                .sum::<f64>()
             + self.inherited.values().sum::<f64>()
+            + self
+                .live
+                .reservations
+                .values()
+                .map(|amount| live::wei_to_shares(*amount))
+                .sum::<f64>()
     }
 
     fn apply_fill(
@@ -189,13 +229,16 @@ impl State {
         self.fees += fee;
         match side {
             Side::Buy => {
-                let holding = self.holdings.entry(token.to_string()).or_insert_with(|| Holding {
-                    market_id,
-                    token: token.to_string(),
-                    shares: 0.0,
-                    cost: 0.0,
-                    opened_at: Utc::now(),
-                });
+                let holding = self
+                    .holdings
+                    .entry(token.to_string())
+                    .or_insert_with(|| Holding {
+                        market_id,
+                        token: token.to_string(),
+                        shares: 0.0,
+                        cost: 0.0,
+                        opened_at: Utc::now(),
+                    });
                 holding.shares += shares;
                 holding.cost += shares * price;
             }
@@ -219,7 +262,11 @@ impl State {
         let mut unrealized = 0.0;
         let mut open_cost = 0.0;
         for h in self.holdings.values() {
-            let mark = self.marks.get(&h.token).copied().unwrap_or_else(|| h.avg_price());
+            let mark = self
+                .marks
+                .get(&h.token)
+                .copied()
+                .unwrap_or_else(|| h.avg_price());
             unrealized += h.shares * mark - h.cost;
             open_cost += h.cost;
         }
@@ -230,6 +277,7 @@ impl State {
             open_cost,
             holdings: self.holdings.len(),
             resting: self.resting.len(),
+            fees_in_cash: self.live.fees_in_cash,
         }
     }
 }
@@ -260,6 +308,10 @@ pub struct Broker {
     taker: Option<Arc<dyn OrderVenue>>,
     limit: Option<Arc<dyn LimitVenue>>,
     state: Mutex<State>,
+    /// The account gate. `None` for venues without one.
+    gate: Option<Arc<crate::service::predict_fun::account::AccountGate>>,
+    /// The identity the gate is keyed on.
+    identity: Option<crate::service::venue::AccountIdentity>,
 }
 
 impl Broker {
@@ -278,7 +330,27 @@ impl Broker {
             taker,
             limit,
             state: Mutex::new(State::default()),
+            gate: None,
+            identity: None,
         })
+    }
+
+    /// Attach the account gate. A live Predict.fun run needs one: without it,
+    /// an unconfirmed order wouldn't stop the next one.
+    pub fn with_account_gate(
+        mut self,
+        gate: Arc<crate::service::predict_fun::account::AccountGate>,
+        identity: crate::service::venue::AccountIdentity,
+    ) -> Self {
+        self.gate = Some(gate);
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Why new orders are refused on this account, if they are.
+    pub fn account_block(&self) -> Option<String> {
+        let (gate, identity) = (self.gate.as_ref()?, self.identity.as_ref()?);
+        gate.block_reason(identity).map(|reason| reason.token())
     }
 
     pub fn is_live(&self) -> bool {
@@ -328,6 +400,14 @@ impl Broker {
         let Some(limit) = self.limit.as_ref() else {
             bail!("no venue to read positions from");
         };
+        if self.live
+            && self
+                .taker
+                .as_ref()
+                .is_some_and(|venue| venue.id() == VenueId::PredictFun)
+        {
+            return live::seed_predict(self).await;
+        }
         let positions = limit.positions().await?;
         let mut state = self.state.lock();
         for pos in &positions {
@@ -394,6 +474,23 @@ impl Broker {
             }
         };
 
+        // Re-read a seeded Predict account before considering fresh risk.
+        // This can heal a prior read failure, never an unresolved attempt.
+        if self.live
+            && self
+                .taker
+                .as_ref()
+                .is_some_and(|venue| venue.id() == VenueId::PredictFun)
+        {
+            live::check_runtime_account(self, false).await?;
+        }
+        // The account gate: an unconfirmed order, a failed read or an
+        // unconfirmed budget stops every new order on this account.
+        if let Some(reason) = self.account_block() {
+            warn!(reason = %reason, "the account is blocked; no new order is sent");
+            return Ok(TakeResult::Blocked(Blocked::Halted));
+        }
+
         let book = token_book(market, token, yes_book);
         let levels = match side {
             Side::Buy => &book.asks,
@@ -403,49 +500,197 @@ impl Broker {
             return Ok(TakeResult::Blocked(Blocked::ThinBook));
         };
 
-        let (filled, price) = match self.taker.as_ref() {
-            Some(venue) => {
-                let planned = PlannedOrder {
-                    venue: venue.id(),
-                    token_id: token.to_string(),
+        // Paper accounting must also run when no wallet is configured. Other
+        // venues retain their existing receipt and fee semantics.
+        if !self.live
+            || self
+                .taker
+                .as_ref()
+                .is_some_and(|v| v.id() != VenueId::PredictFun)
+        {
+            let (filled, price) = match self.taker.as_ref() {
+                Some(venue) => {
+                    let planned = PlannedOrder {
+                        venue: venue.id(),
+                        token_id: token.to_string(),
+                        side,
+                        shares,
+                        limit_price: limit,
+                        usd_notional: shares * limit,
+                        order_type: OrderType::Fak,
+                        source_trade_hash: None,
+                    };
+                    let ticket = venue.place(&planned, 0, self.live).await?;
+                    if self.live {
+                        (ticket.filled_shares.unwrap_or(shares), limit)
+                    } else {
+                        (shares, avg_price)
+                    }
+                }
+                None => (shares, avg_price),
+            };
+            if filled > EPS {
+                self.state.lock().apply_fill(
+                    market.id,
+                    token,
                     side,
-                    shares,
-                    limit_price: limit,
-                    usd_notional: shares * limit,
-                    order_type: OrderType::Fak,
-                    source_trade_hash: None,
-                };
-                let ticket = venue.place(&planned, 0, self.live).await?;
-                if self.live {
-                    // The venue reports size, not price. The limit is the worst
-                    // the signed order allows, so costs aren't understated.
-                    (ticket.filled_shares.unwrap_or(shares), limit)
-                } else {
-                    (shares, avg_price)
+                    filled,
+                    price,
+                    market.taker_fee(price) * filled,
+                );
+            }
+            return Ok(TakeResult::Filled {
+                shares: filled.max(0.0),
+                price,
+            });
+        }
+        let Some(venue) = self.taker.as_ref() else {
+            bail!("live trading needs a configured wallet");
+        };
+
+        // The intent's key. Once an order of this kind may have reached the
+        // venue, it is only ever looked up again, never signed a second time.
+        let intent_key = live::taker_key(market.id, token, side);
+
+        let planned = PlannedOrder {
+            venue: venue.id(),
+            token_id: token.to_string(),
+            side,
+            shares,
+            limit_price: limit,
+            usd_notional: shares * limit,
+            order_type: OrderType::Fak,
+            source_trade_hash: None,
+        };
+
+        let reservation = venue.reservation_atoms(&planned)?;
+        // Reserve before anything can be sent. The lock is released before the
+        // venue is called: no lock is held across an await.
+        let (handle, attempt_id) = {
+            let mut state = self.state.lock();
+            if let Some(previous) = live::tombstoned(&state.live, &intent_key) {
+                warn!(
+                    market = market.id,
+                    token,
+                    attempt = previous,
+                    "this intent already reached the venue; looking it up instead of signing again"
+                );
+                return Ok(TakeResult::Blocked(Blocked::Halted));
+            }
+            if state
+                .live
+                .attempts
+                .values()
+                .any(|handle| handle.lock().phase != AttemptPhase::Closed)
+            {
+                return Ok(TakeResult::Blocked(Blocked::Halted));
+            }
+            if side == Side::Buy {
+                if let Some(blocked) =
+                    self.check_entry(&state, market.id, live::wei_to_shares(reservation))
+                {
+                    return Ok(TakeResult::Blocked(blocked));
                 }
             }
-            None => (shares, avg_price),
+            let attempt_id = live::next_attempt_id(&mut state.live);
+            let record = AttemptRecord {
+                identity: crate::service::venue::OrderIdentity {
+                    local_attempt_id: attempt_id,
+                    signed_hash: None,
+                    venue_order_id: None,
+                    market_id: market.id,
+                    token_id: token.to_string(),
+                    side,
+                    account: self
+                        .identity
+                        .clone()
+                        .ok_or_else(|| anyhow!("ACCOUNT_MISMATCH:MISSING_BROKER_IDENTITY"))?,
+                },
+                request_gross_atoms: alloy_primitives::U256::from((shares * 1e18) as u128),
+                // The worst case the order can cost: the shares at the limit.
+                r0: reservation,
+                reserved_sell: if side == Side::Sell {
+                    alloy_primitives::U256::from((shares * 1e18) as u128)
+                } else {
+                    alloy_primitives::U256::ZERO
+                },
+                phase: AttemptPhase::Prepared,
+                submission: crate::service::venue::Submission::NotSubmitted,
+                last_reason: None,
+            };
+            let handle = live::reserve_attempt(&mut state.live, record);
+            live::tombstone(&mut state.live, &intent_key, attempt_id);
+            (handle, attempt_id)
         };
-        if filled <= EPS {
-            warn!(market = market.id, token, "order accepted but nothing filled");
-            return Ok(TakeResult::Filled { shares: 0.0, price });
+
+        let ticket = match venue
+            .place_tracked(&planned, 0, self.live, handle.clone())
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                live::release_not_submitted(self, &handle, &intent_key);
+                return Err(error);
+            }
+        };
+
+        // A live venue reports its own facts. They decide what the fill was.
+        if let Some(snapshot) = ticket.execution.clone() {
+            let mut state = self.state.lock();
+            let delta = match live::apply_snapshot(&mut state, &snapshot) {
+                Ok(delta) => delta,
+                Err(reason) => {
+                    handle.lock().last_reason = Some(reason.clone());
+                    if let (Some(gate), Some(identity)) = (&self.gate, &self.identity) {
+                        gate.record_reconciliation(identity, &reason);
+                    }
+                    return Ok(TakeResult::Blocked(Blocked::Halted));
+                }
+            };
+            live::tombstone(&mut state.live, &intent_key, attempt_id);
+            if handle.lock().phase == AttemptPhase::Closed {
+                if let (Some(gate), Some(identity)) = (&self.gate, &self.identity) {
+                    gate.resolve(identity, attempt_id, AttemptPhase::Closed);
+                }
+            }
+            drop(state);
+            let mut result = live::take_result(&snapshot, limit);
+            if let TakeResult::Filled { shares, price } = &mut result {
+                *shares = live::wei_to_shares(delta.gross_q);
+                if !delta.gross_q.is_zero() {
+                    *price =
+                        live::wei_to_shares(delta.gross_cash) / live::wei_to_shares(delta.gross_q);
+                }
+            }
+            return Ok(result);
         }
 
+        if !self.live {
+            let mut state = self.state.lock();
+            state.apply_fill(
+                market.id,
+                token,
+                side,
+                shares,
+                avg_price,
+                market.taker_fee(avg_price) * shares,
+            );
+            return Ok(TakeResult::Filled {
+                shares,
+                price: avg_price,
+            });
+        }
+
+        // A live venue without facts is an unknown fill, not a planned one.
         let mut state = self.state.lock();
-        state.apply_fill(market.id, token, side, filled, price, market.taker_fee(price) * filled);
-        info!(
+        live::tombstone(&mut state.live, &intent_key, attempt_id);
+        warn!(
             market = market.id,
-            ?side,
-            shares = filled,
-            price,
-            live = self.live,
-            realized = state.realized,
-            "taker fill"
+            token,
+            attempt = attempt_id,
+            "venue reported no execution facts; the fill stays unknown"
         );
-        Ok(TakeResult::Filled {
-            shares: filled,
-            price,
-        })
+        Ok(TakeResult::Blocked(Blocked::Halted))
     }
 
     /// Rest a limit order. Returns its id, or why it wasn't sent.
@@ -498,6 +743,14 @@ impl Broker {
             return Ok(Err(Blocked::WouldCross));
         }
 
+        if self.live
+            && self
+                .taker
+                .as_ref()
+                .is_some_and(|venue| venue.id() == VenueId::PredictFun)
+        {
+            live::check_runtime_account(self, true).await?;
+        }
         let order = LimitOrder {
             market_id: market.id,
             token_id: token.to_string(),
@@ -507,8 +760,121 @@ impl Broker {
             ttl_secs,
             post_only: true,
         };
+        let predict = self.live
+            && self
+                .taker
+                .as_ref()
+                .is_some_and(|venue| venue.id() == VenueId::PredictFun);
+        let reservation = if predict {
+            if self.account_block().is_some() {
+                return Ok(Err(Blocked::Halted));
+            }
+            self.taker
+                .as_ref()
+                .unwrap()
+                .reservation_atoms(&PlannedOrder {
+                    venue: VenueId::PredictFun,
+                    token_id: token.to_string(),
+                    side,
+                    shares,
+                    limit_price: price,
+                    usd_notional: shares * price,
+                    order_type: OrderType::Gtd,
+                    source_trade_hash: None,
+                })?
+        } else {
+            alloy_primitives::U256::ZERO
+        };
         let posted = match self.limit.as_ref() {
-            Some(venue) => Some(venue.post_limit(&order, self.live).await?),
+            Some(venue) => {
+                if !predict {
+                    Some(venue.post_limit(&order, self.live).await?)
+                } else {
+                    // The intent's key: a resting order that may have reached the
+                    // venue is only looked up again, never signed a second time.
+                    let intent_key = live::taker_key(market.id, token, side);
+                    let venue_id = self
+                        .taker
+                        .as_ref()
+                        .map(|taker| taker.id())
+                        .unwrap_or(VenueId::Polymarket);
+                    let (handle, attempt_id) = {
+                        let mut state = self.state.lock();
+                        if live::tombstoned(&state.live, &intent_key).is_some() {
+                            return Ok(Err(Blocked::Halted));
+                        }
+                        if state
+                            .live
+                            .attempts
+                            .values()
+                            .any(|handle| handle.lock().phase != AttemptPhase::Closed)
+                        {
+                            return Ok(Err(Blocked::Halted));
+                        }
+                        if side == Side::Buy {
+                            if let Some(blocked) = self.check_entry(
+                                &state,
+                                market.id,
+                                live::wei_to_shares(reservation),
+                            ) {
+                                return Ok(Err(blocked));
+                            }
+                        }
+                        let attempt_id = live::next_attempt_id(&mut state.live);
+                        let record = AttemptRecord {
+                            identity: crate::service::venue::OrderIdentity {
+                                local_attempt_id: attempt_id,
+                                signed_hash: None,
+                                venue_order_id: None,
+                                market_id: market.id,
+                                token_id: token.to_string(),
+                                side,
+                                account: self.identity.clone().unwrap_or(
+                                    crate::service::venue::AccountIdentity {
+                                        chain_id: 0,
+                                        trading_address: String::new(),
+                                        mode: crate::service::venue::AccountMode::Eoa,
+                                        signer_address: String::new(),
+                                        venue: venue_id,
+                                    },
+                                ),
+                            },
+                            request_gross_atoms: alloy_primitives::U256::from(
+                                (shares * 1e18) as u128,
+                            ),
+                            r0: reservation,
+                            reserved_sell: if side == Side::Sell {
+                                alloy_primitives::U256::from((shares * 1e18) as u128)
+                            } else {
+                                alloy_primitives::U256::ZERO
+                            },
+                            phase: AttemptPhase::Prepared,
+                            submission: crate::service::venue::Submission::NotSubmitted,
+                            last_reason: None,
+                        };
+                        let handle = live::reserve_attempt(&mut state.live, record);
+                        if self.live {
+                            live::tombstone(&mut state.live, &intent_key, attempt_id);
+                        }
+                        (handle, attempt_id)
+                    };
+                    let posted = match venue
+                        .post_limit_tracked(&order, self.live, handle.clone())
+                        .await
+                    {
+                        Ok(posted) => posted,
+                        Err(error) => {
+                            live::release_not_submitted(self, &handle, &intent_key);
+                            return Err(error);
+                        }
+                    };
+                    if self.live {
+                        let mut state = self.state.lock();
+                        live::tombstone(&mut state.live, &intent_key, attempt_id);
+                    }
+                    Some(posted)
+                }
+            }
             None => None,
         };
 
@@ -535,7 +901,14 @@ impl Broker {
                 removing: false,
             },
         );
-        debug!(market = market.id, ?side, shares, price, id, "quote resting");
+        debug!(
+            market = market.id,
+            ?side,
+            shares,
+            price,
+            id,
+            "quote resting"
+        );
         Ok(Ok(id))
     }
 
@@ -606,10 +979,18 @@ impl Broker {
         let now = Utc::now();
         let mut done = Vec::new();
         for order in state.resting.values().filter(|r| r.market_id == market.id) {
-            let book = if market.is_yes(&order.token) { yes_book } else { &no_book };
+            let book = if market.is_yes(&order.token) {
+                yes_book
+            } else {
+                &no_book
+            };
             let traded_through = match order.side {
-                Side::Buy => book.best_ask().is_some_and(|a| a.price <= order.price + EPS),
-                Side::Sell => book.best_bid().is_some_and(|b| b.price >= order.price - EPS),
+                Side::Buy => book
+                    .best_ask()
+                    .is_some_and(|a| a.price <= order.price + EPS),
+                Side::Sell => book
+                    .best_bid()
+                    .is_some_and(|b| b.price >= order.price - EPS),
             };
             if traded_through {
                 done.push((order.id.clone(), true));
@@ -659,6 +1040,14 @@ impl Broker {
 
     /// Live runs: read each working order's state and book what filled.
     pub async fn sync_live(&self) -> Result<()> {
+        if self.live
+            && self
+                .taker
+                .as_ref()
+                .is_some_and(|venue| venue.id() == VenueId::PredictFun)
+        {
+            return live::sync_predict(self).await;
+        }
         if !self.live {
             return Ok(());
         }
@@ -671,7 +1060,14 @@ impl Broker {
             let mut state = self.state.lock();
             let new_fill = venue_state.filled_shares - order.filled;
             if new_fill > EPS {
-                state.apply_fill(order.market_id, &order.token, order.side, new_fill, order.price, 0.0);
+                state.apply_fill(
+                    order.market_id,
+                    &order.token,
+                    order.side,
+                    new_fill,
+                    order.price,
+                    0.0,
+                );
                 info!(
                     market = order.market_id,
                     side = ?order.side,
@@ -721,7 +1117,11 @@ impl Broker {
             let Some(holding) = state.holdings.remove(&token) else {
                 continue;
             };
-            let payout = if market.is_yes(&token) { payout_yes } else { 1.0 - payout_yes };
+            let payout = if market.is_yes(&token) {
+                payout_yes
+            } else {
+                1.0 - payout_yes
+            };
             let pnl = holding.shares * payout - holding.cost;
             state.realized += pnl;
             info!(
@@ -807,9 +1207,9 @@ pub async fn reconcile(
     for quote in place {
         // An order inside the removal lock is still live, so quoting beside it
         // would double the size on that side.
-        let locked = working.iter().any(|o| {
-            rejected.contains(&o.id) && o.token == quote.token && o.side == quote.side
-        });
+        let locked = working
+            .iter()
+            .any(|o| rejected.contains(&o.id) && o.token == quote.token && o.side == quote.side);
         if locked {
             continue;
         }
@@ -826,7 +1226,12 @@ pub async fn reconcile(
             )
             .await?;
         if let Err(blocked) = sent {
-            debug!(market = market.id, ?blocked, price = quote.price, "quote not sent");
+            debug!(
+                market = market.id,
+                ?blocked,
+                price = quote.price,
+                "quote not sent"
+            );
         }
     }
     Ok(())
@@ -863,8 +1268,20 @@ impl Ctx {
             Err(e) => return Err(e),
         };
         let taker = trader.clone().map(|t| t as Arc<dyn OrderVenue>);
-        let limit = trader.map(|t| t as Arc<dyn LimitVenue>);
-        let broker = Broker::new(cfg.strategies.limits.clone(), live, taker, limit)?;
+        let limit = trader.clone().map(|t| t as Arc<dyn LimitVenue>);
+        let mut broker = Broker::new(cfg.strategies.limits.clone(), live, taker, limit)?;
+        if let Some(trader) = trader.as_ref() {
+            // A live run needs the operator's confirmation of this run's
+            // budget, and the gate that stops new orders without one.
+            if live && !trader.claim_run_confirmation() {
+                warn!(
+                    address = %trader.identity().trading_address,
+                    "no budget confirmation for this account: new orders stay blocked. Pass \
+                     --predict-budget-confirmation <chain:address:mode>."
+                );
+            }
+            broker = broker.with_account_gate(Arc::clone(&trader.gate), trader.identity());
+        }
         Ok(Self {
             cfg,
             data: client.clone(),
@@ -959,8 +1376,12 @@ pub fn pick_quotable(
         .filter_map(|m| {
             let book = books.get(&m.id)?;
             let spread = book.spread()?;
-            (spread >= min_spread - EPS && spread <= max_spread + EPS)
-                .then(|| (m.id, book.depth_usd(Side::Buy, 3) + book.depth_usd(Side::Sell, 3)))
+            (spread >= min_spread - EPS && spread <= max_spread + EPS).then(|| {
+                (
+                    m.id,
+                    book.depth_usd(Side::Buy, 3) + book.depth_usd(Side::Sell, 3),
+                )
+            })
         })
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -972,7 +1393,9 @@ pub fn is_quotable(market: &TradableMarket, min_secs_left: i64, now: DateTime<Ut
     market.open
         && !market.contested
         && market.payout_yes.is_none()
-        && market.secs_left(now).is_none_or(|left| left >= min_secs_left)
+        && market
+            .secs_left(now)
+            .is_none_or(|left| left >= min_secs_left)
 }
 
 #[async_trait]
@@ -1122,7 +1545,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::service::venue::{HeldPosition, OrderTicket, PostedOrder, RemoveResult, RestingState};
+    use crate::service::venue::{
+        HeldPosition, OrderTicket, PostedOrder, RemoveResult, RestingState,
+    };
 
     fn limits() -> StrategyLimits {
         StrategyLimits {
@@ -1152,7 +1577,8 @@ mod tests {
     #[async_trait]
     impl OrderVenue for FakeVenue {
         fn id(&self) -> VenueId {
-            VenueId::PredictFun
+            // Legacy receipt semantics are retained for non-Predict venues.
+            VenueId::Polymarket
         }
         async fn place(&self, p: &PlannedOrder, _: u64, _: bool) -> Result<OrderTicket> {
             self.placed.lock().push(p.clone());
@@ -1162,6 +1588,9 @@ mod tests {
                 taker_amount: "0".into(),
                 order_id: Some("taken".into()),
                 filled_shares: *self.fill.lock(),
+                signed_hash: None,
+                local_attempt_id: None,
+                execution: None,
             })
         }
     }
@@ -1174,6 +1603,8 @@ mod tests {
             Ok(PostedOrder {
                 order_hash: format!("hash-{}", posted.len()),
                 order_id: Some(format!("order-{}", posted.len())),
+                local_attempt_id: None,
+                execution: None,
             })
         }
         async fn remove(&self, ids: &[String]) -> Result<RemoveResult> {
@@ -1181,10 +1612,16 @@ mod tests {
             Ok(self.remove_result.lock().clone())
         }
         async fn order_state(&self, hash: &str) -> Result<RestingState> {
-            Ok(self.states.lock().get(hash).cloned().unwrap_or(RestingState {
-                open: true,
-                filled_shares: 0.0,
-            }))
+            Ok(self
+                .states
+                .lock()
+                .get(hash)
+                .cloned()
+                .unwrap_or(RestingState {
+                    open: true,
+                    filled_shares: 0.0,
+                    execution: None,
+                }))
         }
         async fn positions(&self) -> Result<Vec<HeldPosition>> {
             Ok(self.held.lock().clone())
@@ -1222,7 +1659,13 @@ mod tests {
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 2.0), (0.6, 100.0)]);
         let r = b.take(&m, "yes-1", Side::Buy, 4.0, 0.6, &bk).await.unwrap();
-        assert_eq!(r, TakeResult::Filled { shares: 4.0, price: 0.55 });
+        assert_eq!(
+            r,
+            TakeResult::Filled {
+                shares: 4.0,
+                price: 0.55
+            }
+        );
         let s = b.summary();
         assert!((s.open_cost - 2.2).abs() < 1e-9);
         assert!((s.fees - 4.0 * 0.02 * 0.45).abs() < 1e-9);
@@ -1257,7 +1700,13 @@ mod tests {
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
         // A Yes bid at 0.40 is a No ask at 0.60.
         let r = b.take(&m, "no-1", Side::Buy, 5.0, 0.6, &bk).await.unwrap();
-        assert_eq!(r, TakeResult::Filled { shares: 5.0, price: 0.6 });
+        assert_eq!(
+            r,
+            TakeResult::Filled {
+                shares: 5.0,
+                price: 0.6
+            }
+        );
     }
 
     #[tokio::test]
@@ -1267,7 +1716,10 @@ mod tests {
         let m = market(1);
         let bk = book(&[(0.4, 1000.0)], &[(0.5, 1000.0)]);
 
-        let r = b.take(&m, "yes-1", Side::Buy, 21.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&m, "yes-1", Side::Buy, 21.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::OrderCap));
         let r = b.take(&m, "yes-1", Side::Buy, 1.0, 0.5, &bk).await.unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::BelowMinimum));
@@ -1275,19 +1727,31 @@ mod tests {
 
         // Three 10 USD buys against a 20 USD market cap: the third is refused.
         for _ in 0..2 {
-            let r = b.take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk).await.unwrap();
+            let r = b
+                .take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk)
+                .await
+                .unwrap();
             assert!(matches!(r, TakeResult::Filled { .. }));
         }
-        let r = b.take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::MarketCap));
         assert_eq!(venue.placed.lock().len(), 2);
 
         // A second market still fits the 30 USD total, then the total stops it.
         let m2 = market(2);
-        let r = b.take(&m2, "yes-2", Side::Buy, 20.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&m2, "yes-2", Side::Buy, 20.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert!(matches!(r, TakeResult::Filled { .. }));
         let m3 = market(3);
-        let r = b.take(&m3, "yes-3", Side::Buy, 2.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&m3, "yes-3", Side::Buy, 2.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::TotalCap));
     }
 
@@ -1297,10 +1761,16 @@ mod tests {
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.6, 100.0)]);
         for _ in 0..2 {
-            let r = b.rest(&m, "yes-1", Side::Buy, 20.0, 0.5, 60, &bk).await.unwrap();
+            let r = b
+                .rest(&m, "yes-1", Side::Buy, 20.0, 0.5, 60, &bk)
+                .await
+                .unwrap();
             assert!(r.is_ok());
         }
-        let r = b.rest(&m, "yes-1", Side::Buy, 20.0, 0.5, 60, &bk).await.unwrap();
+        let r = b
+            .rest(&m, "yes-1", Side::Buy, 20.0, 0.5, 60, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, Err(Blocked::MarketCap));
     }
 
@@ -1309,12 +1779,26 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.5, 100.0)], &[(0.6, 100.0)]);
-        let r = b.take(&m, "yes-1", Side::Sell, 5.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&m, "yes-1", Side::Sell, 5.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::NothingHeld));
 
-        b.take(&m, "yes-1", Side::Buy, 10.0, 0.6, &bk).await.unwrap();
-        let r = b.take(&m, "yes-1", Side::Sell, 99.0, 0.5, &bk).await.unwrap();
-        assert_eq!(r, TakeResult::Filled { shares: 10.0, price: 0.5 });
+        b.take(&m, "yes-1", Side::Buy, 10.0, 0.6, &bk)
+            .await
+            .unwrap();
+        let r = b
+            .take(&m, "yes-1", Side::Sell, 99.0, 0.5, &bk)
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            TakeResult::Filled {
+                shares: 10.0,
+                price: 0.5
+            }
+        );
         assert!(b.holding("yes-1").is_none());
         assert!((b.summary().realized - (-1.0)).abs() < 1e-9);
     }
@@ -1325,9 +1809,15 @@ mod tests {
         let m = market(1);
         let bk = book(&[(0.5, 100.0)], &[(0.6, 100.0)]);
         b.take(&m, "yes-1", Side::Buy, 8.0, 0.6, &bk).await.unwrap();
-        let first = b.rest(&m, "yes-1", Side::Sell, 5.0, 0.59, 60, &bk).await.unwrap();
+        let first = b
+            .rest(&m, "yes-1", Side::Sell, 5.0, 0.59, 60, &bk)
+            .await
+            .unwrap();
         assert!(first.is_ok());
-        let second = b.rest(&m, "yes-1", Side::Sell, 5.0, 0.59, 60, &bk).await.unwrap();
+        let second = b
+            .rest(&m, "yes-1", Side::Sell, 5.0, 0.59, 60, &bk)
+            .await
+            .unwrap();
         assert_eq!(second, Err(Blocked::NothingHeld));
     }
 
@@ -1336,10 +1826,16 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        let r = b.rest(&m, "yes-1", Side::Buy, 10.0, 0.5, 60, &bk).await.unwrap();
+        let r = b
+            .rest(&m, "yes-1", Side::Buy, 10.0, 0.5, 60, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, Err(Blocked::WouldCross));
         // Buying No at 0.61 is selling Yes at 0.39, through the 0.40 bid.
-        let r = b.rest(&m, "no-1", Side::Buy, 10.0, 0.61, 60, &bk).await.unwrap();
+        let r = b
+            .rest(&m, "no-1", Side::Buy, 10.0, 0.61, 60, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, Err(Blocked::WouldCross));
     }
 
@@ -1348,7 +1844,10 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk).await.unwrap().unwrap();
+        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk)
+            .await
+            .unwrap()
+            .unwrap();
 
         b.observe(&m, &book(&[(0.44, 100.0)], &[(0.46, 100.0)]));
         assert!(b.holding("yes-1").is_none());
@@ -1366,7 +1865,10 @@ mod tests {
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
         // No bid at 0.55 is a Yes ask at 0.45: filled when Yes bids reach 0.45.
-        b.rest(&m, "no-1", Side::Buy, 10.0, 0.55, 60, &bk).await.unwrap().unwrap();
+        b.rest(&m, "no-1", Side::Buy, 10.0, 0.55, 60, &bk)
+            .await
+            .unwrap()
+            .unwrap();
         b.observe(&m, &book(&[(0.44, 100.0)], &[(0.5, 100.0)]));
         assert!(b.holding("no-1").is_none());
         b.observe(&m, &book(&[(0.45, 100.0)], &[(0.5, 100.0)]));
@@ -1378,7 +1880,10 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 0, &bk).await.unwrap().unwrap();
+        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 0, &bk)
+            .await
+            .unwrap()
+            .unwrap();
         b.observe(&m, &bk);
         assert!(b.resting_in(1).is_empty());
         assert!(b.holding("yes-1").is_none());
@@ -1389,15 +1894,23 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.5, 1000.0)], &[(0.5, 1000.0)]);
-        b.take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk).await.unwrap();
+        b.take(&m, "yes-1", Side::Buy, 20.0, 0.5, &bk)
+            .await
+            .unwrap();
 
         b.observe(&m, &book(&[(0.2, 1000.0)], &[(0.2, 1000.0)]));
         assert!(b.is_halted());
 
-        let r = b.take(&market(2), "yes-2", Side::Buy, 10.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&market(2), "yes-2", Side::Buy, 10.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::Halted));
         let exit = book(&[(0.2, 1000.0)], &[(0.3, 1000.0)]);
-        let r = b.take(&m, "yes-1", Side::Sell, 20.0, 0.2, &exit).await.unwrap();
+        let r = b
+            .take(&m, "yes-1", Side::Sell, 20.0, 0.2, &exit)
+            .await
+            .unwrap();
         assert!(matches!(r, TakeResult::Filled { .. }));
     }
 
@@ -1406,7 +1919,9 @@ mod tests {
         let b = paper();
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        b.take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk).await.unwrap();
+        b.take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk)
+            .await
+            .unwrap();
         b.settle(&m, 1.0);
         assert!(b.holding("yes-1").is_none());
         assert!((b.summary().realized - 5.0).abs() < 1e-9);
@@ -1423,13 +1938,31 @@ mod tests {
         let b = live(&venue);
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        let r = b.take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk).await.unwrap();
-        assert_eq!(r, TakeResult::Filled { shares: 3.0, price: 0.5 });
+        let r = b
+            .take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk)
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            TakeResult::Filled {
+                shares: 3.0,
+                price: 0.5
+            }
+        );
         assert!((b.holding("yes-1").unwrap().shares - 3.0).abs() < 1e-9);
 
         *venue.fill.lock() = Some(0.0);
-        let r = b.take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk).await.unwrap();
-        assert_eq!(r, TakeResult::Filled { shares: 0.0, price: 0.5 });
+        let r = b
+            .take(&m, "yes-1", Side::Buy, 10.0, 0.5, &bk)
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            TakeResult::Filled {
+                shares: 0.0,
+                price: 0.5
+            }
+        );
         assert!((b.holding("yes-1").unwrap().shares - 3.0).abs() < 1e-9);
     }
 
@@ -1439,11 +1972,18 @@ mod tests {
         let b = live(&venue);
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk).await.unwrap().unwrap();
+        b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk)
+            .await
+            .unwrap()
+            .unwrap();
 
         venue.states.lock().insert(
             "hash-1".into(),
-            RestingState { open: true, filled_shares: 4.0 },
+            RestingState {
+                open: true,
+                filled_shares: 4.0,
+                execution: None,
+            },
         );
         b.sync_live().await.unwrap();
         b.sync_live().await.unwrap();
@@ -1452,7 +1992,11 @@ mod tests {
 
         venue.states.lock().insert(
             "hash-1".into(),
-            RestingState { open: false, filled_shares: 10.0 },
+            RestingState {
+                open: false,
+                filled_shares: 10.0,
+                execution: None,
+            },
         );
         b.sync_live().await.unwrap();
         assert!((b.holding("yes-1").unwrap().shares - 10.0).abs() < 1e-9);
@@ -1466,18 +2010,30 @@ mod tests {
         let b = live(&venue);
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        let id = b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk).await.unwrap().unwrap();
+        let id = b
+            .rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk)
+            .await
+            .unwrap()
+            .unwrap();
 
         venue.remove_result.lock().removed = vec![id.clone()];
         let rejected = b.cancel(&[id.clone()]).await.unwrap();
         assert!(rejected.is_empty());
         assert!(b.resting_in(1).is_empty(), "not offered to the strategy");
-        assert_eq!(b.summary().resting, 1, "still counted until the venue closes it");
+        assert_eq!(
+            b.summary().resting,
+            1,
+            "still counted until the venue closes it"
+        );
 
         // A fill landing after removal must still be booked.
         venue.states.lock().insert(
             "hash-1".into(),
-            RestingState { open: false, filled_shares: 2.0 },
+            RestingState {
+                open: false,
+                filled_shares: 2.0,
+                execution: None,
+            },
         );
         b.sync_live().await.unwrap();
         assert!((b.holding("yes-1").unwrap().shares - 2.0).abs() < 1e-9);
@@ -1490,7 +2046,11 @@ mod tests {
         let b = live(&venue);
         let m = market(1);
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
-        let id = b.rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk).await.unwrap().unwrap();
+        let id = b
+            .rest(&m, "yes-1", Side::Buy, 10.0, 0.45, 60, &bk)
+            .await
+            .unwrap()
+            .unwrap();
 
         venue.remove_result.lock().rejected = vec![id.clone()];
         let rejected = b.cancel(&[id.clone()]).await.unwrap();
@@ -1511,22 +2071,41 @@ mod tests {
         b.seed_from_venue().await.unwrap();
         let bk = book(&[(0.4, 100.0)], &[(0.5, 100.0)]);
 
-        let r = b.take(&market(1), "yes-1", Side::Buy, 4.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&market(1), "yes-1", Side::Buy, 4.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::MarketCap));
         // They also use up the total: 20 held plus 10 here reaches the 30 cap.
-        let r = b.take(&market(2), "yes-2", Side::Buy, 20.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&market(2), "yes-2", Side::Buy, 20.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert!(matches!(r, TakeResult::Filled { .. }));
-        let r = b.take(&market(3), "yes-3", Side::Buy, 2.0, 0.5, &bk).await.unwrap();
+        let r = b
+            .take(&market(3), "yes-3", Side::Buy, 2.0, 0.5, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::TotalCap));
 
         // A strategy can't see them, sell them or offer them.
         assert!(b.holding("yes-1").is_none());
         assert_eq!(b.holdings().len(), 1, "only this run's own position");
-        let r = b.take(&market(1), "yes-1", Side::Sell, 40.0, 0.4, &bk).await.unwrap();
+        let r = b
+            .take(&market(1), "yes-1", Side::Sell, 40.0, 0.4, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, TakeResult::Blocked(Blocked::NothingHeld));
-        let r = b.rest(&market(1), "yes-1", Side::Sell, 40.0, 0.6, 60, &bk).await.unwrap();
+        let r = b
+            .rest(&market(1), "yes-1", Side::Sell, 40.0, 0.6, 60, &bk)
+            .await
+            .unwrap();
         assert_eq!(r, Err(Blocked::NothingHeld));
-        assert_eq!(venue.placed.lock().len(), 1, "only the buy reached the venue");
+        assert_eq!(
+            venue.placed.lock().len(),
+            1,
+            "only the buy reached the venue"
+        );
     }
 
     #[test]
@@ -1590,8 +2169,14 @@ mod tests {
         .into_iter()
         .collect();
         let markets = [good, deep, disputed, ending, resolved, tight];
-        assert_eq!(pick_quotable(&markets, &books, 0.04, 0.5, 3600, 5, now), vec![2, 1]);
-        assert_eq!(pick_quotable(&markets, &books, 0.04, 0.5, 3600, 1, now), vec![2]);
+        assert_eq!(
+            pick_quotable(&markets, &books, 0.04, 0.5, 3600, 5, now),
+            vec![2, 1]
+        );
+        assert_eq!(
+            pick_quotable(&markets, &books, 0.04, 0.5, 3600, 1, now),
+            vec![2]
+        );
         assert!(pick_quotable(&markets, &books, 0.04, 0.05, 3600, 5, now).is_empty());
     }
 }

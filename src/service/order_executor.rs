@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use crate::config::AppConfig;
-use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
+use crate::models::{OrderType, PlannedOrder, Side, VenueId, WhaleTrade};
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::market_cache::MarketInfo;
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::service::risk_guard::{BlockReason, RiskCheck, RiskGuard};
 use crate::service::strategy;
-use crate::service::venue::{MarketSource, OrderTicket, OrderVenue};
+use crate::service::venue::{MarketSource, OrderTicket, OrderVenue, Quantity};
 use crate::utils;
 use anyhow::Result;
 use chrono::Utc;
@@ -43,8 +43,18 @@ pub enum SkipReason {
     BelowSizing,
     MarketMetadataUnavailable,
     Ineligible(Eligibility),
-    ExposureCategoryCap { category: String, cap: f64, current: f64, want: f64 },
-    ExposureTagCap { tag: String, cap: f64, current: f64, want: f64 },
+    ExposureCategoryCap {
+        category: String,
+        cap: f64,
+        current: f64,
+        want: f64,
+    },
+    ExposureTagCap {
+        tag: String,
+        cap: f64,
+        current: f64,
+        want: f64,
+    },
     RiskBlocked(BlockReason),
     TradingDisabled,
     AlreadyOpen,
@@ -91,6 +101,15 @@ impl OrderExecutor {
         // 0a. Whale sells are not mirrored — TP/SL is the configured exit path.
         if trade.side == Side::Sell {
             return Ok(ExecutionOutcome::Skipped(SkipReason::WhaleExitIgnored));
+        }
+        if self.cfg.live_trading_allowed() {
+            if let Some(venue) = self
+                .venue
+                .as_ref()
+                .filter(|venue| venue.id() == VenueId::PredictFun)
+            {
+                self.positions.sync_copy(venue.as_ref()).await?;
+            }
         }
         // 0b. Don't pyramid into a market we're already long.
         if self.positions.get(&trade.token_id).is_some() {
@@ -172,6 +191,57 @@ impl OrderExecutor {
 
         // 7. Sign, and dispatch unless this is a dry run.
         let live = self.cfg.live_trading_allowed();
+        if live && venue.id() == VenueId::PredictFun {
+            let key = crate::bot::runtime::live::copy_key(
+                &planned.token_id,
+                planned.source_trade_hash.as_deref(),
+            );
+            let (take_profit_pct, stop_loss_pct) = self.tp_sl_for(&market);
+            let template = OpenPosition {
+                token_id: planned.token_id.clone(),
+                slug: market.slug.clone(),
+                category: market.category.clone(),
+                tags: market.tags.clone(),
+                side: planned.side,
+                entry_price: 0.0,
+                shares: 0.0,
+                usd_notional: 0.0,
+                take_profit_pct,
+                stop_loss_pct,
+                opened_at: Utc::now(),
+            };
+            let r0 = venue.reservation_atoms(&planned)?;
+            let (fresh, handle) = self
+                .positions
+                .reserve_copy(&key, &planned, template, r0, &self.cfg)?;
+            if !fresh {
+                return Ok(ExecutionOutcome::Skipped(SkipReason::AlreadyOpen));
+            }
+            let ticket = match venue
+                .place_tracked(
+                    &planned,
+                    self.cfg.trading.order_expiration_secs,
+                    true,
+                    handle,
+                )
+                .await
+            {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.positions.release_copy_not_submitted(&key);
+                    return Err(error);
+                }
+            };
+            if let Some(snapshot) = &ticket.execution {
+                self.positions
+                    .apply_exit(&key, snapshot)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            return Ok(ExecutionOutcome::Submitted {
+                order_id: ticket.order_id.clone(),
+                ticket,
+            });
+        }
         let ticket = venue
             .place(&planned, self.cfg.trading.order_expiration_secs, live)
             .await?;
@@ -189,6 +259,77 @@ impl OrderExecutor {
             // the TP/SL path against real midprices.
             self.record_open(&market, &planned);
             return Ok(ExecutionOutcome::DryRun(ticket));
+        }
+
+        if venue.id() == VenueId::PredictFun
+            && !ticket.execution.as_ref().is_some_and(|snapshot| {
+                snapshot.pages_complete && snapshot.accounting.is_complete()
+            })
+        {
+            // Accepted, missing facts and incomplete accounting never arm TP/SL.
+            return Ok(ExecutionOutcome::Submitted {
+                order_id: ticket.order_id.clone(),
+                ticket,
+            });
+        }
+
+        // A live venue reports its own facts. They decide what filled: the
+        // venue's size, never the planned one.
+        if let Some(snapshot) = ticket.execution.as_ref() {
+            match snapshot.quantity {
+                Quantity::Known { .. } => {
+                    let filled = match snapshot.accounting.net_inventory.value() {
+                        Some(net) => crate::bot::runtime::live::wei_to_shares(*net),
+                        None => {
+                            return Ok(ExecutionOutcome::Submitted {
+                                order_id: ticket.order_id.clone(),
+                                ticket,
+                            })
+                        }
+                    };
+                    if filled <= 0.0 {
+                        warn!(token = %planned.token_id, "the venue confirmed no fill");
+                        return Ok(ExecutionOutcome::Submitted {
+                            order_id: ticket.order_id.clone(),
+                            ticket,
+                        });
+                    }
+                    // The cost comes from the venue's own accounting, not from
+                    // the limit and not from the model fee.
+                    let cost = match snapshot.accounting.net_cash.value() {
+                        Some(net) => crate::bot::runtime::live::wei_to_shares(*net),
+                        None => {
+                            warn!(
+                                token = %planned.token_id,
+                                "the venue confirmed a fill but not its cost; the position is not recorded"
+                            );
+                            return Ok(ExecutionOutcome::Submitted {
+                                order_id: ticket.order_id.clone(),
+                                ticket,
+                            });
+                        }
+                    };
+                    let actual = PlannedOrder {
+                        shares: filled,
+                        usd_notional: cost,
+                        limit_price: cost / filled,
+                        ..planned.clone()
+                    };
+                    self.record_open(&market, &actual);
+                }
+                Quantity::Unknown => {
+                    // An unknown fill is not a planned fill: no position is
+                    // opened, and nothing is armed for a stop.
+                    warn!(
+                        token = %planned.token_id,
+                        "the venue's fill is unknown; no position is recorded"
+                    );
+                }
+            }
+            return Ok(ExecutionOutcome::Submitted {
+                order_id: ticket.order_id.clone(),
+                ticket,
+            });
         }
 
         // Track what actually filled, where the venue says. An order that
@@ -320,9 +461,10 @@ fn order_type_for(side: Side) -> OrderType {
 }
 
 fn ci_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| {
-        x.to_ascii_lowercase() == y.to_ascii_lowercase()
-    })
+    a.len() == b.len()
+        && a.chars()
+            .zip(b.chars())
+            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -348,12 +490,35 @@ mod tests {
         }
     }
 
-    struct FakeVenue(Option<f64>);
+    struct FakeVenue(Option<f64>, VenueId);
 
     #[async_trait]
     impl OrderVenue for FakeVenue {
         fn id(&self) -> VenueId {
-            VenueId::PredictFun
+            self.1
+        }
+        fn reservation_atoms(&self, planned: &PlannedOrder) -> Result<alloy_primitives::U256> {
+            Ok(alloy_primitives::U256::from(
+                (planned.usd_notional * 1e18) as u128,
+            ))
+        }
+        async fn account_snapshot(&self) -> Result<crate::service::venue::AccountSnapshot> {
+            use crate::service::venue::{AccountIdentity, AccountMode, AccountSnapshot};
+            Ok(AccountSnapshot {
+                identity: AccountIdentity {
+                    chain_id: 56,
+                    trading_address: "synthetic".into(),
+                    signer_address: "synthetic".into(),
+                    mode: AccountMode::Eoa,
+                    venue: self.1,
+                },
+                collateral_atoms: Some(alloy_primitives::U256::from(1000)),
+                gas_atoms: Some(alloy_primitives::U256::from(1)),
+                positions: vec![],
+                positions_explained: true,
+                open_orders: vec![],
+                complete: true,
+            })
         }
         async fn place(&self, p: &PlannedOrder, _: u64, _: bool) -> Result<OrderTicket> {
             Ok(OrderTicket {
@@ -362,12 +527,15 @@ mod tests {
                 taker_amount: "1".into(),
                 order_id: Some("1".into()),
                 filled_shares: self.0,
+                signed_hash: None,
+                local_attempt_id: None,
+                execution: None,
             })
         }
     }
 
     /// Run one live buy through the pipeline; returns the shares recorded.
-    async fn recorded_shares(filled: Option<f64>) -> Option<f64> {
+    async fn recorded_shares(filled: Option<f64>, venue: VenueId) -> Option<f64> {
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
         cfg.filters = Default::default();
         cfg.bot.enable_trading = true;
@@ -376,14 +544,14 @@ mod tests {
         let risk = RiskGuard::new(cfg.risk.clone());
         let executor = OrderExecutor::new(
             cfg,
-            Ok(Arc::new(FakeVenue(filled))),
+            Ok(Arc::new(FakeVenue(filled, venue))),
             risk,
             Arc::new(FakeMarkets),
             Arc::clone(&positions),
         )
         .unwrap();
         let trade = WhaleTrade {
-            venue: VenueId::PredictFun,
+            venue,
             maker: "0xwhale".into(),
             side: Side::Buy,
             token_id: "t".into(),
@@ -402,16 +570,80 @@ mod tests {
     #[tokio::test]
     async fn unknown_fill_records_the_planned_size() {
         // PERCENTAGE 20% of $250 at a 0.505 limit, floored to whole shares.
-        assert_eq!(recorded_shares(None).await, Some(99.0));
+        assert_eq!(recorded_shares(None, VenueId::Polymarket).await, Some(99.0));
     }
 
     #[tokio::test]
     async fn partial_fill_records_what_filled() {
-        assert_eq!(recorded_shares(Some(12.5)).await, Some(12.5));
+        assert_eq!(
+            recorded_shares(Some(12.5), VenueId::Polymarket).await,
+            Some(12.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn a007_copy_unknown_not_full() {
+        for filled in [None, Some(99.0), Some(0.0)] {
+            // A legacy numeric field is not a Predict execution fact.
+            assert_eq!(recorded_shares(filled, VenueId::PredictFun).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a007_copy_original_hash_recovers_actual_net_once() {
+        use std::sync::atomic::Ordering;
+        for drift in ["cash_drift", "inventory_drift"] {
+            let (trader, transport) =
+                crate::service::predict_fun::fills::tests::scenario("missing_fee", "");
+            let identity = trader.identity();
+            let gate = trader.gate.clone();
+            let mut cfg: AppConfig =
+                serde_json::from_str(include_str!("../../config.json")).unwrap();
+            cfg.filters = Default::default();
+            cfg.bot.enable_trading = true;
+            cfg.bot.mock_trading = false;
+            let positions = PositionStore::new();
+            let executor = OrderExecutor::new(
+                cfg.clone(),
+                Ok(Arc::new(trader)),
+                RiskGuard::new(cfg.risk.clone()),
+                Arc::new(FakeMarkets),
+                positions.clone(),
+            )
+            .unwrap();
+            let trade = WhaleTrade {
+                venue: VenueId::PredictFun,
+                maker: "synthetic-whale".into(),
+                side: Side::Buy,
+                token_id: "77".into(),
+                shares: 500.0,
+                price: 0.5,
+                usd_notional: 250.0,
+                tx_hash: Some("synthetic-source".into()),
+                block_number: None,
+                observed_at: Utc::now(),
+            };
+            executor.execute(&trade).await.unwrap();
+            assert!(positions.get("77").is_none());
+            transport.base.stage.store(1, Ordering::SeqCst);
+            executor.execute(&trade).await.unwrap();
+            executor.execute(&trade).await.unwrap();
+            let position = positions.get("77").unwrap();
+            assert!((position.shares - 9.9).abs() < 1e-12);
+            assert!((position.usd_notional - 4.62).abs() < 1e-12);
+            *transport.mode.lock() = drift;
+            assert!(executor.execute(&trade).await.is_err(), "{drift}");
+            assert!(!gate.allows_new_orders(&identity));
+            let unchanged = positions.get("77").unwrap();
+            assert_eq!(unchanged.shares, position.shares);
+            assert_eq!(unchanged.usd_notional, position.usd_notional);
+            assert_eq!(transport.base.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.base.signs.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
     async fn empty_fill_records_nothing() {
-        assert_eq!(recorded_shares(Some(0.0)).await, None);
+        assert_eq!(recorded_shares(Some(0.0), VenueId::Polymarket).await, None);
     }
 }

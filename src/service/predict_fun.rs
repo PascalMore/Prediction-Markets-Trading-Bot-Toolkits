@@ -23,8 +23,8 @@ use crate::models::{BookLevel, BookSnapshot, OrderType, PlannedOrder, Side, Venu
 use crate::service::market_cache::MarketInfo;
 use crate::service::midprice::MidpriceSource;
 use crate::service::venue::{
-    HeldPosition, LimitOrder, LimitVenue, MarketData, MarketQuery, MarketSource, OrderTicket,
-    OrderVenue, PostedOrder, RemoveResult, RestingState, TradableMarket,
+    AccountIdentity, AccountMode, MarketData, MarketQuery, MarketSource, OrderVenue,
+    TradableMarket, VenueError, VenueErrorCode,
 };
 use alloy_primitives::{address, eip191_hash_message, keccak256, Address, B256, U256};
 use alloy_signer::Signer;
@@ -42,6 +42,20 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+pub mod account;
+pub mod fills;
+
+use account::AccountGate;
+
+/// Whether an authenticated request may be sent again after a 401.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPolicy {
+    /// A read may be sent once more with a fresh token.
+    ReadOnceRefresh,
+    /// A write is never sent again.
+    NoReplay,
+}
 
 sol! {
     /// Predict.fun CTF Exchange order. Field types are part of the typehash:
@@ -162,6 +176,9 @@ pub struct ApiMarket {
     pub decimal_precision: Option<u32>,
     #[serde(default)]
     pub polymarket_condition_ids: Vec<String>,
+    /// Native Predict condition, never a Polymarket alias.
+    #[serde(default)]
+    pub condition_id: Option<B256>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +244,20 @@ pub struct ApiLeg {
     pub outcome: ApiOutcome,
     pub signer: String,
     pub hash: String,
+    /// The fee the venue charged on this leg. Absent means unknown, not zero.
+    #[serde(default)]
+    pub fee: Option<ApiFee>,
+}
+
+/// What the venue says about a fee.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiFee {
+    /// The fee amount, in wei.
+    pub amount: String,
+    /// `COLLATERAL` or `SHARES` (OpenAPI Fee.type).
+    #[serde(rename = "type")]
+    pub fee_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +269,43 @@ pub struct ApiMatch {
     #[serde(default)]
     pub transaction_hash: Option<String>,
     pub executed_at: String,
+}
+
+/// The venue's own order record.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiOrderData {
+    pub id: String,
+    pub market_id: u64,
+    /// The venue's cumulative filled amount, in wei.
+    pub amount_filled: String,
+    pub status: String,
+    #[serde(default)]
+    pub order: Option<ApiContractOrder>,
+    #[serde(default)]
+    pub amount: Option<String>,
+}
+
+/// The signed order the venue holds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiContractOrder {
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub maker: Option<String>,
+    #[serde(default)]
+    pub signer: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    pub maker_amount: Option<String>,
+    #[serde(default)]
+    pub taker_amount: Option<String>,
+    #[serde(default)]
+    pub side: Option<i32>,
+    #[serde(default)]
+    pub expiration: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -411,15 +479,21 @@ fn market_amounts(book: &WeiBook, side: Side, quantity_wei: U256) -> Result<Mark
         Side::Sell => &book.bids,
     };
 
+    use alloy_primitives::U512;
     let mut remaining = quantity;
-    let mut cost = U256::ZERO;
+    let mut cost = U512::ZERO;
     let mut last_price = U256::ZERO;
     for (price, size) in levels {
         if remaining.is_zero() {
             break;
         }
         let take = remaining.min(*size);
-        cost += *price * take;
+        let level_cost = U512::from(*price)
+            .checked_mul(U512::from(take))
+            .ok_or_else(|| anyhow!("AMOUNT_OVERFLOW"))?;
+        cost = cost
+            .checked_add(level_cost)
+            .ok_or_else(|| anyhow!("AMOUNT_OVERFLOW"))?;
         remaining -= take;
         last_price = *price;
     }
@@ -431,7 +505,7 @@ fn market_amounts(book: &WeiBook, side: Side, quantity_wei: U256) -> Result<Mark
         );
     }
 
-    let worst_value = last_price * quantity / U256::from(WEI);
+    let worst_value = fills::checked_product_atoms(last_price, quantity)?;
     let (maker_amount, taker_amount) = match side {
         Side::Buy => (worst_value, quantity),
         Side::Sell => (quantity, worst_value),
@@ -439,7 +513,8 @@ fn market_amounts(book: &WeiBook, side: Side, quantity_wei: U256) -> Result<Mark
     Ok(MarketAmounts {
         maker_amount,
         taker_amount,
-        price_per_share: cost / quantity,
+        price_per_share: U256::from_str_radix(&(cost / U512::from(quantity)).to_string(), 10)
+            .map_err(|_| anyhow!("AMOUNT_OVERFLOW"))?,
         last_price,
         quantity,
     })
@@ -453,7 +528,7 @@ fn limit_amounts(side: Side, price_wei: U256, quantity_wei: U256) -> Result<Mark
     }
     let price = retain_significant_digits(price_wei, 3);
     let quantity = retain_significant_digits(quantity_wei, 5);
-    let value = price * quantity / U256::from(WEI);
+    let value = fills::checked_product_atoms(price, quantity)?;
     let (maker_amount, taker_amount) = match side {
         Side::Buy => (value, quantity),
         Side::Sell => (quantity, value),
@@ -498,6 +573,8 @@ pub struct PredictFunClient {
     categories: RwLock<HashMap<String, (Option<String>, Vec<String>)>>,
     /// Category slug → event. A schedule doesn't change once published.
     events: RwLock<HashMap<String, ApiEvent>>,
+    #[cfg(test)]
+    synthetic: Option<Arc<dyn account::SyntheticTransport>>,
 }
 
 impl PredictFunClient {
@@ -518,6 +595,8 @@ impl PredictFunClient {
             http: Client::builder()
                 .user_agent("polymarket-toolkits/0.1")
                 .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .connection_verbose(false)
                 .build()?,
             deployment: deployment(network),
             network,
@@ -525,6 +604,8 @@ impl PredictFunClient {
             markets: RwLock::new(HashMap::new()),
             categories: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            synthetic: None,
         }))
     }
 
@@ -535,6 +616,14 @@ impl PredictFunClient {
         bearer: Option<&str>,
         body: Option<&Value>,
     ) -> Result<String> {
+        #[cfg(test)]
+        if let Some(transport) = &self.synthetic {
+            let result = transport.rest(&method, path, bearer, body);
+            if method == Method::POST && path == "/orders" && transport.pending_post() {
+                std::future::pending::<()>().await;
+            }
+            return result;
+        }
         let url = format!("{}{}", self.deployment.api_base, path);
         let mut req = self.http.request(method.clone(), &url);
         if let Some(key) = &self.api_key {
@@ -546,11 +635,15 @@ impl PredictFunClient {
         if let Some(body) = body {
             req = req.json(body);
         }
-        let resp = req.send().await.with_context(|| format!("{method} {path}"))?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("{method} {path}"))?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(ApiError { status, body: text }).with_context(|| format!("{method} {path}"));
+            return Err(ApiError { status, body: text })
+                .with_context(|| format!("{method} {path}"));
         }
         Ok(text)
     }
@@ -562,7 +655,9 @@ impl PredictFunClient {
         bearer: Option<&str>,
         body: Option<&Value>,
     ) -> Result<Envelope<T>> {
-        let text = self.request_text(method.clone(), path, bearer, body).await?;
+        let text = self
+            .request_text(method.clone(), path, bearer, body)
+            .await?;
         serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
     }
 
@@ -631,7 +726,11 @@ impl PredictFunClient {
 
     /// Whatever the adapter knows about the market holding `token_id`.
     pub fn tradable_for_token(&self, token_id: &str) -> Result<TradableMarket> {
-        Ok(tradable(&self.market_for_token(token_id)?, None, chrono::Utc::now()))
+        Ok(tradable(
+            &self.market_for_token(token_id)?,
+            None,
+            chrono::Utc::now(),
+        ))
     }
 
     /// The API quotes for the first outcome, so anything else reads it mirrored.
@@ -647,7 +746,10 @@ impl PredictFunClient {
         if let Some(hit) = self.categories.read().get(slug) {
             return hit.clone();
         }
-        match self.get::<ApiCategory>(&format!("/categories/{slug}")).await {
+        match self
+            .get::<ApiCategory>(&format!("/categories/{slug}"))
+            .await
+        {
             Ok(env) => {
                 let tags = env.data.tags;
                 let entry = classify(&tags);
@@ -750,7 +852,9 @@ fn tradable(
     now: chrono::DateTime<chrono::Utc>,
 ) -> TradableMarket {
     let ends_at = event.and_then(|e| e.ends_at);
-    let variant = event.and_then(|e| e.variant_data.clone()).unwrap_or_default();
+    let variant = event
+        .and_then(|e| e.variant_data.clone())
+        .unwrap_or_default();
     let outcome = |i: usize| market.outcomes.get(i);
     let labels = event.and_then(|e| e.tags.as_deref()).map(classify);
     let open = market.trading_status == "OPEN" && ends_at.is_none_or(|end| end > now);
@@ -771,12 +875,19 @@ fn tradable(
         question: market.question.clone(),
         category_slug: market.category_slug.clone().unwrap_or_default(),
         variant: market.market_variant.clone(),
-        yes_token: outcome(0).map(|o| o.on_chain_id.clone()).unwrap_or_default(),
-        no_token: outcome(1).map(|o| o.on_chain_id.clone()).unwrap_or_default(),
+        yes_token: outcome(0)
+            .map(|o| o.on_chain_id.clone())
+            .unwrap_or_default(),
+        no_token: outcome(1)
+            .map(|o| o.on_chain_id.clone())
+            .unwrap_or_default(),
         yes_name: outcome(0).map(|o| o.name.clone()).unwrap_or_default(),
         no_name: outcome(1).map(|o| o.name.clone()).unwrap_or_default(),
         open,
-        contested: matches!(market.status.as_str(), "PRICE_DISPUTED" | "PAUSED" | "REMOVED"),
+        contested: matches!(
+            market.status.as_str(),
+            "PRICE_DISPUTED" | "PAUSED" | "REMOVED"
+        ),
         tick: tick_of(market),
         fee_rate_bps: market.fee_rate_bps,
         starts_at: event.and_then(|e| e.starts_at),
@@ -833,8 +944,9 @@ impl MarketData for PredictFunClient {
             // rounds with empty books before anything tradable. Lifetime volume reaches
             // established markets at once: 24-hour volume lists rounds with no book yet.
             for _ in 0..query.max_pages.max(1) {
-                let mut path =
-                    format!("/markets?first={CATEGORY_PAGE_SIZE}&status=OPEN&sort=VOLUME_TOTAL_DESC");
+                let mut path = format!(
+                    "/markets?first={CATEGORY_PAGE_SIZE}&status=OPEN&sort=VOLUME_TOTAL_DESC"
+                );
                 if let Some(c) = &cursor {
                     path.push_str(&format!("&after={c}"));
                 }
@@ -929,7 +1041,11 @@ impl MarketData for PredictFunClient {
     async fn books(&self, ids: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
         let mut out = HashMap::new();
         for batch in ids.chunks(BOOK_BATCH_SIZE) {
-            let list = batch.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            let list = batch
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             let books = self
                 .get::<Vec<ApiMarketBook>>(&format!("/markets/orderbooks?ids={list}"))
                 .await?
@@ -1070,9 +1186,8 @@ impl WhaleFeed {
                 FeedTarget::Wallet(w) => format!("signerAddress={}", w.to_checksum(None)),
                 FeedTarget::AnyAbove(min) => format!("minValueUsdtWei={}", f64_to_wei(*min)?),
             };
-            let mut path = format!(
-                "/orders/matches?first={FEED_PAGE_SIZE}&{filter}&executedAfter={after}"
-            );
+            let mut path =
+                format!("/orders/matches?first={FEED_PAGE_SIZE}&{filter}&executedAfter={after}");
             if let Some(c) = &cursor {
                 path.push_str(&format!("&after={c}"));
             }
@@ -1153,6 +1268,13 @@ pub struct PredictFunTrader {
     /// the signer's own address.
     account: Option<Address>,
     jwt: tokio::sync::RwLock<Option<String>>,
+    /// The account gate every order on this account passes through.
+    pub gate: Arc<AccountGate>,
+    /// The generation of each order's last reading, so an older reading never
+    /// overwrites a newer one.
+    generations: RwLock<HashMap<String, u64>>,
+    run_context: RwLock<Option<account::RunContext>>,
+    bound_orders: RwLock<HashMap<String, fills::BoundOrder>>,
 }
 
 impl PredictFunTrader {
@@ -1169,12 +1291,77 @@ impl PredictFunTrader {
             .as_deref()
             .map(|a| Address::from_str(a.trim()).context("parsing predict_account"))
             .transpose()?;
-        Ok(Self {
+        let trader = Self {
             client,
             signer,
             account,
             jwt: tokio::sync::RwLock::new(None),
-        })
+            gate: AccountGate::new(),
+            generations: RwLock::new(HashMap::new()),
+            run_context: RwLock::new(None),
+            bound_orders: RwLock::new(HashMap::new()),
+        };
+        if cfg.live_trading_allowed() {
+            if let Some(context) =
+                account::run_confirmation_slot().claim_context(&trader.identity())?
+            {
+                if context.confirmation.is_some() {
+                    trader.gate.confirm_budget(&trader.identity());
+                }
+                *trader.run_context.write() = Some(context);
+            }
+        }
+        Ok(trader)
+    }
+
+    /// Claim the operator's confirmation of this run's budget, if it belongs to
+    /// this account.
+    ///
+    /// It is claimed once: a second trader in the same process doesn't inherit
+    /// it.
+    pub fn claim_run_confirmation(&self) -> bool {
+        self.gate.budget_confirmed(&self.identity())
+    }
+
+    /// Whether new orders are allowed on this account right now.
+    pub fn allows_new_orders(&self) -> bool {
+        self.gate.allows_new_orders(&self.identity())
+    }
+
+    /// Refuse a new order when the account can't take one.
+    ///
+    /// A live run needs the operator's confirmation of this run's budget: it
+    /// says a human looked at the account's risk. It overrides no health
+    /// check, so an unconfirmed order or a failed read still blocks.
+    pub fn check_allows_new_order(&self) -> Result<()> {
+        let identity = self.identity();
+        if let Some(reason) = self.gate.block_reason(&identity) {
+            return Err(VenueError::new(reason.code(), "account_gate", &reason.token()).into());
+        }
+        if !self.gate.budget_confirmed(&identity) {
+            return Err(VenueError::new(
+                VenueErrorCode::BudgetUnconfirmed,
+                "account_gate",
+                "BUDGET_UNCONFIRMED",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The account this trader trades from.
+    pub fn identity(&self) -> AccountIdentity {
+        let signer_address = self.signer.address().to_checksum(None);
+        AccountIdentity {
+            chain_id: self.client.deployment.chain_id,
+            trading_address: self.trading_address().to_checksum(None),
+            mode: match self.account {
+                Some(_) => AccountMode::PredictAccount,
+                None => AccountMode::Eoa,
+            },
+            signer_address,
+            venue: VenueId::PredictFun,
+        }
     }
 
     /// The address orders trade from, and the identity the API authenticates.
@@ -1182,60 +1369,14 @@ impl PredictFunTrader {
         self.account.unwrap_or_else(|| self.signer.address())
     }
 
-    fn build_order(
-        &self,
-        market: &ApiMarket,
-        token_id: &str,
-        side: Side,
-        amounts: &MarketAmounts,
-        expiration: i64,
-    ) -> Result<Order> {
-        let maker = self.trading_address();
-        Ok(Order {
-            salt: U256::from(rand::random::<u32>() % MAX_SALT),
-            maker,
-            signer: maker,
-            taker: Address::ZERO,
-            tokenId: U256::from_str_radix(token_id, 10)
-                .map_err(|_| anyhow!("token id must be a decimal U256"))?,
-            makerAmount: amounts.maker_amount,
-            takerAmount: amounts.taker_amount,
-            expiration: U256::from(expiration),
-            nonce: U256::ZERO,
-            feeRateBps: U256::from(market.fee_rate_bps),
-            side: side.as_u8(),
-            signatureType: 0,
-        })
-    }
-
-    async fn sign_order(&self, order: &Order, market: &ApiMarket) -> Result<(B256, String)> {
-        let digest = order_digest(
-            order,
-            self.client.deployment,
-            market.is_neg_risk,
-            market.is_yield_bearing,
-        );
-        let signature = match self.account {
-            Some(account) => {
-                sign_for_account(&self.signer, digest, account, self.client.deployment.chain_id)
-                    .await?
-            }
-            None => {
-                let sig = self
-                    .signer
-                    .sign_hash(&digest)
-                    .await
-                    .context("signing order digest")?;
-                format!("0x{}", hex::encode(sig.as_bytes()))
-            }
-        };
-        Ok((digest, signature))
-    }
-
     /// Exchange a signed message for a JWT. The message includes acceptance of
     /// Predict's Terms of Service, which is why nothing signs it except a live
     /// run or an explicit `check-venue --sign-in`.
     async fn sign_in(&self) -> Result<String> {
+        #[cfg(test)]
+        if let Some(transport) = &self.client.synthetic {
+            return Ok(transport.auth_token());
+        }
         let message = self
             .client
             .get::<ApiAuthMessage>("/auth/message")
@@ -1289,11 +1430,17 @@ impl PredictFunTrader {
     }
 
     /// An authenticated request, signing in again once if the JWT has expired.
+    ///
+    /// `replay` decides what happens after a 401. A read may be sent once more
+    /// with a fresh token: a token isn't part of the order. A write is never
+    /// sent again, not even with the same hash: the venue may already have
+    /// taken it.
     async fn authed_text(
         &self,
         method: Method,
         path: &str,
         body: Option<&Value>,
+        replay: ReplayPolicy,
     ) -> Result<String> {
         let token = self.token().await?;
         match self
@@ -1305,6 +1452,17 @@ impl PredictFunTrader {
                 if e.downcast_ref::<ApiError>()
                     .is_some_and(|a| a.status == StatusCode::UNAUTHORIZED) =>
             {
+                *self.jwt.write().await = None;
+                if replay == ReplayPolicy::NoReplay {
+                    // The request may have reached the venue. The caller keeps
+                    // the order's identity and looks it up instead.
+                    return Err(VenueError::new(
+                        VenueErrorCode::SubmissionUnknown,
+                        "authed_text",
+                        "POST_NOT_REPLAYED",
+                    )
+                    .into());
+                }
                 debug!("JWT rejected; signing in again");
                 *self.jwt.write().await = None;
                 let token = self.token().await?;
@@ -1322,51 +1480,23 @@ impl PredictFunTrader {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Envelope<T>> {
-        let text = self.authed_text(method.clone(), path, body).await?;
+        let text = self
+            .authed_text(method.clone(), path, body, ReplayPolicy::ReadOnceRefresh)
+            .await?;
         serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
     }
 
-    /// Wei held of an outcome. Buy fees are taken in shares, so this is less
-    /// than the size bought and is the only safe size to sell.
-    async fn held_wei(&self, market_id: u64, token_id: &str) -> Result<U256> {
-        let positions = self
-            .authed::<Vec<ApiPosition>>(
-                Method::GET,
-                &format!("/positions?marketId={market_id}&first=100"),
-                None,
-            )
-            .await?
-            .data;
-        for pos in positions {
-            if pos.outcome.on_chain_id == token_id {
-                return decimal_to_wei_exact(&pos.amount);
-            }
-        }
-        Ok(U256::ZERO)
-    }
-
-    /// Wait for a MARKET order to settle. `None` means the API couldn't say.
-    async fn confirmed_fill(&self, order_hash: &str) -> Option<f64> {
-        let mut last = None;
-        for _ in 0..FILL_POLL_ATTEMPTS {
-            tokio::time::sleep(FILL_POLL_DELAY).await;
-            match self
-                .authed::<ApiOrderState>(Method::GET, &format!("/orders/{order_hash}"), None)
-                .await
-            {
-                Ok(env) => {
-                    let filled = decimal_to_wei_exact(&env.data.amount_filled)
-                        .map(wei_to_f64)
-                        .ok();
-                    last = filled;
-                    if env.data.status != "OPEN" {
-                        return filled;
-                    }
-                }
-                Err(e) => warn!(error = ?e, order_hash, "fill check failed"),
-            }
-        }
-        last.filter(|f| *f > 0.0)
+    /// An authenticated write. It is sent once, and never again.
+    async fn authed_write<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Envelope<T>> {
+        let text = self
+            .authed_text(method.clone(), path, body, ReplayPolicy::NoReplay)
+            .await?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
     }
 
     /// Prove the connection without placing anything. `sign_in` also signs the
@@ -1378,155 +1508,23 @@ impl PredictFunTrader {
             .data;
         Ok(account.address)
     }
-}
 
-#[async_trait]
-impl OrderVenue for PredictFunTrader {
-    fn id(&self) -> VenueId {
-        VenueId::PredictFun
-    }
-
-    async fn place(
-        &self,
-        planned: &PlannedOrder,
-        _expiration_secs: u64,
-        live: bool,
-    ) -> Result<OrderTicket> {
-        let market = self.client.market_for_token(&planned.token_id)?;
-
-        let mut quantity = f64_to_wei(planned.shares)?;
-        if live && planned.side == Side::Sell {
-            let held = self.held_wei(market.id, &planned.token_id).await?;
-            if held.is_zero() {
-                info!(token = %planned.token_id, "nothing held to sell");
-                return Ok(OrderTicket {
-                    token_id: planned.token_id.clone(),
-                    maker_amount: "0".into(),
-                    taker_amount: "0".into(),
-                    order_id: None,
-                    filled_shares: Some(0.0),
-                });
-            }
-            quantity = quantity.min(held);
-        }
-
-        let mirrored = PredictFunClient::is_mirrored(&market, &planned.token_id);
-        let book = WeiBook::from_api(&self.client.book(market.id).await?, mirrored)?;
-        let amounts = market_amounts(&book, planned.side, quantity)?;
-        check_limit(&amounts, planned.side, planned.limit_price)?;
-
-        let expiration = chrono::Utc::now().timestamp() + MARKET_ORDER_TTL_SECS;
-        let order = self.build_order(&market, &planned.token_id, planned.side, &amounts, expiration)?;
-        let (digest, signature) = self.sign_order(&order, &market).await?;
-        let order_hash = format!("0x{}", hex::encode(digest));
-
-        let mut ticket = OrderTicket {
-            token_id: planned.token_id.clone(),
-            maker_amount: amounts.maker_amount.to_string(),
-            taker_amount: amounts.taker_amount.to_string(),
-            order_id: None,
-            filled_shares: None,
-        };
-        if !live {
-            return Ok(ticket);
-        }
-
-        let body = order_body(&order, &order_hash, &signature, &amounts, expiration);
-        let created = self
-            .authed::<ApiCreatedOrder>(Method::POST, "/orders", Some(&body))
+    /// The venue's cumulative filled amount for an order.
+    async fn order_amount_filled(&self, order_hash: &str) -> Result<U256> {
+        let order = self
+            .authed::<ApiOrderData>(Method::GET, &format!("/orders/{order_hash}"), None)
             .await?
             .data;
-        ticket.order_id = Some(created.order_id);
-        ticket.filled_shares = self.confirmed_fill(&order_hash).await;
-        Ok(ticket)
+        fills::venue_gross_q(&order)
     }
-}
 
-#[async_trait]
-impl LimitVenue for PredictFunTrader {
-    async fn post_limit(&self, order: &LimitOrder, live: bool) -> Result<PostedOrder> {
-        let market = self.client.market_for_token(&order.token_id)?;
-        let amounts = limit_amounts(order.side, f64_to_wei(order.price)?, f64_to_wei(order.shares)?)?;
-        let expiration = chrono::Utc::now().timestamp() + order.ttl_secs as i64;
-        let signed = self.build_order(&market, &order.token_id, order.side, &amounts, expiration)?;
-        let (digest, signature) = self.sign_order(&signed, &market).await?;
-        let order_hash = format!("0x{}", hex::encode(digest));
-        if !live {
-            return Ok(PostedOrder {
-                order_hash,
-                order_id: None,
-            });
-        }
-        let body = limit_order_body(
-            &signed,
-            &order_hash,
-            &signature,
-            &amounts,
-            expiration,
-            order.post_only,
-        );
-        let created = self
-            .authed::<ApiCreatedOrder>(Method::POST, "/orders", Some(&body))
+    /// The venue's status for an order.
+    async fn order_status(&self, order_hash: &str) -> Result<String> {
+        let order = self
+            .authed::<ApiOrderData>(Method::GET, &format!("/orders/{order_hash}"), None)
             .await?
             .data;
-        Ok(PostedOrder {
-            order_hash,
-            order_id: Some(created.order_id),
-        })
-    }
-
-    async fn remove(&self, order_ids: &[String]) -> Result<RemoveResult> {
-        let body = json!({ "data": { "ids": order_ids } });
-        let text = self
-            .authed_text(Method::POST, "/orders/remove", Some(&body))
-            .await?;
-        let removed: ApiRemoved =
-            serde_json::from_str(&text).context("parsing POST /orders/remove response")?;
-        Ok(RemoveResult {
-            removed: removed.removed,
-            noop: removed.noop,
-            rejected: removed.rejected,
-        })
-    }
-
-    async fn order_state(&self, order_hash: &str) -> Result<RestingState> {
-        let state = self
-            .authed::<ApiOrderState>(Method::GET, &format!("/orders/{order_hash}"), None)
-            .await?
-            .data;
-        Ok(RestingState {
-            open: state.status == "OPEN",
-            filled_shares: wei_to_f64(decimal_to_wei_exact(&state.amount_filled)?),
-        })
-    }
-
-    async fn positions(&self) -> Result<Vec<HeldPosition>> {
-        let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..POSITION_MAX_PAGES {
-            let mut path = "/positions?first=100".to_string();
-            if let Some(c) = &cursor {
-                path.push_str(&format!("&after={c}"));
-            }
-            let env = self
-                .authed::<Vec<ApiHeldPosition>>(Method::GET, &path, None)
-                .await?;
-            let page_len = env.data.len();
-            for pos in env.data {
-                self.client.remember_market(&pos.market);
-                out.push(HeldPosition {
-                    market: tradable(&pos.market, None, chrono::Utc::now()),
-                    token_id: pos.outcome.on_chain_id,
-                    shares: wei_to_f64(decimal_to_wei_exact(&pos.amount)?),
-                    avg_price: parse_avg_price(pos.average_buy_price_usd.as_deref()),
-                });
-            }
-            cursor = env.cursor;
-            if cursor.is_none() || page_len < 100 {
-                return Ok(out);
-            }
-        }
-        bail!("more than {POSITION_MAX_PAGES} pages of positions; can't account for them all")
+        Ok(order.status)
     }
 }
 
@@ -1539,7 +1537,11 @@ fn parse_avg_price(raw: Option<&str>) -> f64 {
     let Some(value) = raw.and_then(|r| r.parse::<f64>().ok()) else {
         return 1.0;
     };
-    let price = if value > 1.0 { value / WEI as f64 } else { value };
+    let price = if value > 1.0 {
+        value / WEI as f64
+    } else {
+        value
+    };
     if price > 0.0 && price <= 1.0 {
         price
     } else {
@@ -1548,7 +1550,12 @@ fn parse_avg_price(raw: Option<&str>) -> f64 {
 }
 
 /// EIP-712 digest of an order against the exchange its market settles on.
-fn order_digest(order: &Order, dep: &Deployment, is_neg_risk: bool, is_yield_bearing: bool) -> B256 {
+fn order_digest(
+    order: &Order,
+    dep: &Deployment,
+    is_neg_risk: bool,
+    is_yield_bearing: bool,
+) -> B256 {
     let domain: Eip712Domain = eip712_domain! {
         name: DOMAIN_NAME,
         version: DOMAIN_VERSION,
@@ -1710,7 +1717,10 @@ pub async fn check(cfg: &AppConfig, sign_in: bool) -> Result<()> {
     );
 
     if sign_in {
-        println!("sign-in        ok: API identifies you as {}", trader.check_sign_in().await?);
+        println!(
+            "sign-in        ok: API identifies you as {}",
+            trader.check_sign_in().await?
+        );
     } else {
         println!("sign-in        skipped; --sign-in accepts Predict's Terms of Service");
     }
@@ -1892,7 +1902,10 @@ mod tests {
 
     #[test]
     fn prices_parse_without_float_drift() {
-        assert_eq!(f64_to_wei(0.37).unwrap(), U256::from(370_000_000_000_000_000u128));
+        assert_eq!(
+            f64_to_wei(0.37).unwrap(),
+            U256::from(370_000_000_000_000_000u128)
+        );
         assert_eq!(f64_to_wei(1.0).unwrap(), U256::from(WEI));
         assert_eq!(f64_to_wei(519869.6282).unwrap(), wei("519869.6282"));
         assert!(f64_to_wei(-1.0).is_err());
@@ -1914,7 +1927,10 @@ mod tests {
         assert_eq!(MAINNET.exchange(false, false), MAINNET.ctf_exchange);
         assert_eq!(MAINNET.exchange(true, false), MAINNET.neg_risk_exchange);
         assert_eq!(MAINNET.exchange(false, true), MAINNET.yield_ctf_exchange);
-        assert_eq!(MAINNET.exchange(true, true), MAINNET.yield_neg_risk_exchange);
+        assert_eq!(
+            MAINNET.exchange(true, true),
+            MAINNET.yield_neg_risk_exchange
+        );
     }
 
     /// A real match from the testnet feed, trimmed to the fields we read.
@@ -1990,10 +2006,17 @@ mod tests {
         let trades = feed.poll().await.unwrap();
         assert!(!trades.is_empty(), "no large trades in a month of testnet");
         for t in trades.iter().take(5) {
-            println!("{:?} {} x {} = {} by {}", t.side, t.shares, t.price, t.usd_notional, t.maker);
+            println!(
+                "{:?} {} x {} = {} by {}",
+                t.side, t.shares, t.price, t.usd_notional, t.maker
+            );
         }
         for t in &trades {
-            assert!(t.usd_notional >= 1.0, "below the requested size: {}", t.usd_notional);
+            assert!(
+                t.usd_notional >= 1.0,
+                "below the requested size: {}",
+                t.usd_notional
+            );
             assert!(t.price > 0.0 && t.price < 1.0, "price {}", t.price);
             assert!(client.tradable_for_token(&t.token_id).is_ok());
         }
@@ -2091,7 +2114,10 @@ mod tests {
                         // which is what catches an unmirrored No book.
                         let maker: f64 = wei_to_f64(ticket.maker_amount.parse().unwrap());
                         let taker: f64 = wei_to_f64(ticket.taker_amount.parse().unwrap());
-                        assert!((maker / taker - ask).abs() < 0.011, "priced off the wrong book");
+                        assert!(
+                            (maker / taker - ask).abs() < 0.011,
+                            "priced off the wrong book"
+                        );
                         assert!(ticket.order_id.is_none(), "dry run must not submit");
                         signed += 1;
                     }
@@ -2099,7 +2125,10 @@ mod tests {
                 }
             }
         }
-        println!("signed {signed} dry-run orders, {} positions open", positions.len());
+        println!(
+            "signed {signed} dry-run orders, {} positions open",
+            positions.len()
+        );
         assert!(signed > 0);
     }
 
@@ -2107,13 +2136,62 @@ mod tests {
     #[test]
     fn limit_amounts_match_the_sdk() {
         let cases = [
-            (Side::Buy, "0.37", "10", "370000000000000000", "3700000000000000000", "10000000000000000000"),
-            (Side::Sell, "0.37", "10", "370000000000000000", "10000000000000000000", "3700000000000000000"),
-            (Side::Buy, "0.123", "13.51", "123000000000000000", "1661730000000000000", "13510000000000000000"),
-            (Side::Sell, "0.999", "1234567.89", "999000000000000000", "1234500000000000000000000", "1233265500000000000000000"),
-            (Side::Buy, "0.1234", "13.51351", "123000000000000000", "1662099000000000000", "13513000000000000000"),
-            (Side::Buy, "0.05", "100", "50000000000000000", "5000000000000000000", "100000000000000000000"),
-            (Side::Sell, "0.5", "0.01", "500000000000000000", "10000000000000000", "5000000000000000"),
+            (
+                Side::Buy,
+                "0.37",
+                "10",
+                "370000000000000000",
+                "3700000000000000000",
+                "10000000000000000000",
+            ),
+            (
+                Side::Sell,
+                "0.37",
+                "10",
+                "370000000000000000",
+                "10000000000000000000",
+                "3700000000000000000",
+            ),
+            (
+                Side::Buy,
+                "0.123",
+                "13.51",
+                "123000000000000000",
+                "1661730000000000000",
+                "13510000000000000000",
+            ),
+            (
+                Side::Sell,
+                "0.999",
+                "1234567.89",
+                "999000000000000000",
+                "1234500000000000000000000",
+                "1233265500000000000000000",
+            ),
+            (
+                Side::Buy,
+                "0.1234",
+                "13.51351",
+                "123000000000000000",
+                "1662099000000000000",
+                "13513000000000000000",
+            ),
+            (
+                Side::Buy,
+                "0.05",
+                "100",
+                "50000000000000000",
+                "5000000000000000000",
+                "100000000000000000000",
+            ),
+            (
+                Side::Sell,
+                "0.5",
+                "0.01",
+                "500000000000000000",
+                "10000000000000000",
+                "5000000000000000",
+            ),
         ];
         for (side, price, qty, per_share, maker, taker) in cases {
             let a = limit_amounts(side, wei(price), wei(qty)).unwrap();
@@ -2127,13 +2205,27 @@ mod tests {
     #[test]
     fn limit_order_body_is_a_post_only_limit() {
         let amounts = limit_amounts(Side::Buy, wei("0.37"), wei("10")).unwrap();
-        let body = limit_order_body(&vector_order(), "0xabc", "0xsig", &amounts, 4102444800, true);
+        let body = limit_order_body(
+            &vector_order(),
+            "0xabc",
+            "0xsig",
+            &amounts,
+            4102444800,
+            true,
+        );
         assert_eq!(body["data"]["strategy"], "LIMIT");
         assert_eq!(body["data"]["isPostOnly"], true);
         assert_eq!(body["data"]["pricePerShare"], "370000000000000000");
         assert_eq!(body["data"]["order"]["expiration"], 4102444800i64);
 
-        let taker = limit_order_body(&vector_order(), "0xabc", "0xsig", &amounts, 4102444800, false);
+        let taker = limit_order_body(
+            &vector_order(),
+            "0xabc",
+            "0xsig",
+            &amounts,
+            4102444800,
+            false,
+        );
         assert!(taker["data"].get("isPostOnly").is_none());
     }
 
@@ -2214,9 +2306,18 @@ mod tests {
             markets: Vec::new(),
             tags: None,
         };
-        assert_eq!(tradable(&won, Some(&event(100.0, 100.0)), now).payout_yes, Some(0.5));
-        assert_eq!(tradable(&won, Some(&event(100.0, 99.0)), now).payout_yes, Some(0.0));
-        assert_eq!(tradable(&won, Some(&event(100.0, 101.0)), now).payout_yes, Some(1.0));
+        assert_eq!(
+            tradable(&won, Some(&event(100.0, 100.0)), now).payout_yes,
+            Some(0.5)
+        );
+        assert_eq!(
+            tradable(&won, Some(&event(100.0, 99.0)), now).payout_yes,
+            Some(0.0)
+        );
+        assert_eq!(
+            tradable(&won, Some(&event(100.0, 101.0)), now).payout_yes,
+            Some(1.0)
+        );
     }
 
     #[test]

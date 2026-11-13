@@ -1,0 +1,2 @@
+# Source: predict-sdk distribution, isolated from the Rust execution path.
+predict-sdk==0.0.22

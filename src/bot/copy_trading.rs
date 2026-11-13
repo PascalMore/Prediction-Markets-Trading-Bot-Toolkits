@@ -154,8 +154,18 @@ async fn run_predict_fun(cfg: AppConfig) -> Result<()> {
     let risk = RiskGuard::new(cfg.risk.clone());
     let positions = PositionStore::new();
 
-    let venue = PredictFunTrader::new(Arc::clone(&client), &cfg)
-        .map(|t| Arc::new(t) as Arc<dyn OrderVenue>);
+    let trader = match PredictFunTrader::new(Arc::clone(&client), &cfg) {
+        Ok(t) => Some(Arc::new(t)),
+        Err(e) if !cfg.live_trading_allowed() => {
+            info!(reason = %e, "no wallet: dry-run only");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let venue: Result<Arc<dyn OrderVenue>> = match trader.as_ref() {
+        Some(t) => Ok(Arc::clone(t) as Arc<dyn OrderVenue>),
+        None => Err(anyhow!("no wallet configured")),
+    };
     let executor = OrderExecutor::new(
         cfg.clone(),
         venue,
@@ -163,6 +173,17 @@ async fn run_predict_fun(cfg: AppConfig) -> Result<()> {
         client.clone(),
         Arc::clone(&positions),
     )?;
+    // A live copy bot needs the operator's confirmation of this run's budget,
+    // and the gate that stops new orders without one.
+    if let Some(trader) = trader.as_ref() {
+        if cfg.live_trading_allowed() && !trader.claim_run_confirmation() {
+            warn!(
+                address = %trader.identity().trading_address,
+                "no budget confirmation for this account: new orders stay blocked. Pass \
+                 --predict-budget-confirmation <chain:address:mode>."
+            );
+        }
+    }
     spawn_tp_sl(&cfg, &executor, &positions, client.clone());
 
     let mut feed = WhaleFeed::new(client, &whale)?;
