@@ -20,6 +20,8 @@ eth-utils==6.0.0 --hash=sha256:63cf48ee32c45541cb5748751909a8345c470432fb6f0fed4
 frozenlist==1.8.0 --hash=sha256:cba69cb73723c3f329622e34bdbf5ce1f80c21c290ff04256cff1cd3c2036ed2
 hexbytes==2.0.0 --hash=sha256:5425bd7ac83cdd9791c13a5bf97cfe9b9609a304b1ef3ab146adfd50de06cf0e
 idna==3.20 --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+# Official PyPI jeepney 0.9.0 wheel; approved single-package addition.
+jeepney==0.9.0 --hash=sha256:97e5714520c16fc0a45695e5365a2e11b81ea79bba796e26f9f1d178cb182683
 multidict==7.2.1 --hash=sha256:822a7fcd33f6922b650e1b26594f09d53c5d011fe655fea7ded27b2728ce2a1b
 parsimonious==0.10.0 --hash=sha256:982ab435fabe86519b57f6b35610aa4e4e977e9f02a14353edf4bbc75369fc0f
 predict-sdk==0.0.22 --hash=sha256:879cfe183544d931f16c0be5e2c4f927ad127403963d146000904e2c1fc8d6b2

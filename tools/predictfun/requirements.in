@@ -1,2 +1,4 @@
 # Source: predict-sdk distribution, isolated from the Rust execution path.
 predict-sdk==0.0.22
+# Fixed Secret Service transport; official PyPI wheel, no extras.
+jeepney==0.9.0

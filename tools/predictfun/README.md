@@ -101,3 +101,36 @@ tools/predictfun/.venv/bin/python -B -m unittest discover -s tools/predictfun/te
 ```
 
 测试来源全部是明确合成 fixture：真实 SDK 控制流、真实 ABI 解码器、fake 签名/transport/RPC/市场状态。它们证明离线工程行为，不证明真实余额、交易可成交性、真实授权/兑付、策略盈利或获准实盘。
+
+## 07-003 本地 signer / keyring 入口（离线候选，非真实操作许可）
+
+`local_signer.py` 仅提供 `enroll` 和 `check --config <明确公共JSON路径> [--sign-in]`，没有默认启动、run 或参数透传。`--sign-in` 仅是 check 专属的显式无值开关；普通 check/enroll 保持原语义，enroll/带值/缩写/钱包或 binary 覆盖仍拒绝。
+下列是独立验收并另行获准后的用户本地用法，不是现在要求导出、录入或运行真钱账户：
+
+```bash
+tools/predictfun/.venv/bin/python -B tools/predictfun/local_signer.py enroll
+tools/predictfun/.venv/bin/python -B tools/predictfun/local_signer.py check --config /absolute/path/public-mainnet.json
+# 显式接受 Predict.fun Terms 并认证；仍不提交订单：
+tools/predictfun/.venv/bin/python -B tools/predictfun/local_signer.py check --config /absolute/path/public-mainnet.json --sign-in
+```
+
+- enroll 只在 stdin/stderr 为同一真实 TTY 且关闭回显成功时读取；禁止把 key 交给 Hermes/聊天/CLI 参数/管道/环境/文件。仅接受64位 ASCII hex（可带小写 `0x`），不修剪空白；恢复终端并丢弃剩余输入。
+- 固定 BNB chain=56、Predict Account=`0xfc9eb66e6F22f96608058C0A711Ed048eED8c2E2`，固定 signer=`0x5129330159f4E6a99eF873f86901E3cafa7f9A7D`。真实派生不符即拒绝，不能改选登录钱包或新 agent-wallet。
+- 唯一存储为既有 WSL Secret Service 的 unlocked login 集合（default 必须指向 login）。精确全属性、仅缺失时 create、replace=false、全新连接独立读回；已有/重复/locked/Prompt/不可用一律停止，无激活/Unlock/Prompt/文件回退。
+- 写入结果不明或读回失败可能已经留下条目；任何失败均不自动重试、覆盖或删除。`PROMPT_REQUIRED` 同样表示未确认保存，不自动重试。
+- check 只启动本 BOT 的 `target/debug/polymarket-toolkits`，不自动构建。公共 `.json` 必须显式为 predict_fun/mainnet、enable_trading=false、mock_trading=true，无 credentials 字段/重复键；默认 config.json 不适用。
+- 固定 `tools/predictfun/.keyring-no-credentials` 必须不存在（含悬空链接），不会读取默认 YAML 凭据。只从已有环境映射 `YQUANT_PREDICT_FUN_TOKEN -> PM_PREDICT_API_KEY`，不 source `.env`；缺失/冲突或存在 `PM_PRIVATE_KEY` 均拒绝。
+- 私钥仅在 helper 内存和单一 child 环境；父环境不改，无秘密 argv/临时文件/日志，仅继承必要 OS、代理/CA 白名单。普通 check 丢弃输出；显式登录仅在内存接收 stdout/stderr，核验后丢弃，不转发原文/异常/秘密/摘要。最多60秒且不重启。
+- 注意：原 check-venue 会联网并签未提交的样例订单，不是“无签名检查”。默认不接受 Terms、不登录/JWT；显式 --sign-in 复用原 Rust：先市场/盘口与样例签名，再 GET /auth/message、签认证消息接受 Terms、POST /auth、GET /account。JWT 仅 Rust 内存，不持久化。原 GET401 可清 JWT、重新登录并重读一次，所以一次 helper child 不保证只有一次 HTTP 认证；helper 不额外重试。不提交订单、不 approve/redeem/转账，原 Rust signer、预算和交易风险链未改。
+- 登录仅在 exit0 且 stdout 唯一完整 signing 成功行先于唯一完整 sign-in 成功行、账户严格合法并匹配固定 Predict Account 时成功。缺失/畸形/重复/错序为 LAUNCH_FAILED/EVIDENCE_INVALID，唯一合法错账户为 AUTH_ACCOUNT_MISMATCH；child失败优先 START/EXIT/SIGNAL/TIMEOUT。失败停止，可能已认证，不能宣称“绝未认证”。
+- 成功 stdout 固定为 `Saved and independently verified.`（enroll）、`Check child completed; no trading authorization implied.`（普通 check，仅 child完成），或 `Sign-in verified for Predict Account 0xfc9eb66e6F22f96608058C0A711Ed048eED8c2E2; no trading authorization implied.`（显式登录）；各末尾换行、stderr 空，均不代表交易授权。
+- 每个 backend 阶段9秒业务+最多1秒清理；enroll 至多三阶段（TTY等待除外）。WSL/POSIX 主线程运行，已有 ITIMER_REAL 时拒绝。错误仅 JSON code/step/reason；退出0仅表示读回一致/普通child正常退出/显式登录证据核验通过，2为输入/TTY/身份/环境拒绝，1为后端/存储/child或证据失败。
+- 新增依赖仅批准的 jeepney==0.9.0 官方 PyPI wheel，SHA256=`97e5714520c16fc0a45695e5365a2e11b81ea79bba796e26f9f1d178cb182683`；原 pins/hashes 不变，无 extras/全局安装。plain session bus、同 UID/管理员、内存/child-env不构成强隔离或物理清零。
+
+合成测试（从 BOT 根运行；真实 Account/Jeepney，socketpair backend、PTY、无网 fake child，不读取共享 keyring/生产 .env）：
+
+```bash
+tools/predictfun/.venv/bin/python -B -m unittest discover -s tools/predictfun/tests -p test_local_signer.py -v
+```
+
+开发者自测不替代独立 Validate；真实私钥、网站控制/签名/认证/交易、冷启动和同 UID 隔离均未验证。本轮不要导出或录入真实 key。
