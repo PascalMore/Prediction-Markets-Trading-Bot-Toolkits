@@ -372,6 +372,159 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(sdk_ops.target_digest({"a": 1, "b": None}), sdk_ops.target_digest({"a": 1}))
 
 
+class KeyringConsumerTests(unittest.TestCase):
+    """Exercise the real CLI, empty pipe, FD loader and installed SDK offline."""
+
+    def setUp(self):
+        import local_signer
+        from eth_account import Account
+        self.key = b"01" * 32
+        self.controller = Account.from_key(self.key.decode()).address.lower()
+        self.sessions = []
+        self.descriptors = []
+        self.patches = [
+            patch("socket.socket.connect", side_effect=AssertionError("NETWORK_FORBIDDEN")),
+            patch.object(local_signer, "SIGNER", self.controller),
+            patch.object(local_signer, "_read_owned", return_value=self.key),
+            patch("eth_account.signers.local.LocalAccount.sign_transaction",
+                  return_value=SimpleNamespace(raw_transaction=RAW)),
+        ]
+        self.mocks = [item.start() for item in self.patches]
+        for item in self.patches:
+            self.addCleanup(item.stop)
+        self.owned, self.sign = self.mocks[2:]
+        self.account = local_signer.TRADING_ADDRESS
+        self.pipe = cli.os.pipe
+
+    def argv(self, command="plan", **changes):
+        return arguments(command, **{
+            "--chain-id": "56", "--owner": self.account,
+            "--account-mode": "predict-account", "--predict-account": self.account,
+            "--keyring": True, **changes,
+        })
+
+    def invoke(self, fault=None, allowance=0):
+        plan = cli.run(self.argv())
+        test = self
+
+        class Session(FakeSession):
+            def identity(self):
+                return OWNER if fault == "controller" else test.controller
+
+            def market(self):
+                if fault == "mutate-before":
+                    self.target["amount_atoms"] += 1
+                return super().market()
+
+            def gas_available(self, controller):
+                if fault == "interrupt":
+                    raise KeyboardInterrupt
+                return super().gas_available(controller)
+
+        def factory(target, rpc):
+            session = Session(target, rpc, fault, allowance)
+            self.sessions.append(session)
+            return session
+
+        def pipe():
+            pair = self.pipe()
+            self.descriptors.extend(pair)
+            return pair
+
+        with patch.object(cli.os, "pipe", side_effect=pipe):
+            return cli.run(self.argv("approve", **{
+                "--execute": True, "--confirm-target": sdk_ops.target_digest(plan.target),
+                "--rpc-url": "https://offline.invalid",
+            }), session_factory=factory)
+
+    def assert_closed(self):
+        import os
+        for descriptor in self.descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_real_pipe_and_original_fd_loader_reach_sdk_once(self):
+        import os
+        original = sdk_ops.fd_signer_loader
+
+        def loader(fd):
+            self.assertGreaterEqual(fd, 3)
+            self.assertFalse(os.get_inheritable(fd))
+            self.assertEqual(self.owned.call_count, 1)
+            return original(fd)
+
+        with patch.object(sdk_ops, "fd_signer_loader", side_effect=loader) as loaded:
+            result = self.invoke()
+        self.assertTrue(result.completed)
+        self.assertEqual(loaded.call_count, 1)
+        self.assertEqual(self.sign.call_count, 1)
+        self.assertEqual(self.sessions[-1].sends, 1)
+        self.assert_closed()
+
+    def test_readonly_and_noop_never_read_key(self):
+        cli.run(self.argv())
+        target = cli.run(self.argv()).target
+        session = FakeSession(target, None)
+        session.identity = lambda: self.controller
+        cli.run(self.argv("check"), session_factory=lambda *_: session)
+        self.assertTrue(self.invoke(allowance=10).completed)
+        self.owned.assert_not_called()
+        self.sign.assert_not_called()
+        self.assert_closed()
+
+    def test_preflight_failures_and_controller_mismatch_close_empty_pipe(self):
+        for fault in ("controller", "market", "gas"):
+            with self.subTest(fault=fault), self.assertRaises(ToolError):
+                self.invoke(fault)
+            self.assert_closed()
+        self.owned.assert_not_called()
+        self.sign.assert_not_called()
+
+    def test_changed_target_is_rejected_before_secret(self):
+        with self.assertRaises(ToolError) as caught:
+            self.invoke("mutate-before")
+        self.assertEqual(caught.exception.reason, "TARGET_CHANGED")
+        self.owned.assert_not_called()
+        self.assert_closed()
+
+    def test_changed_target_during_key_read_never_signs(self):
+        def read():
+            self.sessions[-1].target["amount_atoms"] += 1
+            return self.key
+        self.owned.side_effect = read
+        with self.assertRaises(ToolError) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.reason, "TARGET_CHANGED")
+        self.sign.assert_not_called()
+        self.assert_closed()
+
+    def test_pipe_write_failure_and_interrupt_close_fds(self):
+        with patch.object(cli.os, "write", side_effect=OSError("SYNTHETIC_SECRET")):
+            with self.assertRaises(ToolError):
+                self.invoke()
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke("interrupt")
+        self.sign.assert_not_called()
+        self.assert_closed()
+
+    def test_missing_confirmation_and_wrong_account_allocate_no_pipe(self):
+        with patch.object(cli.os, "pipe", side_effect=AssertionError("PIPE_FORBIDDEN")):
+            for argv in (self.argv("approve"), self.argv("approve", **{
+                    "--execute": True, "--confirm-target": "wrong"}),
+                    self.argv(**{"--owner": OWNER, "--predict-account": OWNER})):
+                with self.subTest(argv=argv), self.assertRaises(ToolError):
+                    cli.run(argv)
+        self.owned.assert_not_called()
+
+    def test_sent_unknown_is_not_retried(self):
+        result = self.invoke("receipt")
+        self.assertFalse(result.completed)
+        self.assertIsNotNone(result.expected_tx_hash)
+        self.assertEqual(self.sessions[-1].sends, 1)
+        self.assertEqual(self.sign.call_count, 1)
+        self.assert_closed()
+
+
 class ContractReadTests(unittest.TestCase):
     """Exercise the actual ReadSession and SDK ABI decoders with synthetic chain logs."""
 
@@ -379,6 +532,72 @@ class ContractReadTests(unittest.TestCase):
         self.guard = patch("socket.socket.connect", side_effect=AssertionError("NETWORK_FORBIDDEN"))
         self.guard.start()
         self.addCleanup(self.guard.stop)
+
+    def test_mainnet_market_key_is_request_local_and_redirects_fail_closed(self):
+        import os
+        target = cli.run(arguments(**{"--chain-id": "56"})).target
+        session = sdk_ops.ReadSession(target, "https://offline.invalid")
+        digest = sdk_ops.target_digest(target)
+        market = {"id": 7, "isNegRisk": False, "isYieldBearing": False}
+        for status in (200, 302, 401, 503):
+            response = SimpleNamespace(status_code=status,
+                                       json=lambda: {"success": True, "data": market})
+            with self.subTest(status=status), patch.dict(os.environ, {
+                    "YQUANT_PREDICT_FUN_TOKEN": "synthetic-api",
+                    "PM_PREDICT_API_KEY": "synthetic-api"}, clear=True), patch(
+                    "requests.get", return_value=response) as request:
+                if status == 200:
+                    self.assertEqual(session.market(), market)
+                else:
+                    with self.assertRaises(ToolError):
+                        session.market()
+                self.assertEqual(request.call_args.args,
+                                 ("https://api.predict.fun/v1/markets/7",))
+                self.assertEqual(request.call_args.kwargs["headers"],
+                                 {"x-api-key": "synthetic-api"})
+                self.assertEqual(request.call_args.kwargs["timeout"], 15)
+                self.assertFalse(request.call_args.kwargs["allow_redirects"])
+                self.assertNotIn("x-api-key", session.web3.provider._request_kwargs.get("headers", {}))
+                self.assertEqual(sdk_ops.target_digest(target), digest)
+
+    def test_market_api_source_failures_have_no_request_and_testnet_needs_no_key(self):
+        import os
+        target = cli.run(arguments(**{"--chain-id": "56"})).target
+        session = sdk_ops.ReadSession(target, "https://offline.invalid")
+        for environment in ({}, {"YQUANT_PREDICT_FUN_TOKEN": " "},
+                            {"YQUANT_PREDICT_FUN_TOKEN": "one", "PM_PREDICT_API_KEY": "two"}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True), patch(
+                    "requests.get", side_effect=AssertionError("REQUEST_FORBIDDEN")):
+                with self.assertRaises(ToolError):
+                    session.market()
+        target = cli.run(arguments()).target
+        session = sdk_ops.ReadSession(target, "https://offline.invalid")
+        response = SimpleNamespace(status_code=200, json=lambda: {
+            "success": True, "data": {"id": 7, "isNegRisk": False, "isYieldBearing": False}})
+        with patch.dict(os.environ, {}, clear=True), patch("requests.get", return_value=response) as request:
+            session.market()
+            self.assertEqual(request.call_args.kwargs["headers"], {})
+
+    def test_bad_market_envelope_route_and_transport_never_look_like_success(self):
+        import os
+        target = cli.run(arguments(**{"--chain-id": "56"})).target
+        session = sdk_ops.ReadSession(target, "https://offline.invalid")
+        market = {"id": 7, "isNegRisk": False, "isYieldBearing": False}
+        for envelope in ({"success": False, "data": market}, {"data": market},
+                         {"success": True, "data": {**market, "id": 8}},
+                         {"success": True, "data": {**market, "isNegRisk": True}},
+                         {"success": True, "data": []}):
+            response = SimpleNamespace(status_code=200, json=lambda: envelope)
+            with self.subTest(envelope=envelope), patch.dict(os.environ, {
+                    "YQUANT_PREDICT_FUN_TOKEN": "synthetic-api"}, clear=True), patch(
+                    "requests.get", return_value=response):
+                with self.assertRaises(ToolError):
+                    session.market()
+        with patch.dict(os.environ, {"YQUANT_PREDICT_FUN_TOKEN": "synthetic-api"}, clear=True), patch(
+                "requests.get", side_effect=TimeoutError("SYNTHETIC_SECRET")):
+            with self.assertRaises(ToolError) as caught:
+                session.market()
+            self.assertNotIn("SYNTHETIC_SECRET", str(caught.exception))
 
     def fixture(self, neg=False, yielding=False, batch=False):
         from eth_abi import encode

@@ -399,6 +399,26 @@ pub trait OrderVenue: Send + Sync {
     }
 }
 
+/// The official facts about one round's outcome.
+///
+/// These are the venue's own words, carried through unchanged. A missing fact
+/// stays missing: it is never inferred from a local price or a start price.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoundFacts {
+    /// The oracle's state, e.g. `RESOLVED`.
+    pub oracle_status: Option<String>,
+    /// The matching state, e.g. `OPEN` or `CLOSED`.
+    pub trading_status: Option<String>,
+    /// The first outcome's status, e.g. `WON` or `LOST`.
+    pub yes_status: Option<String>,
+    /// The second outcome's status.
+    pub no_status: Option<String>,
+    /// The number of price decimals the market accepts, when stated.
+    pub decimal_precision: Option<u32>,
+    /// The official price feed, e.g. `CHAINLINK`. Unknown stays unknown.
+    pub price_feed_provider: Option<String>,
+}
+
 /// A market as the strategy bots see it.
 #[derive(Debug, Clone, Default)]
 pub struct TradableMarket {
@@ -426,6 +446,8 @@ pub struct TradableMarket {
     pub payout_yes: Option<f64>,
     /// Category and tags, when they came along with the market.
     pub labels: Option<(Option<String>, Vec<String>)>,
+    /// The venue's own round facts, when the market carried them.
+    pub round_facts: Option<RoundFacts>,
 }
 
 impl TradableMarket {

@@ -10,7 +10,7 @@
 //! trades a real quote would get, and they don't show adverse selection the way
 //! real ones do. Treat paper P&L as a check of the plumbing, not a forecast.
 
-use crate::config::{AppConfig, FiltersConfig, StrategyLimits};
+use crate::config::{AppConfig, ControlledMode, ControlledRun, FiltersConfig, StrategyLimits};
 use crate::models::{BookLevel, BookSnapshot, OrderType, PlannedOrder, Side, VenueId};
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::market_cache::MarketInfo;
@@ -29,6 +29,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 pub mod live;
+pub mod paper;
+
+pub use paper::{PaperCash, PaperSnapshot, Settlement, EVENT_PREFIX};
 
 /// The venue's minimum order value.
 pub const MIN_ORDER_USD: f64 = 1.0;
@@ -70,6 +73,20 @@ pub enum Blocked {
     NothingHeld,
     WouldCross,
     ThinBook,
+    /// The controlled run's deadline passed, or its parent stopped it.
+    Deadline,
+    /// The loss limit latched this run.
+    LossLatch,
+    /// The data a safe entry needs isn't there.
+    DataIncomplete,
+    /// Not enough virtual cash for the worst case.
+    InsufficientCash,
+    /// The market's rules couldn't be confirmed.
+    MarketRulesUnknown,
+    /// The venue's official result contradicts itself.
+    SettlementConflict,
+    /// A controlled run doesn't rest orders.
+    ControlledRestUnsupported,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +176,34 @@ struct State {
     next_paper_id: u64,
     /// The live path's reservations, cumulative facts and tombstones.
     live: live::LiveState,
+    /// The controlled paper cash model, when this is a controlled run.
+    paper: Option<PaperCash>,
+    /// Why new entries stopped, when a controlled run stopped.
+    entry_stop_reason: Option<ControlledStop>,
+}
+
+/// Why a controlled run stopped adding risk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlledStop {
+    /// The fixed deadline passed.
+    Deadline,
+    /// The parent lost supervision of the run.
+    ParentLost,
+    /// Invalid supervisor protocol input.
+    ControlChannel,
+    /// An official result conflicts with the traded round or applied result.
+    SettlementConflict,
+}
+
+impl ControlledStop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlledStop::Deadline => "DEADLINE",
+            ControlledStop::ParentLost => "PARENT_LOST",
+            ControlledStop::ControlChannel => "CONTROL_CHANNEL",
+            ControlledStop::SettlementConflict => "SETTLEMENT_CONFLICT",
+        }
+    }
 }
 
 impl State {
@@ -263,9 +308,12 @@ impl State {
         let mut open_cost = 0.0;
         for h in self.holdings.values() {
             let mark = self
-                .marks
-                .get(&h.token)
-                .copied()
+                .paper
+                .as_ref()
+                .and_then(|paper| paper.marks.get(&h.token))
+                .filter(|mark| mark.valid)
+                .and_then(|mark| mark.price)
+                .or_else(|| self.marks.get(&h.token).copied())
                 .unwrap_or_else(|| h.avg_price());
             unrealized += h.shares * mark - h.cost;
             open_cost += h.cost;
@@ -277,7 +325,11 @@ impl State {
             open_cost,
             holdings: self.holdings.len(),
             resting: self.resting.len(),
-            fees_in_cash: self.live.fees_in_cash,
+            fees_in_cash: if self.paper.is_some() {
+                self.fees
+            } else {
+                self.live.fees_in_cash
+            },
         }
     }
 }
@@ -312,6 +364,9 @@ pub struct Broker {
     gate: Option<Arc<crate::service::predict_fun::account::AccountGate>>,
     /// The identity the gate is keyed on.
     identity: Option<crate::service::venue::AccountIdentity>,
+    /// The controlled run's identity and clock, when this is a controlled run.
+    controlled: Option<ControlledRun>,
+    control_changed: tokio::sync::Notify,
 }
 
 impl Broker {
@@ -332,6 +387,8 @@ impl Broker {
             state: Mutex::new(State::default()),
             gate: None,
             identity: None,
+            controlled: None,
+            control_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -424,6 +481,12 @@ impl Broker {
     }
 
     fn check_entry(&self, state: &State, market_id: u64, usd: f64) -> Option<Blocked> {
+        if self.controlled.is_some()
+            && (self.controlled.as_ref().is_some_and(ControlledRun::stopped)
+                || state.entry_stop_reason.is_some())
+        {
+            return Some(Blocked::Deadline);
+        }
         if state.halted {
             Some(Blocked::Halted)
         } else if usd < MIN_ORDER_USD {
@@ -450,6 +513,9 @@ impl Broker {
         limit: f64,
         yes_book: &BookSnapshot,
     ) -> Result<TakeResult> {
+        if self.state.lock().paper.is_some() {
+            return self.controlled_take(market, token, side, shares, limit, yes_book);
+        }
         let limit = clean(limit);
         let shares = {
             let state = self.state.lock();
@@ -704,6 +770,11 @@ impl Broker {
         ttl_secs: u64,
         yes_book: &BookSnapshot,
     ) -> Result<std::result::Result<String, Blocked>> {
+        if self.controlled.is_some() {
+            // A controlled run trades one taker order at a time. It has no maker
+            // model, so a resting order is refused rather than half supported.
+            return Ok(Err(Blocked::ControlledRestUnsupported));
+        }
         let price = clean(price);
         {
             let state = self.state.lock();
@@ -964,6 +1035,10 @@ impl Broker {
     /// simulates fills and expiry.
     pub fn observe(&self, market: &TradableMarket, yes_book: &BookSnapshot) {
         let mut state = self.state.lock();
+        if state.paper.is_some() {
+            self.controlled_observe(&mut state, market, yes_book);
+            return;
+        }
         if let Some(mid) = yes_book.mid() {
             state.marks.insert(market.yes_token.clone(), mid);
             state.marks.insert(market.no_token.clone(), 1.0 - mid);
@@ -1089,6 +1164,7 @@ impl Broker {
 
     /// Close out holdings in markets whose result is known.
     pub async fn settle_resolved(&self, data: &dyn MarketData) -> Result<()> {
+        let controlled = self.state.lock().paper.is_some();
         let held: HashSet<u64> = self.holdings().iter().map(|h| h.market_id).collect();
         for id in held {
             let market = match data.market(id).await {
@@ -1098,6 +1174,10 @@ impl Broker {
                     continue;
                 }
             };
+            if controlled {
+                self.controlled_settle(&market);
+                continue;
+            }
             if let Some(payout_yes) = market.payout_yes {
                 self.settle(&market, payout_yes);
             }
@@ -1250,6 +1330,14 @@ impl Ctx {
     /// Connect to the configured venue. The strategy bots need market listing and
     /// resting orders, which only the Predict.fun adapter has so far.
     pub fn connect(cfg: AppConfig, strategy: &str) -> Result<Self> {
+        Self::connect_with_trader(cfg, strategy, PredictFunTrader::new)
+    }
+
+    pub(super) fn connect_with_trader(
+        cfg: AppConfig,
+        strategy: &str,
+        trader_factory: impl FnOnce(Arc<PredictFunClient>, &AppConfig) -> Result<PredictFunTrader>,
+    ) -> Result<Self> {
         if cfg.venue != VenueId::PredictFun {
             bail!(
                 "{strategy} runs on Predict.fun only so far: use --venue predict-fun. The \
@@ -1259,7 +1347,36 @@ impl Ctx {
         }
         let client = PredictFunClient::new(&cfg)?;
         let live = cfg.live_trading_allowed();
-        let trader = match PredictFunTrader::new(Arc::clone(&client), &cfg) {
+        // A controlled unsigned paper run has no wallet at all: it never builds
+        // a signer or a trader, so there is nothing that could sign or send.
+        if let Some(run) = cfg
+            .controlled
+            .clone()
+            .filter(|run| run.mode == ControlledMode::UnsignedPaper)
+        {
+            let paper = cfg
+                .controlled_paper
+                .as_ref()
+                .ok_or_else(|| anyhow!("CONTROLLED_MODE: the controlled cash is missing"))?;
+            if paper.fee_model != paper::FEE_MODEL_NET_SHARES {
+                bail!("CONTROLLED_MODE: the fee model must be paper_net_shares");
+            }
+            let broker = Broker::new(cfg.strategies.limits.clone(), false, None, None)?
+                .with_controlled_paper(run, paper.initial_cash)?;
+            let broker = Arc::new(broker);
+            // The parent holds the other end of this pipe. A control byte or a
+            // closed pipe stops new risk through the broker's own lock. The
+            // thread only sets that flag: it never runs the strategy, never
+            // touches the network and never holds a secret.
+            paper::watch_control_channel(Arc::clone(&broker));
+            return Ok(Self {
+                cfg,
+                data: client.clone(),
+                client,
+                broker,
+            });
+        }
+        let trader = match trader_factory(Arc::clone(&client), &cfg) {
             Ok(trader) => Some(Arc::new(trader)),
             Err(e) if !live => {
                 info!(reason = %e, "no wallet: simulating fills without signing orders");
@@ -1282,11 +1399,16 @@ impl Ctx {
             }
             broker = broker.with_account_gate(Arc::clone(&trader.gate), trader.identity());
         }
+        broker.controlled = cfg.controlled.clone();
+        let broker = Arc::new(broker);
+        if broker.controlled.is_some() {
+            paper::watch_control_channel(Arc::clone(&broker));
+        }
         Ok(Self {
             cfg,
             data: client.clone(),
             client,
-            broker: Arc::new(broker),
+            broker,
         })
     }
 
@@ -1422,6 +1544,18 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
         ctx.broker.seed_from_venue().await?;
     }
 
+    // A controlled run watches its own deadline: it stops adding risk when the
+    // window closes, whatever the strategy wants.
+    let controlled = ctx.broker.controlled_run().cloned();
+    if let Some(run) = &controlled {
+        info!(
+            run_id = %run.run_id,
+            mode = run.mode.as_str(),
+            deadline_at = %run.deadline_at,
+            "controlled run starting"
+        );
+    }
+
     let mut ticker =
         tokio::time::interval(Duration::from_secs(ctx.cfg.strategies.poll_secs.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1433,7 +1567,16 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
     loop {
         tokio::select! {
             biased;
+            _ = ctx.broker.wait_controlled_stop(), if controlled.is_some() => {
+                ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                return Ok(());
+            }
             _ = &mut shutdown => {
+                if controlled.is_some() {
+                    ctx.broker.stop_entries(ControlledStop::ParentLost);
+                    ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                    return Ok(());
+                }
                 info!(strategy = name, "shutdown signal received; pulling quotes");
                 if let Err(e) = ctx.broker.cancel_all().await {
                     error!(error = ?e, "couldn't pull quotes: they stay open until they expire");
@@ -1442,6 +1585,13 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 return Ok(());
             }
             _ = ticker.tick() => {
+                if let Some(run) = &controlled {
+                    if run.stopped() {
+                        ctx.broker.stop_entries(ControlledStop::Deadline);
+                        ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                        return Ok(());
+                    }
+                }
                 if let Err(e) = ctx.broker.sync_live().await {
                     warn!(error = ?e, "order state check failed");
                 }
@@ -1458,7 +1608,16 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 } else {
                     tokio::select! {
                         biased;
+                        _ = ctx.broker.wait_controlled_stop(), if controlled.is_some() => {
+                            ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                            return Ok(());
+                        }
                         _ = &mut shutdown => {
+                            if controlled.is_some() {
+                                ctx.broker.stop_entries(ControlledStop::ParentLost);
+                                ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                                return Ok(());
+                            }
                             info!(strategy = name, "shutdown signal received; pulling quotes");
                             if let Err(e) = ctx.broker.cancel_all().await {
                                 error!(error = ?e, "couldn't pull quotes");
@@ -1484,7 +1643,16 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 }
                 if last_settle.elapsed() >= SETTLE_CHECK_EVERY {
                     last_settle = Instant::now();
-                    if let Err(e) = ctx.broker.settle_resolved(ctx.data.as_ref()).await {
+                    if controlled.is_some() && !ctx.broker.is_live() {
+                        tokio::select! {
+                            biased;
+                            _ = ctx.broker.wait_controlled_stop() => {
+                                ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                                return Ok(());
+                            }
+                            _ = ctx.broker.settle_resolved(ctx.data.as_ref()) => (),
+                        }
+                    } else if let Err(e) = ctx.broker.settle_resolved(ctx.data.as_ref()).await {
                         warn!(error = ?e, "settlement check failed");
                     }
                 }
@@ -1499,6 +1667,10 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
 
 fn log_summary(name: &str, ctx: &Ctx) {
     let s = ctx.broker.summary();
+    if ctx.broker.paper_snapshot().is_some() {
+        // A controlled run's accounting is its own event stream.
+        paper::emit_summary(ctx.broker.as_ref());
+    }
     info!(
         strategy = name,
         live = ctx.broker.is_live(),
@@ -1549,7 +1721,7 @@ mod tests {
         HeldPosition, OrderTicket, PostedOrder, RemoveResult, RestingState,
     };
 
-    fn limits() -> StrategyLimits {
+    pub(super) fn limits() -> StrategyLimits {
         StrategyLimits {
             max_order_usd: 10.0,
             max_market_usd: 20.0,
@@ -1564,7 +1736,7 @@ mod tests {
 
     /// Records what reached the venue, standing in for it on a live run.
     #[derive(Default)]
-    struct FakeVenue {
+    pub(super) struct FakeVenue {
         placed: Mutex<Vec<PlannedOrder>>,
         posted: Mutex<Vec<LimitOrder>>,
         removed: Mutex<Vec<String>>,

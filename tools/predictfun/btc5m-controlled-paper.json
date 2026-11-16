@@ -1,0 +1,115 @@
+{
+  "bot": {
+    "enable_trading": false,
+    "mock_trading": true,
+    "wallets_to_track": []
+  },
+  "controlled_paper": {
+    "fee_model": "paper_net_shares",
+    "initial_cash": 100.0
+  },
+  "exchange": {
+    "chain_id": 137,
+    "ctf_exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+    "domain_name": "Polymarket CTF Exchange",
+    "domain_version": "2",
+    "exchange_v3_address": "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa",
+    "neg_risk_exchange_address": "0xe2222d279d744050d28e00520010520000310F59"
+  },
+  "filters": {
+    "_comment_mode": "Strict allowlist: when any *_allow list is non-empty, only matching markets are copied. Block lists always win.",
+    "categories_allow": [
+      "Politics",
+      "Sports",
+      "Crypto"
+    ],
+    "categories_block": [
+      "Memes"
+    ],
+    "per_category_max_open_usd": {
+      "Crypto": 400.0,
+      "Politics": 500.0,
+      "Sports": 300.0
+    },
+    "per_tag_max_open_usd": {},
+    "slug_allow": [],
+    "slug_block": [],
+    "tags_allow": [],
+    "tags_block": [
+      "satire"
+    ]
+  },
+  "predict_fun": {
+    "network": "mainnet",
+    "wallets_to_track": []
+  },
+  "risk": {
+    "consecutive_trigger": 2,
+    "large_trade_shares": 1500.0,
+    "min_depth_usd": 200.0,
+    "sequence_window_secs": 30,
+    "trip_duration_secs": 120
+  },
+  "site": {
+    "clob_api_base": "https://clob.polymarket.com",
+    "clob_wss_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    "data_api_base": "https://data-api.polymarket.com",
+    "gamma_api_base": "https://gamma-api.polymarket.com",
+    "polygon_rpc_url": "https://polygon.drpc.org",
+    "polygon_ws_url": "wss://polygon.drpc.org"
+  },
+  "strategies": {
+    "_comment": "Applies to every strategy except copy trading. Limits are in USD and are hard caps.",
+    "btc_arb": {
+      "min_edge": 0.03,
+      "min_secs_left": 30,
+      "order_usd": 2.0,
+      "round_interval_secs": 300,
+      "symbols": [
+        "BTCUSDT"
+      ],
+      "vol_floor": 5e-05
+    },
+    "limits": {
+      "max_loss_usd": 20.0,
+      "max_market_usd": 2.0,
+      "max_order_usd": 2.0,
+      "max_total_usd": 10.0
+    },
+    "poll_secs": 5,
+    "quote_ttl_secs": 300,
+    "rescan_secs": 300
+  },
+  "strategy": {
+    "adaptive_max_percent": 30.0,
+    "adaptive_min_percent": 5.0,
+    "adaptive_threshold_usd": 1000.0,
+    "copy_size": 20.0,
+    "copy_strategy": "PERCENTAGE",
+    "max_order_size_usd": 500.0,
+    "min_order_size_usd": 5.0,
+    "min_whale_shares_to_copy": 10.0,
+    "trade_multiplier": 1.0
+  },
+  "tp_sl": {
+    "default_stop_loss_pct": 30.0,
+    "default_take_profit_pct": 50.0,
+    "enabled": true,
+    "per_category_sl_pct": {
+      "Politics": 25.0
+    },
+    "per_category_tp_pct": {
+      "Politics": 40.0,
+      "Sports": 30.0
+    },
+    "poll_interval_secs": 15
+  },
+  "trading": {
+    "order_expiration_secs": 60,
+    "poll_interval_secs": 5,
+    "price_buffer": 0.005,
+    "rate_limit": 25,
+    "rate_window_secs": 10
+  },
+  "venue": "predict_fun"
+}

@@ -1068,6 +1068,7 @@ fn tradable_market(market: &MarketState) -> TradableMarket {
         polymarket_condition_ids: Vec::new(),
         payout_yes: None,
         labels: None,
+        round_facts: None,
     }
 }
 

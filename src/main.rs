@@ -44,6 +44,23 @@ struct Cli {
     #[arg(long)]
     predict_rpc_url: Option<String>,
 
+    /// Run in the controlled unsigned-paper mode. Only the fixed `run btc-arb`
+    /// command accepts it, and only with the run's identity below.
+    #[arg(long)]
+    controlled_mode: Option<String>,
+
+    /// The controlled run's public id.
+    #[arg(long)]
+    controlled_run_id: Option<String>,
+
+    /// The controlled run's start, in UTC.
+    #[arg(long)]
+    controlled_started_at: Option<String>,
+
+    /// The controlled run's deadline, in UTC.
+    #[arg(long)]
+    controlled_deadline_at: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -167,8 +184,61 @@ async fn main() -> Result<()> {
         rpc_url,
     };
 
-    let mut cfg =
-        AppConfig::load(&cli.config, &cli.credentials).context("loading configuration")?;
+    let controlled = polymarket_toolkits::config::ControlledRun::from_arguments(
+        cli.controlled_mode.as_deref(),
+        cli.controlled_run_id.as_deref(),
+        cli.controlled_started_at.as_deref(),
+        cli.controlled_deadline_at.as_deref(),
+    )?;
+
+    let mut cfg = match &controlled {
+        Some(run) => {
+            // Only the fixed strategy may run in a controlled mode, and only
+            // with the controlled configuration.
+            if !matches!(
+                cli.command,
+                Some(Command::Run {
+                    bot: BotKindArg::BtcArb
+                })
+            ) {
+                anyhow::bail!("CONTROLLED_MODE: only 'run btc-arb' may run in a controlled mode");
+            }
+            if cli.venue.is_some() {
+                anyhow::bail!("CONTROLLED_MODE: the venue is fixed and can't be overridden");
+            }
+            if run.mode == polymarket_toolkits::config::ControlledMode::SignedFutureLive {
+                let expected = format!(
+                    "56:{}:predict-account",
+                    "0xfc9eb66e6f22f96608058c0a711ed048eed8c2e2"
+                );
+                if cli
+                    .predict_budget_confirmation
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    != Some(expected.as_str())
+                    || cli.predict_rpc_url.is_none()
+                {
+                    anyhow::bail!("CONTROLLED_MODE: LIVE_CONFIRMATION");
+                }
+                let url = url::Url::parse(cli.predict_rpc_url.as_deref().unwrap())
+                    .map_err(|_| anyhow::anyhow!("CONTROLLED_MODE"))?;
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                {
+                    anyhow::bail!("CONTROLLED_MODE: RPC_INPUT");
+                }
+            } else if cli.predict_budget_confirmation.is_some() || cli.predict_rpc_url.is_some() {
+                anyhow::bail!("CONTROLLED_MODE: LIVE_OPTION_REFUSED");
+            }
+            let mut cfg = AppConfig::load_controlled(&cli.config, run.mode)?;
+            cfg.controlled = Some(run.clone());
+            cfg
+        }
+        None => AppConfig::load(&cli.config, &cli.credentials).context("loading configuration")?,
+    };
     if let Some(venue) = cli.venue {
         cfg.venue = venue.into();
     }

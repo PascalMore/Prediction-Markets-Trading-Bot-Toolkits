@@ -312,6 +312,43 @@ def fd_signer_loader(fd: int) -> Any:
         raise ToolError(ErrorCode.INVALID_INPUT, "signer", "BAD_SIGNER_FD_CONTENT") from None
 
 
+def read_owned_key() -> bytes:
+    """Read the owned key from the local keyring, once, on demand.
+
+    The key is returned to the caller and nowhere else: no environment, no
+    command line, no file. A backend that can't deliver it fails closed.
+    """
+    import local_signer
+    try:
+        key = local_signer._read_owned()
+    except Exception:
+        raise ToolError(ErrorCode.EXECUTION_NOT_ENABLED, "signer", "KEYRING_UNAVAILABLE") from None
+    if not key or len(key) > 66:
+        raise ToolError(ErrorCode.INVALID_INPUT, "signer", "BAD_SIGNER_FD_CONTENT")
+    return key
+
+
+def market_api_key() -> str:
+    """The market API key, from the one existing source.
+
+    The key is read from the environment the operator already set, never from
+    a file the SDK loads. A missing or blank key fails the read closed.
+    """
+    source = os.environ.get("YQUANT_PREDICT_FUN_TOKEN", "")
+    if not source.strip():
+        raise ToolError(ErrorCode.READ_UNAVAILABLE, "market", "API_SOURCE")
+    other = os.environ.get("PM_PREDICT_API_KEY")
+    if other is not None and other != source:
+        raise ToolError(ErrorCode.RECONCILIATION_REQUIRED, "market", "API_CONFLICT")
+    return source
+
+
+def keyring_expected_controller() -> str:
+    """The fixed signer the keyring's key belongs to."""
+    import local_signer
+    return local_signer.SIGNER.lower()
+
+
 class ReadSession:
     """Read-only contracts from the pinned SDK; construction has no signer."""
     def __init__(self, target: dict[str, Any], rpc_url: str | None) -> None:
@@ -372,17 +409,35 @@ class ReadSession:
     def market(self) -> dict[str, Any]:
         """Read only the explicit official public market; auth/shape failure is unknown."""
         import requests
-        host = "api.predict.fun" if self.target["chain_id"] == 56 else "api-testnet.predict.fun"
-        response = requests.get(f"https://{host}/v1/markets/{self.target['market_id']}",
-                                timeout=15, auth=lambda request: request, allow_redirects=False)
-        response.raise_for_status()
-        market = response.json()["data"]
-        if str(market["id"]) != self.target["market_id"] or any(
-            market[key] is not self.target[field] for key, field in
-            (("isNegRisk", "is_neg_risk"), ("isYieldBearing", "is_yield_bearing"))
-        ):
-            raise ToolError(ErrorCode.RECONCILIATION_REQUIRED, "market", "ROUTE_MISMATCH")
-        return market
+        mainnet = self.target["chain_id"] == 56
+        host = "api.predict.fun" if mainnet else "api-testnet.predict.fun"
+        headers = {}
+        if mainnet:
+            # The mainnet market API needs its own key. It goes only to this
+            # one request, and only when the source has one.
+            headers["x-api-key"] = market_api_key()
+        market_id = str(parse_positive_int(self.target["market_id"], "market_id"))
+        try:
+            response = requests.get(f"https://{host}/v1/markets/{market_id}",
+                                    timeout=15, headers=headers,
+                                    auth=lambda request: request, allow_redirects=False)
+            if not 200 <= response.status_code < 300:
+                raise ValueError("HTTP_STATUS")
+            envelope = response.json()
+            if (not isinstance(envelope, dict) or envelope.get("success") is not True
+                    or not isinstance(envelope.get("data"), dict)):
+                raise ValueError("ENVELOPE")
+            market = envelope["data"]
+            if str(market["id"]) != market_id or any(
+                market[key] is not self.target[field] for key, field in
+                (("isNegRisk", "is_neg_risk"), ("isYieldBearing", "is_yield_bearing"))
+            ):
+                raise ToolError(ErrorCode.RECONCILIATION_REQUIRED, "market", "ROUTE_MISMATCH")
+            return market
+        except ToolError:
+            raise
+        except Exception:
+            raise ToolError(ErrorCode.READ_UNAVAILABLE, "market", "READ_UNAVAILABLE") from None
 
     def position_id(self) -> int:
         """Use the route's actual collateral, including NegRisk wrapped collateral."""
@@ -563,6 +618,7 @@ def execute_target(
     execute: bool = False, confirmation: str | None = None, signer_fd: int | None = None,
     tx_hash: str | None = None, session_factory: Callable[..., Any] = ReadSession,
     signer_loader: Callable[[int], Any] = fd_signer_loader,
+    expected_controller: str | None = None,
 ) -> OperationResult:
     """Execute one explicit target, or signer-free check of the original receipt.
 
@@ -575,11 +631,21 @@ def execute_target(
         raise ToolError(ErrorCode.INVALID_INPUT, "execute", "TARGET_DIGEST_MISMATCH")
     if tx_hash is not None:
         tx_hash = parse_hash(tx_hash, "tx_hash")
-    result = OperationResult(target["operation"], target)
+    frozen_target = json.loads(json.dumps(target))
+
+    def require_confirmed_target() -> None:
+        if target != frozen_target:
+            raise ToolError(ErrorCode.INVALID_INPUT, "execute", "TARGET_CHANGED")
+
+    result = OperationResult(target["operation"], frozen_target)
     try:
         session = session_factory(target, rpc_url)
         controller = session.identity()
+        if expected_controller is not None and controller.lower() != expected_controller.lower():
+            # The controller must be the fixed signer before any key is read.
+            raise ToolError(ErrorCode.ACCOUNT_MISMATCH, "identity", "CONTROLLER_MISMATCH")
         session.market()
+        require_confirmed_target()
         step = None
         if target["operation"] == "approve":
             step = select_step(target, approval_steps(target))
@@ -613,12 +679,16 @@ def execute_target(
         else:
             before = session.redemption_before()
         session.gas_available(controller)
+        require_confirmed_target()
         signer = load_signer(signer_loader, signer_fd,
                              ReadContext(controller, target["chain_id"], rpc_url))
+        require_confirmed_target()
         # Standard SDK redeems all of the selected set: reread immediately before signing.
         if before is not None and session.redemption_before() != before:
             raise ToolError(ErrorCode.RECONCILIATION_REQUIRED, "before", "BALANCE_CHANGED")
+        require_confirmed_target()
         builder = session.signed_builder(signer)
+        require_confirmed_target()
     except Exception as error:
         if command == "check" and tx_hash is not None:
             result.expected_tx_hash = tx_hash

@@ -23,7 +23,7 @@ use crate::models::{BookLevel, BookSnapshot, OrderType, PlannedOrder, Side, Venu
 use crate::service::market_cache::MarketInfo;
 use crate::service::midprice::MidpriceSource;
 use crate::service::venue::{
-    AccountIdentity, AccountMode, MarketData, MarketQuery, MarketSource, OrderVenue,
+    AccountIdentity, AccountMode, MarketData, MarketQuery, MarketSource, OrderVenue, RoundFacts,
     TradableMarket, VenueError, VenueErrorCode,
 };
 use alloy_primitives::{address, eip191_hash_message, keccak256, Address, B256, U256};
@@ -223,6 +223,10 @@ struct ApiVariantData {
     end_price: Option<f64>,
     #[serde(default)]
     price_feed_symbol: Option<String>,
+    /// The official price feed's own name, e.g. `CHAINLINK`. Absent stays
+    /// unknown: it is never inferred from the symbol.
+    #[serde(default)]
+    price_feed_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -898,6 +902,14 @@ fn tradable(
         polymarket_condition_ids: market.polymarket_condition_ids.clone(),
         payout_yes,
         labels,
+        round_facts: Some(RoundFacts {
+            oracle_status: Some(market.status.clone()),
+            trading_status: Some(market.trading_status.clone()),
+            yes_status: outcome(0).and_then(|o| o.status.clone()),
+            no_status: outcome(1).and_then(|o| o.status.clone()),
+            decimal_precision: market.decimal_precision,
+            price_feed_provider: variant.price_feed_provider.clone(),
+        }),
     }
 }
 
@@ -2302,6 +2314,7 @@ mod tests {
                 start_price: Some(start),
                 end_price: Some(end),
                 price_feed_symbol: None,
+                price_feed_provider: None,
             }),
             markets: Vec::new(),
             tags: None,

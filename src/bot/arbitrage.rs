@@ -11,8 +11,8 @@
 //! still runs on a Coinbase price to exercise the path, but only ever on paper:
 //! the feeds differ by enough to swamp a small edge.
 
-pub mod replay;
 pub mod history;
+pub mod replay;
 
 use crate::bot::quoting::Known;
 use crate::bot::runtime::{drive, shares_for, Ctx, Strategy, TakeResult};
@@ -44,6 +44,8 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         known: Known::default(),
         rounds: Vec::new(),
         last_scan: None,
+        #[cfg(test)]
+        inputs: None,
     };
     drive(&mut bot, &ctx).await
 }
@@ -56,6 +58,8 @@ struct RoundTaker {
     known: Known,
     rounds: Vec<TradableMarket>,
     last_scan: Option<Instant>,
+    #[cfg(test)]
+    inputs: Option<(Vec<TradableMarket>, SpotQuote, DateTime<Utc>)>,
 }
 
 /// The decision core shared by the live tick and the offline replay driver.
@@ -117,13 +121,7 @@ impl DecisionCore {
     }
 
     /// The model value of `symbol` against `strike`, if the volatility is warm.
-    fn valuation(
-        &self,
-        symbol: &str,
-        spot: f64,
-        strike: f64,
-        secs_left: f64,
-    ) -> Option<Valuation> {
+    fn valuation(&self, symbol: &str, spot: f64, strike: f64, secs_left: f64) -> Option<Valuation> {
         let vol = self.vols.get(symbol)?;
         if vol.samples() < self.min_vol_samples {
             return None;
@@ -190,6 +188,30 @@ fn live_entry(
 }
 
 impl RoundTaker {
+    fn now(&self) -> DateTime<Utc> {
+        #[cfg(test)]
+        if let Some((_, _, now)) = &self.inputs {
+            return *now;
+        }
+        Utc::now()
+    }
+
+    async fn read_rounds(&self, ctx: &Ctx) -> Result<Vec<TradableMarket>> {
+        #[cfg(test)]
+        if let Some((rounds, _, _)) = &self.inputs {
+            return Ok(rounds.clone());
+        }
+        ctx.client.live_rounds().await
+    }
+
+    async fn read_quote(&mut self, symbol: &str) -> Result<SpotQuote> {
+        #[cfg(test)]
+        if let Some((_, quote, _)) = &self.inputs {
+            return Ok(*quote);
+        }
+        self.spot.quote(symbol).await
+    }
+
     /// Apply the configured symbol and optional cadence together on every rescan.
     fn select_rounds(&mut self, rounds: Vec<TradableMarket>, now: DateTime<Utc>) {
         self.rounds = rounds
@@ -199,7 +221,9 @@ impl RoundTaker {
                     && !m.contested
                     && m.start_price.is_some()
                     && m.starts_at.is_some_and(|s| s <= now)
-                    && m.feed_symbol.as_ref().is_some_and(|s| self.cfg.symbols.contains(s))
+                    && m.feed_symbol
+                        .as_ref()
+                        .is_some_and(|s| self.cfg.symbols.contains(s))
                     && self.cfg.round_interval_secs.is_none_or(|seconds| {
                         seconds > 0
                             && m.starts_at.zip(m.ends_at).is_some_and(|(start, end)| {
@@ -218,18 +242,26 @@ impl Strategy for RoundTaker {
     }
 
     async fn tick(&mut self, ctx: &Ctx) -> Result<()> {
+        // A controlled run starts each tick with no usable mark: only the books
+        // seen in this tick can make one valid again.
+        ctx.broker.invalidate_paper_marks();
         if self.last_scan.is_none_or(|t| t.elapsed() >= ROUND_RESCAN) {
-            let rounds = ctx.client.live_rounds().await?;
+            let rounds = self.read_rounds(ctx).await?;
             self.known.remember(&rounds);
-            self.select_rounds(rounds, Utc::now());
+            self.select_rounds(rounds, self.now());
             self.last_scan = Some(Instant::now());
             info!(live_rounds = self.rounds.len(), "up/down rounds read");
         }
 
-        let at_secs = Utc::now().timestamp_millis() as f64 / 1000.0;
+        let at_secs = self.now().timestamp_millis() as f64 / 1000.0;
         let mut quotes = HashMap::new();
         for symbol in self.cfg.symbols.clone() {
-            let quote = self.spot.quote(&symbol).await?;
+            let quote = self.read_quote(&symbol).await?;
+            if ctx.broker.paper_snapshot().is_some()
+                && (!quote.price.is_finite() || quote.price <= 0.0)
+            {
+                anyhow::bail!("DATA_INCOMPLETE");
+            }
             self.core.observe_spot(&symbol, quote.price, at_secs);
             quotes.insert(symbol, quote);
         }
@@ -240,7 +272,20 @@ impl Strategy for RoundTaker {
             return Ok(());
         }
 
-        let now = Utc::now();
+        self.trade_quotes(ctx.broker.as_ref(), &quotes, &books, self.now())
+            .await
+    }
+}
+
+impl RoundTaker {
+    /// The real tick's decision-to-Broker consumer, with input acquisition separated.
+    async fn trade_quotes(
+        &mut self,
+        broker: &crate::bot::runtime::Broker,
+        quotes: &HashMap<String, SpotQuote>,
+        books: &HashMap<u64, BookSnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         for market in self.rounds.clone() {
             if self.core.is_entered(market.id) {
                 continue;
@@ -256,7 +301,7 @@ impl Strategy for RoundTaker {
             if vol < MIN_VOL_SAMPLES {
                 continue;
             }
-            if ctx.broker.is_live() && quote.source != SpotSource::Binance {
+            if broker.is_live() && quote.source != SpotSource::Binance {
                 warn!("no Binance price: not trading live on a substitute feed");
                 continue;
             }
@@ -267,24 +312,22 @@ impl Strategy for RoundTaker {
                 strike = market.start_price,
                 sigma,
                 secs_left = market.secs_left(now),
-                fair_up = market.secs_left(now).zip(market.start_price).map(|(left, strike)| {
-                    digital_up(quote.price, strike, sigma, left as f64)
-                }),
+                fair_up = market
+                    .secs_left(now)
+                    .zip(market.start_price)
+                    .map(|(left, strike)| { digital_up(quote.price, strike, sigma, left as f64) }),
                 bid = book.best_bid().map(|l| l.price),
                 ask = book.best_ask().map(|l| l.price),
                 "round valued"
             );
-            let Some(entry) = live_entry(
-                &self.core,
-                &market,
-                book,
-                *quote,
-                now,
-                ctx.broker.is_live(),
-            ) else {
+            let Some(entry) = live_entry(&self.core, &market, book, *quote, now, broker.is_live())
+            else {
                 continue;
             };
             let shares = shares_for(self.cfg.order_usd, entry.price);
+            // The price source belongs to this decision: a Coinbase fallback is
+            // recorded separately and is not the same evidence as Binance.
+            broker.record_source(&entry.token, &format!("{:?}", quote.source), now);
             info!(
                 market = market.id,
                 fair = entry.fair,
@@ -294,8 +337,7 @@ impl Strategy for RoundTaker {
                 source = ?quote.source,
                 "book below model value"
             );
-            match ctx
-                .broker
+            match broker
                 .take(&market, &entry.token, Side::Buy, shares, entry.price, book)
                 .await?
             {
@@ -386,7 +428,10 @@ mod tests {
         if let Some(seconds) = interval {
             public["strategies"]["btc_arb"]["round_interval_secs"] = seconds.into();
         } else {
-            public["strategies"]["btc_arb"].as_object_mut().unwrap().remove("round_interval_secs");
+            public["strategies"]["btc_arb"]
+                .as_object_mut()
+                .unwrap()
+                .remove("round_interval_secs");
         }
         let app: AppConfig = serde_json::from_value(public).unwrap();
         let cfg = app.strategies.btc_arb;
@@ -397,6 +442,8 @@ mod tests {
             known: Known::default(),
             rounds: Vec::new(),
             last_scan: None,
+            #[cfg(test)]
+            inputs: None,
         }
     }
 
@@ -410,10 +457,173 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn controlled_round_taker_consumes_real_core_and_broker_once() {
+        use crate::bot::runtime::Broker;
+        use crate::config::{ControlledMode, ControlledRun, StrategyLimits};
+        use crate::service::venue::RoundFacts;
+        let now = Utc::now();
+        for source in [SpotSource::Binance, SpotSource::Coinbase] {
+            let mut bot = selection_bot(Some(300));
+            bot.cfg.order_usd = 2.0;
+            let mut round = selectable_round(1, "BTCUSDT", 300, now);
+            round.round_facts = Some(RoundFacts {
+                decimal_precision: Some(2),
+                ..Default::default()
+            });
+            bot.select_rounds(vec![round.clone()], now);
+            for sample in 0..=20 {
+                bot.core.observe_spot("BTCUSDT", 101.0, sample as f64);
+            }
+            let broker = Broker::new(
+                StrategyLimits {
+                    max_order_usd: 2.0,
+                    max_market_usd: 2.0,
+                    max_total_usd: 10.0,
+                    max_loss_usd: 20.0,
+                },
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_controlled_paper(
+                ControlledRun::new(ControlledMode::UnsignedPaper, "round-taker".into(), now)
+                    .unwrap(),
+                100.0,
+            )
+            .unwrap();
+            let book = crate::bot::runtime::test_support::book(&[(0.4, 100.0)], &[(0.4, 100.0)]);
+            broker.observe(&round, &book);
+            let books = HashMap::from([(1, book)]);
+            let quotes = HashMap::from([(
+                "BTCUSDT".into(),
+                SpotQuote {
+                    price: 101.0,
+                    source,
+                },
+            )]);
+            bot.trade_quotes(&broker, &quotes, &books, now)
+                .await
+                .unwrap();
+            assert_eq!(broker.holdings().len(), 1);
+            assert!(bot.core.is_entered(1));
+            assert_eq!(
+                broker.source_of(&round.yes_token).unwrap().0,
+                format!("{source:?}")
+            );
+            let before = broker.paper_snapshot().unwrap();
+            bot.trade_quotes(&broker, &quotes, &books, now)
+                .await
+                .unwrap();
+            assert_eq!(broker.paper_snapshot().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_tick_acquires_inputs_warms_core_and_obeys_29_30_boundary() {
+        use crate::bot::runtime::Broker;
+        use crate::config::{ControlledMode, ControlledRun};
+        use crate::service::predict_fun::PredictFunClient;
+        use crate::service::venue::{MarketData, MarketQuery, RoundFacts};
+        use std::sync::Arc;
+        struct Data(BookSnapshot);
+        #[async_trait]
+        impl MarketData for Data {
+            async fn books(&self, ids: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
+                Ok(ids.iter().map(|id| (*id, self.0.clone())).collect())
+            }
+            async fn market(&self, _: u64) -> Result<TradableMarket> {
+                panic!("UNEXPECTED_MARKET_READ")
+            }
+            async fn markets(&self, _: &MarketQuery) -> Result<Vec<TradableMarket>> {
+                panic!("NETWORK_FORBIDDEN")
+            }
+            async fn with_schedule(&self, _: &TradableMarket) -> Result<TradableMarket> {
+                panic!("NETWORK_FORBIDDEN")
+            }
+        }
+        for (ticks, left, interval, has_start, expected) in [
+            (20, 30, 300, true, false),
+            (21, 29, 300, true, false),
+            (21, 30, 300, true, true),
+            (21, 30, 900, true, false),
+            (21, 30, 300, false, false),
+        ] {
+            for source in [SpotSource::Binance, SpotSource::Coinbase] {
+                let now = Utc::now();
+                let mut round = selectable_round(
+                    1,
+                    "BTCUSDT",
+                    interval,
+                    now - chrono::Duration::seconds(interval - left),
+                );
+                round.starts_at = Some(now - chrono::Duration::seconds(interval - left));
+                round.ends_at = Some(now + chrono::Duration::seconds(left));
+                round.start_price = has_start.then_some(100.0);
+                round.round_facts = Some(RoundFacts {
+                    decimal_precision: Some(2),
+                    ..Default::default()
+                });
+                let mut cfg: AppConfig = serde_json::from_str(include_str!(
+                    "../../tools/predictfun/btc5m-controlled-paper.json"
+                ))
+                .unwrap();
+                cfg.credentials.predict_api_key = Some("synthetic-market-only".into());
+                let client = PredictFunClient::new(&cfg).unwrap();
+                let broker = Broker::new(cfg.strategies.limits.clone(), false, None, None)
+                    .unwrap()
+                    .with_controlled_paper(
+                        ControlledRun::new(ControlledMode::UnsignedPaper, "tick-test".into(), now)
+                            .unwrap(),
+                        100.0,
+                    )
+                    .unwrap();
+                let ctx = Ctx {
+                    cfg: cfg.clone(),
+                    data: Arc::new(Data(book(&[(0.4, 100.0)], &[(0.4, 100.0)]))),
+                    client,
+                    broker: Arc::new(broker),
+                };
+                let mut bot = selection_bot(Some(300));
+                bot.cfg = cfg.strategies.btc_arb;
+                bot.core = DecisionCore::new(bot.cfg.clone());
+                for index in 0..ticks {
+                    let at = now - chrono::Duration::seconds((ticks - 1 - index) * 5);
+                    bot.inputs = Some((
+                        vec![round.clone()],
+                        SpotQuote {
+                            price: 101.0,
+                            source,
+                        },
+                        at,
+                    ));
+                    bot.tick(&ctx).await.unwrap();
+                }
+                assert_eq!(
+                    !ctx.broker.holdings().is_empty(),
+                    expected,
+                    "ticks={ticks}, left={left}"
+                );
+                if expected {
+                    assert_eq!(
+                        ctx.broker.source_of(&round.yes_token).unwrap().0,
+                        format!("{source:?}")
+                    );
+                    let cash = ctx.broker.paper_snapshot().unwrap().cash;
+                    bot.tick(&ctx).await.unwrap();
+                    assert_eq!(ctx.broker.paper_snapshot().unwrap().cash, cash);
+                }
+            }
+        }
+    }
+
     #[test]
     fn rescan_uses_app_config_cadence_and_symbol_together() {
         let now = Utc::now();
-        let mut rounds: Vec<_> = [300, 900, 3600, 86400].into_iter().enumerate()
+        let mut rounds: Vec<_> = [300, 900, 3600, 86400]
+            .into_iter()
+            .enumerate()
             .map(|(index, seconds)| selectable_round(index as u64 + 1, "BTCUSDT", seconds, now))
             .collect();
         rounds.push(selectable_round(5, "BNBUSDT", 300, now));
@@ -433,7 +643,10 @@ mod tests {
             // This is the rescan method called directly by Strategy::tick,
             // operating on the instance's deserialized production config.
             bot.select_rounds(rounds.clone(), now);
-            assert_eq!(bot.rounds.iter().map(|m| m.id).collect::<Vec<_>>(), expected);
+            assert_eq!(
+                bot.rounds.iter().map(|m| m.id).collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 
@@ -449,7 +662,9 @@ mod tests {
         unknown_end.ends_at = None;
         cases.push(unknown_end);
         let mut fractional = valid.clone();
-        fractional.ends_at = fractional.ends_at.map(|end| end + chrono::Duration::milliseconds(1));
+        fractional.ends_at = fractional
+            .ends_at
+            .map(|end| end + chrono::Duration::milliseconds(1));
         cases.push(fractional);
         cases.push(selectable_round(5, "BTCUSDT", -300, now));
         cases.push(selectable_round(6, "BTCUSDT", 0, now));
@@ -478,8 +693,16 @@ mod tests {
         no_symbol.feed_symbol = None;
         for interval in [None, Some(300)] {
             let mut bot = selection_bot(interval);
-            bot.select_rounds(vec![closed.clone(), contested.clone(), no_price.clone(),
-                future.clone(), no_symbol.clone()], now);
+            bot.select_rounds(
+                vec![
+                    closed.clone(),
+                    contested.clone(),
+                    no_price.clone(),
+                    future.clone(),
+                    no_symbol.clone(),
+                ],
+                now,
+            );
             assert!(bot.rounds.is_empty());
         }
     }
@@ -489,7 +712,10 @@ mod tests {
         let mut app: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
         app.strategies.btc_arb.round_interval_secs = Some(0);
         let error = run(app).await.unwrap_err();
-        assert!(error.to_string().contains("round_interval_secs"), "{error:#}");
+        assert!(
+            error.to_string().contains("round_interval_secs"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -522,8 +748,14 @@ mod tests {
     fn fees_count_against_the_edge() {
         let now = Utc::now();
         let book = book(&[(0.3, 50.0)], &[(0.5, 50.0)]);
-        let free = TradableMarket { fee_rate_bps: 0, ..round(now, 300) };
-        let dear = TradableMarket { fee_rate_bps: 2000, ..round(now, 300) };
+        let free = TradableMarket {
+            fee_rate_bps: 0,
+            ..round(now, 300)
+        };
+        let dear = TradableMarket {
+            fee_rate_bps: 2000,
+            ..round(now, 300)
+        };
         // Value about 0.533 against a 0.50 ask: only clears without the fee.
         let spot = 100.0 + 0.000_01 * 100.0 * 100.0;
         let vol = 0.0005;
@@ -538,7 +770,10 @@ mod tests {
         let now = Utc::now();
         let stale = book(&[(0.48, 50.0)], &[(0.52, 50.0)]);
         assert!(round_entry(&round(now, 10), &stale, 100.1, 0.0001, &cfg(), now).is_none());
-        let unstarted = TradableMarket { start_price: None, ..round(now, 300) };
+        let unstarted = TradableMarket {
+            start_price: None,
+            ..round(now, 300)
+        };
         assert!(round_entry(&unstarted, &stale, 100.1, 0.0001, &cfg(), now).is_none());
     }
 
@@ -569,7 +804,11 @@ mod tests {
         let mut core = DecisionCore::new(cfg());
         // Twenty strictly increasing prices warm the volatility up.
         for index in 0..21 {
-            core.observe_spot("BTCUSDT", 100.0 + 0.0001 * index as f64, index as f64 * 300.0);
+            core.observe_spot(
+                "BTCUSDT",
+                100.0 + 0.0001 * index as f64,
+                index as f64 * 300.0,
+            );
         }
         assert_eq!(core.vol_samples("BTCUSDT"), Some(20));
 
@@ -600,7 +839,11 @@ mod tests {
         let stale = book(&[(0.48, 50.0)], &[(0.52, 50.0)]);
         let mut core = DecisionCore::new(cfg());
         for index in 0..21 {
-            core.observe_spot("BTCUSDT", 100.0 + 0.0001 * index as f64, index as f64 * 300.0);
+            core.observe_spot(
+                "BTCUSDT",
+                100.0 + 0.0001 * index as f64,
+                index as f64 * 300.0,
+            );
         }
         let market = golden_round(300);
 
@@ -726,7 +969,11 @@ mod tests {
         let stale = book(&[(0.48, 50.0)], &[(0.52, 50.0)]);
         let mut core = DecisionCore::new(cfg());
         for index in 0..21 {
-            core.observe_spot("BTCUSDT", 100.0 + 0.0001 * index as f64, index as f64 * 300.0);
+            core.observe_spot(
+                "BTCUSDT",
+                100.0 + 0.0001 * index as f64,
+                index as f64 * 300.0,
+            );
         }
         let market = golden_round(300);
         let coinbase = SpotQuote {

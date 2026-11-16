@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, NoReturn
 
@@ -43,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpc-url")
     parser.add_argument("--tx-hash")
     parser.add_argument("--signer-fd", type=int)
+    parser.add_argument("--keyring", action="store_true")
     return parser
 
 
@@ -123,7 +125,15 @@ def run(argv: list[str], *, session_factory: Any = None, signer_loader: Any = No
     """Run explicit public inputs; callers may inject strict offline test dependencies."""
     command_argv = argv if argv and argv[0] in ("plan", "check", "approve", "redeem") else ["plan", *argv]
     args = build_parser().parse_args(command_argv)
+    if args.keyring and args.signer_fd is not None:
+        raise ToolError(ErrorCode.INVALID_INPUT, "args", "KEYRING_AND_FD_EXCLUSIVE")
     target = normalize_target(args)
+    if args.keyring:
+        import local_signer
+        if (target["chain_id"] != 56 or target["account_mode"] != "predict-account"
+                or target["owner"] != local_signer.TRADING_ADDRESS.lower()
+                or target["predict_account"] != local_signer.TRADING_ADDRESS.lower()):
+            raise ToolError(ErrorCode.ACCOUNT_MISMATCH, "target", "KEYRING_ACCOUNT_MISMATCH")
     if args.command == "plan":
         if args.execute or args.signer_fd is not None or args.tx_hash:
             raise ToolError(ErrorCode.INVALID_INPUT, "plan", "PLAN_CANNOT_EXECUTE")
@@ -132,11 +142,54 @@ def run(argv: list[str], *, session_factory: Any = None, signer_loader: Any = No
         raise ToolError(ErrorCode.INVALID_INPUT, "check", "CHECK_CANNOT_EXECUTE")
     if args.command != "check" and args.tx_hash:
         raise ToolError(ErrorCode.INVALID_INPUT, "execute", "HASH_RECOVERY_IS_READ_ONLY")
+    if args.keyring and args.command != "check":
+        if not args.execute or not args.confirm_target:
+            raise ToolError(ErrorCode.EXECUTION_NOT_ENABLED, "execute", "MISSING_EXECUTE_OR_CONFIRM")
+        frozen_digest = sdk_ops.target_digest(target)
+        if args.confirm_target != frozen_digest:
+            raise ToolError(ErrorCode.INVALID_INPUT, "execute", "TARGET_DIGEST_MISMATCH")
+        descriptors = list(os.pipe())
+        try:
+            if min(descriptors) < 3:
+                raise ToolError(ErrorCode.INVALID_INPUT, "signer", "BAD_SIGNER_FD")
+            for descriptor in descriptors:
+                os.set_inheritable(descriptor, False)
+
+            def lazy_loader(fd):
+                if sdk_ops.target_digest(target) != frozen_digest:
+                    raise ToolError(ErrorCode.INVALID_INPUT, "execute", "TARGET_CHANGED")
+                try:
+                    key = sdk_ops.read_owned_key()
+                    if os.write(descriptors[1], key) != len(key):
+                        raise OSError("SHORT_WRITE")
+                    os.close(descriptors[1])
+                    descriptors[1] = -1
+                    return sdk_ops.fd_signer_loader(fd)
+                except ToolError:
+                    raise
+                except Exception:
+                    raise ToolError(ErrorCode.INVALID_INPUT, "signer", "BAD_SIGNER_FD_CONTENT") from None
+                finally:
+                    os.close(descriptors[0])
+                    descriptors[0] = -1
+
+            return sdk_ops.execute_target(
+                target, args.rpc_url, command=args.command, execute=args.execute,
+                confirmation=args.confirm_target, signer_fd=descriptors[0],
+                session_factory=session_factory or sdk_ops.ReadSession,
+                signer_loader=lazy_loader,
+                expected_controller=sdk_ops.keyring_expected_controller(),
+            )
+        finally:
+            for descriptor in descriptors:
+                if descriptor >= 0:
+                    os.close(descriptor)
     return sdk_ops.execute_target(
         target, args.rpc_url, command=args.command, execute=args.execute,
         confirmation=args.confirm_target, signer_fd=args.signer_fd, tx_hash=args.tx_hash,
         session_factory=session_factory or sdk_ops.ReadSession,
         signer_loader=signer_loader or sdk_ops.fd_signer_loader,
+        expected_controller=sdk_ops.keyring_expected_controller() if args.keyring else None,
     )
 
 

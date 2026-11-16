@@ -10,6 +10,47 @@
 - Rust paper/策略不 import 这个 SDK，不需要 Python、SDK 或钱包。
 - 不支持跨进程自动恢复或同钱包多实例互斥。人工必须保证同钱包 bot 与资金工具不并发。
 
+## 07-004 固定 BTC5m 受控入口
+
+仅在独立 Validate PASS、主控核验并批准本次唯一 run-id 后，由主控从 BOT 根目录执行：
+
+```bash
+tools/predictfun/.venv/bin/python -B tools/predictfun/btc5m_control.py --mode unsigned-paper --config tools/predictfun/btc5m-controlled-paper.json --run-id <主控批准的唯一公开ID>
+```
+
+此入口与旧 mock/dry-run 不同：unsigned-paper 不读取 keyring/YAML，不构造钱包或认证；
+不加载整份 .env，仅允许下述固定单键例外。行情 API key 仍优先取原环境来源，
+钱包/JWT 环境键即使为空也拒绝。固定 BTCUSDT/300秒，
+现金100 USDT、单笔/单市场2 USDT、总敞口10 USDT、累计净损失20 USDT锁存；不自动续跑。
+公开配置在取密钥/启动前全量校验并冻结为 run-scoped 快照，候选含 Git HEAD、binary/源码SHA。
+
+### 行情 API key 的唯一来源
+
+环境优先。父环境里 `YQUANT_PREDICT_FUN_TOKEN` 存在时只用它，不读任何文件；它是空白
+同样拒绝，不会借文件"修复"。只有父环境**完全没有**这个键时，才从固定项目文件
+`<项目根>/skills/.env` 精确读取这一个键（路径由源码位置推导，不看当前工作目录，
+没有命令行或环境变量可覆盖）。该例外只用于 unsigned-paper，signed-future-live、SDK
+以及原 check/enroll/sign-in 仍是纯环境来源。
+
+文件读取只认单行 `KEY=value`：可选 `export`、等号两侧空白、单双引号、尾注释。
+值按字面保留，不做变量/命令替换，不 source/eval/load_dotenv，不支持续行或跨行引号。
+重复目标键（同值也拒绝）、缺失、空值、不可读、坏引号或编码错误一律固定脱敏
+`{"code":"API_SOURCE","step":"env","reason":"API_SOURCE"}`，退出码 2，不输出原行或值。
+
+文件里的其他变量一律不导入：只有最终行情 key 经原白名单进 child 的 `PM_PREDICT_API_KEY`。
+父环境映射与 `os.environ` 不变，密钥不进 argv、临时文件、公开快照或任何普通输出。
+
+启动器持有唯一控制管道：6h截止送D、停止新增，清理后仅对本次已成交市场只读尾查≤600秒；
+人工信号/监督EOF紧急退出，父清理/kill/reap共用一个≤30秒预算。不得用新run-id自动恢复。
+事件在首次落盘前经过种类/字段/有限金额/恒等式过滤；缺坏final、强杀、非零child均如实标记。
+纸面回款只在严格官方终态确认后释放现金，不等于live redeem到账；模型spot的Binance/Coinbase
+来源与官方provider分开记录。无真实Gas、排队、部分成交或赎回等待实测，不证明持续alpha。
+
+signed-future-live是未来独立审批分支，不是本轮实盘启动许可；没有虚拟cash账本，未知账户账务
+输出null和LIVE_ACCOUNTING_UNAVAILABLE，Gas仅NOT_MEASURED，不宣称NOT_INCURRED。
+SDK原四命令的`--keyring`复用原FD loader/官方builder：公开确认与只读预检后才lazy读取，
+匿名pipe仅当前进程内消费；与`--signer-fd`互斥。approve/redeem真实调用仍须逐动作另行批准。
+
 ## 隔离依赖
 
 从 Toolkits 根目录运行：

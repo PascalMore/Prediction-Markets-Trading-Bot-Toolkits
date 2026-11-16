@@ -41,6 +41,47 @@ Every bot starts in dry run: it reads real markets, builds and signs orders, and
 - BTC rounds settle on Binance's top of book. Where Binance isn't reachable, that bot uses Coinbase's price and refuses to go live.
 - The bots don't redeem winnings. Redeem them on Predict.
 
+## Controlled BTC5m paper (07-004)
+
+The fixed launcher is `tools/predictfun/btc5m_control.py`; see the exact command in
+[the tool README](../tools/predictfun/README.md#07-004-固定-btc5m-受控入口).
+Run it only after independent Validate PASS and a separately approved unique run-id.
+This engineering change does not authorize a live run or start the six-hour observation.
+
+Unlike ordinary mock mode, `unsigned-paper` never constructs a wallet, reads keyring,
+loads credential YAML, or signs in. It does not load an entire .env file; only the fixed
+single-key exception below is allowed. The existing market API key environment source takes priority;
+wallet/JWT environment keys are refused. The frozen public snapshot fixes BTCUSDT,
+exact 300-second rounds, 100 USDT initial virtual cash, 2 USDT order/market caps,
+10 USDT total exposure and a latched 20 USDT cumulative net-loss stop including fees.
+BUY fees reduce received shares; they are not charged to cash a second time.
+
+The market API key comes from the environment first. When the parent environment has
+no `YQUANT_PREDICT_FUN_TOKEN` key at all, exactly that one key is read from the fixed
+project file `<project root>/skills/.env`; the path comes from the source location,
+not the working directory, and cannot be overridden. A present but blank key is still
+refused, and only single-line `KEY=value` assignments (optional `export`, quotes and
+trailing comments) are accepted, with no substitution or evaluation. A missing,
+duplicated, empty, unreadable or malformed entry fails with the fixed redacted
+`API_SOURCE` error and exit code 2. No other variable from that file is imported,
+and the parent environment, argv and public snapshots never change. This exception
+applies to `unsigned-paper` only; signed mode, the SDK and the original
+check/enroll/sign-in remain environment-only.
+
+Deadline stops entries, cancels quotes, then permits at most 600 seconds of read-only
+official-settlement tail checks for traded markets. Signal/parent EOF interrupts the
+tail; parent cleanup, kill and reap share one 30-second deadline. No automatic restart.
+Missing/invalid final accounting and native child failure remain explicitly incomplete.
+Official paper payout releases virtual cash only once; live settlement is not redeem
+or confirmed wallet cash. Model Binance/Coinbase spot is not the official oracle
+provider (CHAINLINK/UNKNOWN). Gas, queueing, partial fills and redeem delay are not
+measured or simulated, and a profitable window would not establish sustained alpha.
+
+`signed-future-live` requires separate action approval and the original account/budget
+and signer gates. It has no paper ledger: unknown account amounts are null with
+LIVE_ACCOUNTING_UNAVAILABLE and Gas NOT_MEASURED, not a fictitious 100 USDT balance
+or NOT_INCURRED claim. Do not infer live readiness from offline synthetic tests.
+
 ## Polymarket
 
 Copy Trading is the only strategy on Polymarket for now.
