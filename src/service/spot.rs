@@ -5,10 +5,17 @@
 //! Binance refuses: its USD pairs sit a few basis points away because of the
 //! USDT/USD basis, so a value computed from one is good enough to watch but not
 //! to trade on.
+//!
+//! Neither feed carries the time of the event it prices, so a quote only ever
+//! proves when this process received it. The phase1 path keeps that receipt
+//! time next to the price; the ordinary path keeps its old, simpler shape.
 
+use crate::service::observation::{
+    CheckTime, Clock, FreshnessBasis, ObservationClock, ObservedSpot, SourceTimeStatus,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -17,7 +24,8 @@ const COINBASE: &str = "https://api.coinbase.com/v2/prices";
 /// Once Binance has refused us, don't ask again for a while.
 const BINANCE_RETRY_AFTER: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum SpotSource {
     Binance,
     Coinbase,
@@ -64,17 +72,52 @@ impl SpotFeed {
 
     /// `symbol` as Predict's feeds name it, e.g. `BTCUSDT`.
     pub async fn quote(&mut self, symbol: &str) -> Result<SpotQuote> {
+        match self.binance_with_clock(symbol, None).await {
+            Ok((price, _)) => {
+                self.binance_refused_at = None;
+                return Ok(SpotQuote {
+                    price,
+                    source: SpotSource::Binance,
+                });
+            }
+            Err(e) => {
+                warn!(error = ?e, "Binance unavailable; falling back to Coinbase, which can't be traded on");
+                self.binance_refused_at = Some(Instant::now());
+            }
+        }
+        Ok(SpotQuote {
+            price: self.coinbase_with_clock(symbol, None).await?.0,
+            source: SpotSource::Coinbase,
+        })
+    }
+
+    /// The same quote, with the clock that received it.
+    ///
+    /// The clock belongs to the source that answered: a Coinbase fallback's
+    /// request starts after Binance gave up, so the wait for the failed source
+    /// is not part of this quote's age.
+    pub async fn quote_observed(
+        &mut self,
+        symbol: &str,
+        clock: &dyn Clock,
+    ) -> Result<ObservedSpot> {
         if self
             .binance_refused_at
             .is_none_or(|t| t.elapsed() >= BINANCE_RETRY_AFTER)
         {
-            match self.binance(symbol).await {
-                Ok(price) => {
+            match self.binance_with_clock(symbol, Some(clock)).await {
+                Ok((price, times)) if price.is_finite() && price > 0.0 => {
                     self.binance_refused_at = None;
-                    return Ok(SpotQuote {
+                    return Ok(ObservedSpot {
                         price,
                         source: SpotSource::Binance,
+                        actual_pair: symbol.to_string(),
+                        clock: observation_clock(times.expect("a clocked quote has its readings")),
                     });
+                }
+                Ok((price, _)) => {
+                    warn!(price, "Binance returned a value that is not a price; falling back to Coinbase");
+                    self.binance_refused_at = Some(Instant::now());
                 }
                 Err(e) => {
                     warn!(error = ?e, "Binance unavailable; falling back to Coinbase, which can't be traded on");
@@ -82,13 +125,24 @@ impl SpotFeed {
                 }
             }
         }
-        Ok(SpotQuote {
-            price: self.coinbase(symbol).await?,
+        let (price, times) = self.coinbase_with_clock(symbol, Some(clock)).await?;
+        if !price.is_finite() || price <= 0.0 {
+            bail!("DATA_INCOMPLETE: the spot feed returned a value that is not a price");
+        }
+        Ok(ObservedSpot {
+            price,
             source: SpotSource::Coinbase,
+            actual_pair: coinbase_pair(symbol)?,
+            clock: observation_clock(times.expect("a clocked quote has its readings")),
         })
     }
 
-    async fn binance(&self, symbol: &str) -> Result<f64> {
+    async fn binance_with_clock(
+        &self,
+        symbol: &str,
+        clock: Option<&dyn Clock>,
+    ) -> Result<(f64, Option<(CheckTime, CheckTime)>)> {
+        let request_at = sample(clock)?;
         let resp = self
             .http
             .get(format!("{BINANCE}?symbol={symbol}"))
@@ -100,11 +154,17 @@ impl SpotFeed {
         let ticker: BinanceTicker = resp.json().await?;
         let bid: f64 = ticker.bid_price.parse()?;
         let ask: f64 = ticker.ask_price.parse()?;
-        Ok((bid + ask) / 2.0)
+        let received_at = sample(clock)?;
+        Ok(((bid + ask) / 2.0, times(request_at, received_at)))
     }
 
-    async fn coinbase(&self, symbol: &str) -> Result<f64> {
+    async fn coinbase_with_clock(
+        &self,
+        symbol: &str,
+        clock: Option<&dyn Clock>,
+    ) -> Result<(f64, Option<(CheckTime, CheckTime)>)> {
         let pair = coinbase_pair(symbol)?;
+        let request_at = sample(clock)?;
         let price: CoinbaseEnvelope = self
             .http
             .get(format!("{COINBASE}/{pair}/spot"))
@@ -114,7 +174,37 @@ impl SpotFeed {
             .error_for_status()?
             .json()
             .await?;
-        Ok(price.data.amount.parse()?)
+        let received_at = sample(clock)?;
+        Ok((price.data.amount.parse()?, times(request_at, received_at)))
+    }
+}
+
+/// The readings of one request, when the caller wanted them.
+fn times(request_at: Option<CheckTime>, received_at: Option<CheckTime>) -> Option<(CheckTime, CheckTime)> {
+    Some((request_at?, received_at?))
+}
+
+/// One reading of the caller's clock, or nothing when there is no clock.
+fn sample(clock: Option<&dyn Clock>) -> Result<Option<CheckTime>> {
+    match clock {
+        Some(clock) => Ok(Some(clock.now()?)),
+        None => Ok(None),
+    }
+}
+
+/// The clock of an acquired quote.
+///
+/// The upstream feeds carry no event time, so the freshness can only be proven
+/// from the local receipt: `source_at` stays `None` and is never guessed.
+fn observation_clock((request_at, received_at): (CheckTime, CheckTime)) -> ObservationClock {
+    ObservationClock {
+        source_at: None,
+        source_time_status: SourceTimeStatus::Missing,
+        freshness_basis: FreshnessBasis::ReceiptBound,
+        request_at: request_at.utc,
+        received_at: received_at.utc,
+        request_elapsed_ms: request_at.elapsed_ms,
+        received_elapsed_ms: received_at.elapsed_ms,
     }
 }
 

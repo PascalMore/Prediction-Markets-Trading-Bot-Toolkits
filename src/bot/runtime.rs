@@ -336,7 +336,7 @@ impl State {
 
 /// Walk `levels` for `shares`, refusing a partial fill or one past `limit`.
 /// Returns the average price.
-fn walk(levels: &[BookLevel], side: Side, shares: f64, limit: f64) -> Option<f64> {
+pub fn walk(levels: &[BookLevel], side: Side, shares: f64, limit: f64) -> Option<f64> {
     let mut remaining = shares;
     let mut cost = 0.0;
     for level in levels {
@@ -514,6 +514,12 @@ impl Broker {
         yes_book: &BookSnapshot,
     ) -> Result<TakeResult> {
         if self.state.lock().paper.is_some() {
+            // A phase1 BUY has to carry the candidate it was built from. The
+            // bare entry point cannot: it is refused before anything is
+            // reserved or filled.
+            if side == Side::Buy && self.is_phase1() {
+                return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+            }
             return self.controlled_take(market, token, side, shares, limit, yes_book);
         }
         let limit = clean(limit);
@@ -1363,6 +1369,15 @@ impl Ctx {
             }
             let broker = Broker::new(cfg.strategies.limits.clone(), false, None, None)?
                 .with_controlled_paper(run, paper.initial_cash)?;
+            // The unsigned controlled run speaks the phase1 protocol: it is the
+            // only run whose entries are decided on net shares, and the only one
+            // whose events carry the diagnostic snapshots.
+            let broker = broker.with_phase1(
+                Arc::new(crate::service::observation::SystemClock::new()?),
+                crate::bot::arbitrage::phase1::StrategyContract::Phase1NetShares,
+                cfg.strategies.btc_arb.min_edge,
+                cfg.strategies.btc_arb.min_secs_left as f64,
+            )?;
             let broker = Arc::new(broker);
             // The parent holds the other end of this pipe. A control byte or a
             // closed pipe stops new risk through the broker's own lock. The

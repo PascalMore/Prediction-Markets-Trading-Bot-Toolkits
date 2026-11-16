@@ -44,6 +44,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub mod account;
+pub mod books;
 pub mod fills;
 
 use account::AccountGate;
@@ -1051,22 +1052,15 @@ impl MarketData for PredictFunClient {
     }
 
     async fn books(&self, ids: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
-        let mut out = HashMap::new();
-        for batch in ids.chunks(BOOK_BATCH_SIZE) {
-            let list = batch
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let books = self
-                .get::<Vec<ApiMarketBook>>(&format!("/markets/orderbooks?ids={list}"))
-                .await?
-                .data;
-            for book in books {
-                out.insert(book.market_id, to_snapshot(&book.asks, &book.bids));
-            }
-        }
-        Ok(out)
+        books::plain(self, ids).await
+    }
+
+    async fn observed_books(
+        &self,
+        ids: &[u64],
+        clock: &dyn crate::service::observation::Clock,
+    ) -> Result<HashMap<u64, crate::service::observation::ObservedBook>> {
+        books::observed(self, ids, clock).await
     }
 }
 

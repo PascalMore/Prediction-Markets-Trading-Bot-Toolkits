@@ -7,7 +7,7 @@
 use crate::models::{BookSnapshot, PlannedOrder, Side, VenueId};
 use crate::service::market_cache::MarketInfo;
 use alloy_primitives::U256;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -482,6 +482,17 @@ pub trait MarketData: Send + Sync {
     /// out so that it doesn't need a request per market.
     async fn with_schedule(&self, market: &TradableMarket) -> Result<TradableMarket>;
     async fn books(&self, ids: &[u64]) -> Result<HashMap<u64, BookSnapshot>>;
+    /// The same books, with the clock that received each batch.
+    ///
+    /// A venue that cannot say when it received a book does not implement this:
+    /// the default refuses, so a cached book is never presented as a fresh one.
+    async fn observed_books(
+        &self,
+        _ids: &[u64],
+        _clock: &dyn crate::service::observation::Clock,
+    ) -> Result<HashMap<u64, crate::service::observation::ObservedBook>> {
+        bail!("DATA_INCOMPLETE: this venue cannot report when its books arrived")
+    }
 }
 
 #[derive(Debug, Clone)]

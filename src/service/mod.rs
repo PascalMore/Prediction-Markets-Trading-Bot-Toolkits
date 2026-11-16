@@ -18,6 +18,7 @@ pub mod clob;
 pub mod eligibility;
 pub mod market_cache;
 pub mod midprice;
+pub mod observation;
 pub mod onchain;
 pub mod order_executor;
 pub mod parse;

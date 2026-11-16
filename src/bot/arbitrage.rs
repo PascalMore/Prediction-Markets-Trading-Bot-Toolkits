@@ -12,20 +12,25 @@
 //! the feeds differ by enough to swamp a small edge.
 
 pub mod history;
+pub mod phase1;
 pub mod replay;
 
 use crate::bot::quoting::Known;
 use crate::bot::runtime::{drive, shares_for, Ctx, Strategy, TakeResult};
 use crate::config::{AppConfig, BtcArbConfig};
 use crate::models::{BookSnapshot, Side};
+use crate::service::observation::{CheckTime, Clock, ObservedBook, ObservedSpot};
 use crate::service::spot::{digital_up, EwmaVol, SpotFeed, SpotQuote, SpotSource};
 use crate::service::venue::TradableMarket;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+use phase1::{Phase1Core, StrategyContract};
 
 const VOL_HALF_LIFE_SECS: f64 = 300.0;
 /// Spot samples before the volatility estimate is trusted.
@@ -39,14 +44,20 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     let arb_cfg = ctx.cfg.strategies.btc_arb.clone();
     let mut bot = RoundTaker {
         cfg: arb_cfg.clone(),
-        core: DecisionCore::new(arb_cfg),
+        core: DecisionCore::new(arb_cfg.clone()),
         spot: SpotFeed::new()?,
         known: Known::default(),
         rounds: Vec::new(),
         last_scan: None,
+        phase1: None,
         #[cfg(test)]
         inputs: None,
     };
+    // Only an unsigned controlled run speaks the phase1 protocol. Every other
+    // path keeps the legacy cash-fee core.
+    if ctx.broker.is_phase1() {
+        bot.phase1 = Some(Phase1Core::new(StrategyContract::Phase1NetShares));
+    }
     drive(&mut bot, &ctx).await
 }
 
@@ -58,6 +69,8 @@ struct RoundTaker {
     known: Known,
     rounds: Vec<TradableMarket>,
     last_scan: Option<Instant>,
+    /// The phase1 core, when this run speaks the phase1 protocol.
+    phase1: Option<Phase1Core>,
     #[cfg(test)]
     inputs: Option<(Vec<TradableMarket>, SpotQuote, DateTime<Utc>)>,
 }
@@ -253,6 +266,11 @@ impl Strategy for RoundTaker {
             info!(live_rounds = self.rounds.len(), "up/down rounds read");
         }
 
+        let ids: Vec<u64> = self.rounds.iter().map(|m| m.id).collect();
+        if self.phase1.is_some() {
+            return self.tick_phase1(ctx, ids).await;
+        }
+
         let at_secs = self.now().timestamp_millis() as f64 / 1000.0;
         let mut quotes = HashMap::new();
         for symbol in self.cfg.symbols.clone() {
@@ -266,13 +284,67 @@ impl Strategy for RoundTaker {
             quotes.insert(symbol, quote);
         }
 
-        let ids: Vec<u64> = self.rounds.iter().map(|m| m.id).collect();
         let books = self.known.observe(ctx, &ids).await?;
         if ctx.broker.is_halted() {
             return Ok(());
         }
 
         self.trade_quotes(ctx.broker.as_ref(), &quotes, &books, self.now())
+            .await
+    }
+}
+
+impl RoundTaker {
+    /// The phase1 tick: every input carries the clock that received it.
+    ///
+    /// The inputs are acquired the same way the legacy path acquires them,
+    /// but the clock of each quote and each book batch travels with them, so a
+    /// decision can prove how old its inputs are.
+    async fn tick_phase1(&mut self, ctx: &Ctx, ids: Vec<u64>) -> Result<()> {
+        let Some(clock) = ctx.broker.phase1_clock() else {
+            anyhow::bail!("CONTROLLED_MODE: the phase1 run has no clock");
+        };
+        let mut quotes: HashMap<String, ObservedSpot> = HashMap::new();
+        for symbol in self.cfg.symbols.clone() {
+            let quote = self.spot.quote_observed(&symbol, clock.as_ref()).await?;
+            if let Some(core) = self.phase1.as_mut() {
+                let now = clock.now()?;
+                if let Err(reason) = core.observe(
+                    &symbol,
+                    quote.price,
+                    quote.source,
+                    &quote.actual_pair,
+                    &quote.clock,
+                    now,
+                ) {
+                    debug!(symbol = %symbol, ?reason, "phase1 observation refused");
+                }
+            }
+            quotes.insert(symbol, quote);
+        }
+
+        let mut all: Vec<u64> = ids.to_vec();
+        for id in ctx.broker.tracked_markets() {
+            if !all.contains(&id) {
+                all.push(id);
+            }
+        }
+        for id in &all {
+            if self.known.get(*id).is_none() {
+                let market = ctx.data.market(*id).await?;
+                self.known.remember(&[market]);
+            }
+        }
+        let books = ctx.data.observed_books(&all, clock.as_ref()).await?;
+        for (id, observed) in &books {
+            if let Some(market) = self.known.get(*id) {
+                ctx.broker.observe(market, &observed.book);
+            }
+        }
+        if ctx.broker.is_halted() {
+            return Ok(());
+        }
+        self.trade_phase1(ctx.broker.as_ref(), &quotes, &books, clock.as_ref())
             .await
     }
 }
@@ -346,6 +418,93 @@ impl RoundTaker {
                 }
                 TakeResult::Filled { .. } => {}
                 TakeResult::Blocked(reason) => info!(market = market.id, ?reason, "entry blocked"),
+            }
+        }
+        Ok(())
+    }
+
+    /// The phase1 decision-to-Broker consumer.
+    ///
+    /// Every selected market is evaluated once, so a refusal leaves a snapshot
+    /// too. Only a candidate that clears the checks reaches the broker, and it
+    /// reaches it with the context the evaluation produced.
+    async fn trade_phase1(
+        &mut self,
+        broker: &crate::bot::runtime::Broker,
+        quotes: &HashMap<String, ObservedSpot>,
+        books: &HashMap<u64, ObservedBook>,
+        clock: &dyn Clock,
+    ) -> Result<()> {
+        let Some(core) = self.phase1.as_mut() else {
+            return Ok(());
+        };
+        for market in self.rounds.clone() {
+            let Some(symbol) = market.feed_symbol.clone() else {
+                continue;
+            };
+            let Some(quote) = quotes.get(&symbol) else {
+                continue;
+            };
+            let Some(observed) = books.get(&market.id) else {
+                continue;
+            };
+            let now = clock.now()?;
+            let inputs = phase1::EvaluationInputs {
+                market: &market,
+                book: &observed.book,
+                spot_price: quote.price,
+                spot_source: quote.source,
+                actual_pair: quote.actual_pair.clone(),
+                spot_clock: Some(quote.clock.clone()),
+                book_clock: Some(observed.clock.clone()),
+                now,
+                order_usd: self.cfg.order_usd,
+                min_edge: self.cfg.min_edge,
+                min_secs_left: self.cfg.min_secs_left as f64,
+                entered: self.core.is_entered(market.id),
+                identity_available_at: None,
+                strike_available_at: None,
+                settlement_provider: phase1::SettlementProvider::Unknown,
+            };
+            let evaluation = core.evaluate(&inputs);
+            let Some(candidate) = evaluation.candidate else {
+                debug!(
+                    market = market.id,
+                    reason = ?evaluation.diagnostic.reason,
+                    "phase1 evaluation refused"
+                );
+                continue;
+            };
+            let token = candidate.token().to_string();
+            broker.record_source(&token, &format!("{:?}", quote.source), now.utc);
+            info!(
+                market = market.id,
+                fair = candidate.fair(),
+                price = candidate.limit_price(),
+                edge = evaluation
+                    .diagnostic
+                    .up
+                    .as_ref()
+                    .and_then(|side| side.edge)
+                    .or_else(|| {
+                        evaluation
+                            .diagnostic
+                            .down
+                            .as_ref()
+                            .and_then(|side| side.edge)
+                    }),
+                spot = quote.price,
+                source = ?quote.source,
+                "phase1 book below model value"
+            );
+            match broker.take_candidate(&market, &observed.book, &candidate)? {
+                TakeResult::Filled { shares, .. } if shares > 0.0 => {
+                    self.core.confirm_fill(market.id, shares);
+                }
+                TakeResult::Filled { .. } => {}
+                TakeResult::Blocked(reason) => {
+                    info!(market = market.id, ?reason, "phase1 entry blocked")
+                }
             }
         }
         Ok(())
@@ -442,6 +601,7 @@ mod tests {
             known: Known::default(),
             rounds: Vec::new(),
             last_scan: None,
+            phase1: None,
             #[cfg(test)]
             inputs: None,
         }
