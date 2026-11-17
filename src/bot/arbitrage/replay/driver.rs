@@ -5,12 +5,15 @@
 //! output row per event. It has no file, process or network I/O: the facade
 //! owns the stream.
 
-use super::types::*;
+use super::super::phase1::{DecisionDiagnostic, EvaluationInputs, Reason, SettlementProvider};
 use super::super::{DecisionCore, MIN_VOL_SAMPLES};
+use super::types::*;
 use crate::models::{BookLevel, BookSnapshot};
+use crate::service::observation::{CheckTime, ObservationClock};
+use crate::service::spot::SpotSource;
 use crate::service::venue::TradableMarket;
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MISSING_EVIDENCE_REASONS: [&str; 8] = [
     "state_unknown",
@@ -43,20 +46,41 @@ struct MarketState {
     fee_rate_bps: Option<u32>,
     book: Option<BookSnapshot>,
     last_book: Option<(i64, BookPayload)>,
+    /// The clock of the book currently held, when the version carries one.
+    book_clock: Option<ObservationClock>,
     /// The candidate waiting for a result, if any.
     pending_candidate: Option<String>,
+    /// The candidates that were replaced before they were answered.
+    terminated_candidates: HashSet<String>,
     /// Set once a result was unknown: the market stops offering entries.
     unknown_result: bool,
+    /// When the market's identity first became locally available.
+    identity_available_at: Option<i64>,
+    /// When the market's fixed strike first became locally available.
+    strike_available_at: Option<i64>,
+    fixed_strike_conflict: bool,
 }
 
 /// The last spot seen for a symbol.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SpotState {
     price: f64,
     at_ms: i64,
+    /// The source and the clock of the observation, when the version carries
+    /// them.
+    observed: Option<ObservedSpotState>,
+}
+
+/// The source and clock of one spot observation.
+#[derive(Debug, Clone)]
+struct ObservedSpotState {
+    source: SpotSource,
+    actual_pair: String,
+    clock: ObservationClock,
 }
 /// A failure inside the driver, before it becomes a [`ReplayError`].
-pub(super) struct DriverFailure {
+#[derive(Debug)]
+pub(crate) struct DriverFailure {
     pub(super) exit_code: u8,
     pub(super) code: String,
     pub(super) message: String,
@@ -72,53 +96,85 @@ impl DriverFailure {
     }
 }
 
+/// One row of output.
+///
+/// The original version writes the row alone. The net-share version writes
+/// the same row and the decision snapshot that produced it.
+pub(crate) struct DriverRow {
+    pub base: OutputRow,
+    pub decision: Option<DecisionDiagnostic>,
+}
+
 /// The state machine that walks the stream.
-pub(super) struct Driver {
+pub(crate) struct Driver {
     mode: ReplayMode,
+    version: ReplayVersion,
     core: DecisionCore,
     config: ReplayConfig,
     markets: BTreeMap<u64, MarketState>,
     spots: HashMap<String, SpotState>,
-    seen: HashMap<String, EventEnvelope>,
+    seen: HashMap<String, StreamEvent>,
     last_key: Option<(i64, u64)>,
+    /// The last elapsed clock seen, so it can never go backwards.
+    last_elapsed: Option<u64>,
     saw_official_label: bool,
     saw_real_market: bool,
     stream_evidence: Option<EvidenceType>,
+    // Tests pass the actual evaluated candidate to the existing Broker.
+    #[cfg(test)]
+    pub(crate) fixture_candidate: Option<super::super::phase1::CandidateContext>,
+    // The frozen wire has no venue tick precision. Execution tests explicitly
+    // inject only official rules; never replace wire prices or market state.
+    #[cfg(test)]
+    pub(crate) fixture_round_facts: Option<crate::service::venue::RoundFacts>,
 }
 
 impl Driver {
-    pub(super) fn new(config: ReplayConfig, mode: ReplayMode) -> Self {
-        let core = DecisionCore::with_warmup(
-            config.strategy_config(),
-            config.half_life_secs,
-            config.min_vol_samples,
-        );
+    pub(crate) fn new(config: ReplayConfig, mode: ReplayMode) -> Self {
+        let version = config.version().unwrap_or(ReplayVersion::V1);
+        // The net-share version runs the same core under the other economics.
+        let core = match version {
+            ReplayVersion::V1 => DecisionCore::with_warmup(
+                config.strategy_config(),
+                config.half_life_secs,
+                config.min_vol_samples,
+            ),
+            ReplayVersion::V2 => DecisionCore::phase1(config.strategy_config()),
+        };
         Self {
             mode,
+            version,
             core,
             config,
             markets: BTreeMap::new(),
             spots: HashMap::new(),
             seen: HashMap::new(),
             last_key: None,
+            last_elapsed: None,
             saw_official_label: false,
             saw_real_market: false,
             stream_evidence: None,
+            #[cfg(test)]
+            fixture_candidate: None,
+            #[cfg(test)]
+            fixture_round_facts: None,
         }
     }
 
     /// Process one event.
-    pub(super) fn step(
+    pub(crate) fn step(
         &mut self,
-        envelope: EventEnvelope,
+        event: StreamEvent,
         _line: u64,
         summary: &mut ReplaySummary,
-    ) -> Result<Option<OutputRow>, DriverFailure> {
-        self.validate_envelope(&envelope)?;
+    ) -> Result<Option<DriverRow>, DriverFailure> {
+        if self.version == ReplayVersion::V1 {
+            self.validate_envelope(&event)?;
+        }
         // A repeat of an event already seen is ignored; a repeat that says
         // something different is a conflict.
-        if let Some(previous) = self.seen.get(&envelope.event_id) {
-            if *previous == envelope {
+        if let Some(previous) = self.seen.get(&event.event_id) {
+            if *previous == event {
                 summary.duplicate_count += 1;
                 return Ok(None);
             }
@@ -127,12 +183,17 @@ impl Driver {
                 "identity_invalid",
                 format!(
                     "event {}: repeated id with a different payload",
-                    envelope.event_id
+                    event.event_id
                 ),
             ));
         }
 
-        let key = (envelope.available_at_ms, envelope.seq);
+        // A repeated old observation must not trip the current elapsed clock
+        // or reset an epoch. Conflicting identities above still fail closed.
+        if self.version == ReplayVersion::V2 {
+            self.validate_envelope(&event)?;
+        }
+        let key = (event.available_at_ms, event.seq);
         if let Some(last) = self.last_key {
             if key <= last {
                 return Err(DriverFailure::new(
@@ -140,99 +201,124 @@ impl Driver {
                     "time_order",
                     format!(
                         "event {}: available_at_ms/seq must strictly increase",
-                        envelope.event_id
+                        event.event_id
                     ),
                 ));
             }
         }
         self.last_key = Some(key);
-        self.stream_evidence = Some(envelope.evidence_type);
-        self.seen.insert(envelope.event_id.clone(), envelope.clone());
+        self.last_elapsed = Some(event.elapsed_ms);
+        self.stream_evidence = Some(event.evidence_type);
+        self.seen.insert(event.event_id.clone(), event.clone());
 
-        self.dispatch(envelope, summary)
+        self.dispatch(event, summary)
     }
 
     /// Check the envelope's shape, before anything is remembered about it.
-    fn validate_envelope(&self, envelope: &EventEnvelope) -> Result<(), DriverFailure> {
-        if envelope.schema_version != SCHEMA_VERSION {
+    fn validate_envelope(&self, event: &StreamEvent) -> Result<(), DriverFailure> {
+        let expected = match self.version {
+            ReplayVersion::V1 => SCHEMA_VERSION,
+            ReplayVersion::V2 => SCHEMA_VERSION_V2,
+        };
+        if event.schema_version != expected {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "schema_invalid",
                 format!(
-                    "event {}: schema_version must be {SCHEMA_VERSION}",
-                    envelope.event_id
+                    "event {}: schema_version must be {expected}",
+                    event.event_id
                 ),
             ));
         }
-        if envelope.event_id.trim().is_empty() {
+        if event.event_id.trim().is_empty() {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "schema_invalid",
                 "event_id must not be empty".to_string(),
             ));
         }
-        if envelope.source.trim().is_empty() {
+        if event.source.trim().is_empty() {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "schema_invalid",
-                format!("event {}: source must not be empty", envelope.event_id),
+                format!("event {}: source must not be empty", event.event_id),
             ));
         }
-        if DateTime::<Utc>::from_timestamp_millis(envelope.available_at_ms).is_none() {
+        if DateTime::<Utc>::from_timestamp_millis(event.available_at_ms).is_none() {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "value_invalid",
                 format!(
                     "event {}: available_at_ms is not a UTC instant",
-                    envelope.event_id
+                    event.event_id
                 ),
             ));
         }
-        if let Some(event_at) = envelope.event_at_ms {
+        if let Some(event_at) = event.event_at_ms {
             if DateTime::<Utc>::from_timestamp_millis(event_at).is_none() {
                 return Err(DriverFailure::new(
                     EXIT_CONTRACT,
                     "value_invalid",
-                    format!("event {}: event_at_ms is not a UTC instant", envelope.event_id),
+                    format!("event {}: event_at_ms is not a UTC instant", event.event_id),
                 ));
             }
-            if event_at > envelope.available_at_ms {
+            if event_at > event.available_at_ms {
                 return Err(DriverFailure::new(
                     EXIT_CONTRACT,
                     "time_order",
                     format!(
                         "event {}: event_at_ms is after available_at_ms",
-                        envelope.event_id
+                        event.event_id
                     ),
                 ));
             }
         }
+        // The elapsed clock is the process's own: it never goes backwards.
+        if let Some(last) = self.last_elapsed {
+            if event.elapsed_ms < last {
+                return Err(DriverFailure::new(
+                    EXIT_CONTRACT,
+                    "time_order",
+                    format!("event {}: elapsed_ms went backwards", event.event_id),
+                ));
+            }
+        }
         // Evidence is a stream identity, not a per-row permission to share state.
-        if matches!((self.mode, envelope.evidence_type),
+        if matches!(
+            (self.mode, event.evidence_type),
             (ReplayMode::Proxy, EvidenceType::RealMarket)
-                | (ReplayMode::Replay, EvidenceType::RealProxy))
+                | (ReplayMode::Replay, EvidenceType::RealProxy)
+        ) {
+            return Err(DriverFailure::new(
+                EXIT_CONTRACT,
+                "identity_invalid",
+                format!(
+                    "event {}: evidence is not allowed in this mode",
+                    event.event_id
+                ),
+            ));
+        }
+        if self
+            .stream_evidence
+            .is_some_and(|kind| kind != event.evidence_type)
         {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "identity_invalid",
-                format!("event {}: evidence is not allowed in this mode", envelope.event_id),
+                format!(
+                    "event {}: evidence cannot change within a stream",
+                    event.event_id
+                ),
             ));
         }
-        if self.stream_evidence.is_some_and(|kind| kind != envelope.evidence_type) {
-            return Err(DriverFailure::new(
-                EXIT_CONTRACT,
-                "identity_invalid",
-                format!("event {}: evidence cannot change within a stream", envelope.event_id),
-            ));
-        }
-        match (self.mode, envelope.payload.event_type()) {
+        match (self.mode, event.payload.event_type()) {
             (ReplayMode::Proxy, EventType::Spot) | (ReplayMode::Proxy, EventType::Value) => Ok(()),
             (ReplayMode::Proxy, other) => Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "schema_invalid",
                 format!(
                     "event {}: {} is not available in proxy mode",
-                    envelope.event_id,
+                    event.event_id,
                     other.as_str()
                 ),
             )),
@@ -241,7 +327,7 @@ impl Driver {
                 "schema_invalid",
                 format!(
                     "event {}: value is not available in replay mode",
-                    envelope.event_id
+                    event.event_id
                 ),
             )),
             (ReplayMode::Replay, _) => Ok(()),
@@ -251,18 +337,22 @@ impl Driver {
     /// Apply one event and produce its row.
     fn dispatch(
         &mut self,
-        envelope: EventEnvelope,
+        event: StreamEvent,
         summary: &mut ReplaySummary,
-    ) -> Result<Option<OutputRow>, DriverFailure> {
-        let event_type = envelope.payload.event_type();
+    ) -> Result<Option<DriverRow>, DriverFailure> {
+        let event_type = event.payload.event_type();
+        let schema_version = match self.version {
+            ReplayVersion::V1 => SCHEMA_VERSION,
+            ReplayVersion::V2 => SCHEMA_VERSION_V2,
+        };
         let mut row = OutputRow {
-            schema_version: SCHEMA_VERSION.to_string(),
-            event_id: envelope.event_id.clone(),
-            event_at_ms: envelope.event_at_ms,
-            available_at_ms: envelope.available_at_ms,
-            seq: envelope.seq,
-            evidence_type: envelope.evidence_type,
-            source: envelope.source.clone(),
+            schema_version: schema_version.to_string(),
+            event_id: event.event_id.clone(),
+            event_at_ms: event.event_at_ms,
+            available_at_ms: event.available_at_ms,
+            seq: event.seq,
+            evidence_type: event.evidence_type,
+            source: event.source.clone(),
             event_type,
             market_id: None,
             yes_token: None,
@@ -282,33 +372,49 @@ impl Driver {
             entered_after: None,
             reason: "observed".to_string(),
         };
-        if envelope.evidence_type == EvidenceType::RealMarket {
+        let mut decision = None;
+        if event.evidence_type == EvidenceType::RealMarket {
             self.saw_real_market = true;
         }
-        match envelope.payload {
-            Payload::Market(payload) => self.apply_market(&payload, &mut row)?,
-            Payload::State(payload) => self.apply_state(&payload, &mut row)?,
-            Payload::Spot(payload) => {
-                self.apply_spot(&payload, envelope.available_at_ms, &mut row, summary)?
-            }
-            Payload::Book(payload) => {
-                if self.apply_book(&payload, envelope.available_at_ms, &mut row)? {
+        match event.payload {
+            StreamPayload::Market(payload) => self.apply_market(&payload, &mut row)?,
+            StreamPayload::State(payload) => self.apply_state(&payload, &mut row)?,
+            StreamPayload::Spot(payload) => self.apply_spot(
+                &payload,
+                event.available_at_ms,
+                event.elapsed_ms,
+                &mut row,
+                summary,
+            )?,
+            StreamPayload::Book(payload) => {
+                if self.apply_book(&payload, event.available_at_ms, event.elapsed_ms, &mut row)? {
                     summary.duplicate_count += 1;
                     return Ok(None);
                 }
             }
-            Payload::Tick(payload) => {
-                self.apply_tick(&payload, envelope.available_at_ms, &mut row, summary)?
+            StreamPayload::Tick(payload) => {
+                decision = self.apply_tick(
+                    &payload,
+                    event.available_at_ms,
+                    event.elapsed_ms,
+                    &mut row,
+                    summary,
+                )?;
             }
-            Payload::Value(payload) => {
-                self.apply_value(&payload, envelope.available_at_ms, &mut row, summary)?
+            StreamPayload::Value(payload) => {
+                self.apply_value(&payload, event.available_at_ms, &mut row, summary)?
             }
-            Payload::Result(payload) => {
+            StreamPayload::Result(payload) => {
                 self.apply_result(&payload, &mut row, summary)?;
             }
-            Payload::Label(payload) => self.apply_label(&payload, envelope.available_at_ms, &mut row)?,
+            StreamPayload::Label(payload) => {
+                self.apply_label(&payload, event.available_at_ms, &mut row)?
+            }
         }
-        Ok(Some(row))
+        Ok(Some(DriverRow {
+            base: row,
+            decision,
+        }))
     }
 
     /// Establish or re-state a market's identity.
@@ -321,7 +427,10 @@ impl Driver {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "identity_invalid",
-                format!("market {}: symbol must be {REPLAY_SYMBOL}", payload.market_id),
+                format!(
+                    "market {}: symbol must be {REPLAY_SYMBOL}",
+                    payload.market_id
+                ),
             ));
         }
         if payload.ends_at_ms - payload.starts_at_ms != ROUND_MS {
@@ -358,7 +467,10 @@ impl Driver {
             return Err(DriverFailure::new(
                 EXIT_CONTRACT,
                 "schema_invalid",
-                format!("market {}: rules_source must not be empty", payload.market_id),
+                format!(
+                    "market {}: rules_source must not be empty",
+                    payload.market_id
+                ),
             ));
         }
         let state = MarketState {
@@ -378,8 +490,13 @@ impl Driver {
             fee_rate_bps: None,
             book: None,
             last_book: None,
+            book_clock: None,
             pending_candidate: None,
+            terminated_candidates: HashSet::new(),
             unknown_result: false,
+            identity_available_at: None,
+            strike_available_at: None,
+            fixed_strike_conflict: false,
         };
         match self.markets.get(&payload.market_id) {
             Some(existing) => {
@@ -408,12 +525,22 @@ impl Driver {
                         "identity_invalid",
                         format!(
                             "market {}: a token of market {} cannot be reused",
-                            payload.market_id, other_id(other)
+                            payload.market_id,
+                            other_id(other)
                         ),
                     ));
                 }
                 self.markets.insert(payload.market_id, state);
             }
+        }
+        // The identity was first available when this envelope became
+        // available: the first valid reading freezes that moment.
+        let market = self
+            .markets
+            .get_mut(&payload.market_id)
+            .expect("the market exists");
+        if market.identity_available_at.is_none() {
+            market.identity_available_at = Some(row.available_at_ms);
         }
         row.market_id = Some(payload.market_id);
         row.yes_token = Some(payload.yes_token.clone());
@@ -433,19 +560,28 @@ impl Driver {
                 return Err(DriverFailure::new(
                     EXIT_CONTRACT,
                     "value_invalid",
-                    format!(
-                        "market {}: start_price must be positive",
-                        payload.market_id
-                    ),
+                    format!("market {}: start_price must be positive", payload.market_id),
                 ));
             }
         }
+        let phase1 = self.version == ReplayVersion::V2;
         let market = self.market_mut(payload.market_id)?;
+        if phase1
+            && market.strike_available_at.is_some()
+            && market.start_price != payload.start_price
+        {
+            market.fixed_strike_conflict = true;
+        }
         market.open = Some(payload.open);
         market.contested = Some(payload.contested);
         market.paused = Some(payload.paused);
         market.start_price = payload.start_price;
         market.fee_rate_bps = payload.fee_rate_bps;
+        // The fixed strike was first available when this envelope became
+        // available: the first valid reading freezes that moment.
+        if payload.start_price.is_some() && market.strike_available_at.is_none() {
+            market.strike_available_at = Some(row.available_at_ms);
+        }
         row.market_id = Some(payload.market_id);
         row.symbol = Some(market.symbol.clone());
         Ok(())
@@ -454,8 +590,9 @@ impl Driver {
     /// Record a spot observation on the event's clock.
     fn apply_spot(
         &mut self,
-        payload: &SpotPayload,
+        payload: &SpotEvent,
         available_at_ms: i64,
+        elapsed_ms: u64,
         row: &mut OutputRow,
         summary: &mut ReplaySummary,
     ) -> Result<(), DriverFailure> {
@@ -487,6 +624,35 @@ impl Driver {
                 "spot: proxy bars must be aligned to the round length".to_string(),
             ));
         }
+        // The net-share version carries the source, the pair and the clock;
+        // the source and the pair must agree with each other, and the clock
+        // must be the moment the row was consumed. The identity of the feed
+        // comes first: a price of the wrong pair is not a stale price, it is
+        // a different price.
+        if let Some(source) = payload.source {
+            let Some(actual_pair) = payload.actual_pair.as_deref() else {
+                return Err(DriverFailure::new(
+                    EXIT_CONTRACT,
+                    "schema_invalid",
+                    "spot: actual_pair must not be empty".to_string(),
+                ));
+            };
+            let expected = match source {
+                SpotSource::Binance => "BTCUSDT",
+                SpotSource::Coinbase => "BTC-USD",
+            };
+            if actual_pair != expected {
+                return Err(DriverFailure::new(
+                    EXIT_CONTRACT,
+                    "identity_invalid",
+                    format!("spot: the {source:?} feed serves {expected}, not {actual_pair}"),
+                ));
+            }
+        }
+        let clock = payload.clock.clone();
+        if let Some(clock) = &clock {
+            self.check_clock(clock, available_at_ms, elapsed_ms, row, "spot")?;
+        }
         if let Some(last) = self.spots.get(&payload.symbol) {
             if last.at_ms == available_at_ms {
                 if last.price != payload.price {
@@ -508,28 +674,93 @@ impl Driver {
                 }
             }
         }
-        self.core
-            .observe_spot(&payload.symbol, payload.price, available_at_ms as f64 / 1000.0);
+        match self.version {
+            ReplayVersion::V1 => {
+                self.core.observe_spot(
+                    &payload.symbol,
+                    payload.price,
+                    available_at_ms as f64 / 1000.0,
+                );
+            }
+            ReplayVersion::V2 => {
+                let (Some(source), Some(actual_pair), Some(clock)) =
+                    (payload.source, payload.actual_pair.clone(), clock.clone())
+                else {
+                    return Err(DriverFailure::new(
+                        EXIT_CONTRACT,
+                        "schema_invalid",
+                        "spot: the net-share version needs a source, a pair and a clock"
+                            .to_string(),
+                    ));
+                };
+                let now = CheckTime {
+                    utc: DateTime::<Utc>::from_timestamp_millis(available_at_ms).ok_or_else(
+                        || {
+                            DriverFailure::new(
+                                EXIT_CONTRACT,
+                                "value_invalid",
+                                "spot: available_at_ms is not a UTC instant".to_string(),
+                            )
+                        },
+                    )?,
+                    elapsed_ms,
+                };
+                if let Err(reason) = self.core.observe_phase1(
+                    &payload.symbol,
+                    payload.price,
+                    source,
+                    &actual_pair,
+                    &clock,
+                    now,
+                ) {
+                    // Keep the received input for the next diagnostic, just
+                    // like RoundTaker. It was not admitted to EWMA; silently
+                    // substituting the older cached quote would lose its clock.
+                    row.reason = reason_text(reason).to_lowercase();
+                    summary.missing_reasons.push(row.reason.clone());
+                }
+            }
+        }
         self.spots.insert(
             payload.symbol.clone(),
             SpotState {
                 price: payload.price,
                 at_ms: available_at_ms,
+                observed: match (payload.source, payload.actual_pair.clone(), clock) {
+                    (Some(source), Some(actual_pair), Some(clock)) => Some(ObservedSpotState {
+                        source,
+                        actual_pair,
+                        clock,
+                    }),
+                    _ => None,
+                },
             },
         );
         row.symbol = Some(payload.symbol.clone());
-        row.samples = self.core.vol_samples(&payload.symbol);
-        row.sigma = self.core.sigma(&payload.symbol);
+        row.samples = match self.version {
+            ReplayVersion::V1 => self.core.vol_samples(&payload.symbol),
+            ReplayVersion::V2 => Some(self.core.samples(&payload.symbol)),
+        };
+        row.sigma = match self.version {
+            ReplayVersion::V1 => self.core.sigma(&payload.symbol),
+            ReplayVersion::V2 => self
+                .core
+                .phase1_sigma(&payload.symbol, self.config.vol_floor),
+        };
         Ok(())
     }
 
     /// Record a book snapshot, returning true for a same-time duplicate.
     fn apply_book(
         &mut self,
-        payload: &BookPayload,
+        payload: &BookEvent,
         available_at_ms: i64,
+        elapsed_ms: u64,
         row: &mut OutputRow,
     ) -> Result<bool, DriverFailure> {
+        if let Some(clock) = &payload.clock {
+            self.check_clock(clock, available_at_ms, elapsed_ms, row, "book")?;
+        }
         let market = self.market_mut(payload.market_id)?;
         if payload.yes_token != market.yes_token {
             return Err(DriverFailure::new(
@@ -573,20 +804,30 @@ impl Driver {
                 ));
             }
         }
+        let wire = BookPayload {
+            market_id: payload.market_id,
+            yes_token: payload.yes_token.clone(),
+            bids: payload.bids.clone(),
+            asks: payload.asks.clone(),
+        };
         if let Some((previous_at, previous)) = &market.last_book {
             if *previous_at == available_at_ms {
-                if previous != payload {
+                if previous != &wire {
                     return Err(DriverFailure::new(
                         EXIT_CONTRACT,
                         "value_invalid",
-                        format!("market {}: conflicting books at {available_at_ms} ms", payload.market_id),
+                        format!(
+                            "market {}: conflicting books at {available_at_ms} ms",
+                            payload.market_id
+                        ),
                     ));
                 }
                 return Ok(true);
             }
         }
-        market.last_book = Some((available_at_ms, payload.clone()));
+        market.last_book = Some((available_at_ms, wire));
         market.book = Some(BookSnapshot { bids, asks });
+        market.book_clock = payload.clock.clone();
         row.market_id = Some(payload.market_id);
         row.yes_token = Some(payload.yes_token.clone());
         row.symbol = Some(market.symbol.clone());
@@ -595,6 +836,26 @@ impl Driver {
 
     /// Decide on a market, the way the live tick would.
     fn apply_tick(
+        &mut self,
+        payload: &TickPayload,
+        available_at_ms: i64,
+        elapsed_ms: u64,
+        row: &mut OutputRow,
+        summary: &mut ReplaySummary,
+    ) -> Result<Option<DecisionDiagnostic>, DriverFailure> {
+        match self.version {
+            ReplayVersion::V1 => {
+                self.apply_tick_v1(payload, available_at_ms, row, summary)?;
+                Ok(None)
+            }
+            ReplayVersion::V2 => {
+                self.apply_tick_v2(payload, available_at_ms, elapsed_ms, row, summary)
+            }
+        }
+    }
+
+    /// Decide on a market under the original cash-fee economics.
+    fn apply_tick_v1(
         &mut self,
         payload: &TickPayload,
         available_at_ms: i64,
@@ -631,13 +892,17 @@ impl Driver {
         }
         // Everything needed is present, so value the round and look for an entry.
         let symbol = market.symbol.clone();
-        let spot = self.spots.get(&symbol).map(|state| state.price).ok_or_else(|| {
-            DriverFailure::new(
-                EXIT_CONTRACT,
-                "value_invalid",
-                "tick: spot must be known".to_string(),
-            )
-        })?;
+        let spot = self
+            .spots
+            .get(&symbol)
+            .map(|state| state.price)
+            .ok_or_else(|| {
+                DriverFailure::new(
+                    EXIT_CONTRACT,
+                    "value_invalid",
+                    "tick: spot must be known".to_string(),
+                )
+            })?;
         let book = market.book.clone().ok_or_else(|| {
             DriverFailure::new(
                 EXIT_CONTRACT,
@@ -680,6 +945,148 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Decide on a market under the net-share economics.
+    ///
+    /// The shared core does the deciding: this path only builds the inputs the
+    /// live path would build and reports what the core concluded. The
+    /// candidate the core produces is the one the result refers to.
+    fn apply_tick_v2(
+        &mut self,
+        payload: &TickPayload,
+        available_at_ms: i64,
+        elapsed_ms: u64,
+        row: &mut OutputRow,
+        summary: &mut ReplaySummary,
+    ) -> Result<Option<DecisionDiagnostic>, DriverFailure> {
+        let now = DateTime::<Utc>::from_timestamp_millis(available_at_ms).ok_or_else(|| {
+            DriverFailure::new(
+                EXIT_CONTRACT,
+                "value_invalid",
+                "tick: available_at_ms is not a UTC instant".to_string(),
+            )
+        })?;
+        let market = self.market_mut(payload.market_id)?.clone();
+        row.market_id = Some(payload.market_id);
+        row.yes_token = Some(market.yes_token.clone());
+        row.no_token = Some(market.no_token.clone());
+        row.symbol = Some(market.symbol.clone());
+        let entered_before = self.core.is_entered(payload.market_id);
+        row.entered_before = Some(entered_before);
+        row.entered_after = Some(entered_before);
+        row.candidate = Some(false);
+        row.samples = Some(self.core.samples(&market.symbol));
+        row.sigma = self
+            .core
+            .phase1_sigma(&market.symbol, self.config.vol_floor);
+
+        // The round keeps one open entry: while a candidate waits for its
+        // result, the round offers no second one.
+        let open_candidate = market.pending_candidate.is_some();
+        let spot = self.spots.get(&market.symbol).cloned();
+        let observed = spot.as_ref().and_then(|state| state.observed.as_ref());
+        let spot_clock = observed.map(|observed| observed.clock.clone());
+        let actual_pair = observed.map(|observed| observed.actual_pair.clone());
+        let source = observed.map(|observed| observed.source);
+        let book = market.book.clone().unwrap_or_default();
+        let tradable = tradable_market_v2(&market);
+        #[cfg(test)]
+        let tradable = TradableMarket {
+            round_facts: self.fixture_round_facts.clone(),
+            ..tradable
+        };
+        let inputs = EvaluationInputs {
+            market: &tradable,
+            book: &book,
+            spot_price: spot.as_ref().map(|state| state.price).unwrap_or(f64::NAN),
+            spot_source: source,
+            actual_pair,
+            spot_clock,
+            book_clock: market.book_clock.clone(),
+            now: CheckTime {
+                utc: now,
+                elapsed_ms,
+            },
+            order_usd: self.config.order_usd,
+            min_edge: self.config.min_edge,
+            min_secs_left: self.config.min_secs_left as f64,
+            entered: entered_before,
+            identity_available_at: market
+                .identity_available_at
+                .and_then(|at| DateTime::<Utc>::from_timestamp_millis(at)),
+            strike_available_at: market
+                .strike_available_at
+                .and_then(|at| DateTime::<Utc>::from_timestamp_millis(at)),
+            // The net-share wire carries no official provider: it stays
+            // unknown rather than being read out of the prediction source.
+            settlement_provider: SettlementProvider::Unknown,
+        };
+        let evaluation = self.core.evaluate_phase1(&inputs);
+        let mut diagnostic = evaluation.diagnostic;
+        let mut candidate = evaluation.candidate;
+        // The official fee is a rule of the market: without it the fee cannot
+        // be zero. The core sees no fee, so the driver refuses here.
+        diagnostic.fee_rate_bps = market.fee_rate_bps;
+        if market.fee_rate_bps.is_none() && !entered_before {
+            diagnostic.reason = Reason::MarketInvalid;
+            diagnostic.candidate_id = None;
+            diagnostic.selected_token = None;
+            candidate = None;
+        }
+        if open_candidate || market.unknown_result {
+            // The round already has an open entry: the single-entry
+            // protection of the round applies, and no new candidate is made.
+            candidate = None;
+            diagnostic.candidate_id = None;
+            diagnostic.reason = Reason::AlreadyEntered;
+            diagnostic.selected_token = None;
+        }
+        row.samples = Some(diagnostic.samples);
+        row.sigma = diagnostic.sigma;
+        row.p_up = diagnostic.p_up;
+        row.reason = reason_text(diagnostic.reason).to_lowercase();
+        if market.unknown_result {
+            row.reason = "result_unknown".to_string();
+        }
+        if let Some(selected) = &diagnostic.selected_token {
+            row.token = Some(selected.clone());
+            let side = if selected == &market.yes_token {
+                diagnostic.up.as_ref()
+            } else {
+                diagnostic.down.as_ref()
+            };
+            if let Some(side) = side {
+                row.price = side.limit_price;
+                row.fair = side.fair;
+                row.edge = side.edge;
+            }
+        }
+        if let Some(candidate) = &candidate {
+            row.candidate = Some(true);
+            row.reason = "candidate".to_string();
+            summary.candidate_count += 1;
+            if let Some(state) = self.markets.get_mut(&payload.market_id) {
+                // The result refers to the candidate the core produced, not to
+                // the event that asked for it. An older candidate that is
+                // replaced is terminated, never confirmed.
+                if let Some(previous) = state
+                    .pending_candidate
+                    .replace(candidate.candidate_id().to_string())
+                {
+                    state.terminated_candidates.insert(previous);
+                }
+            }
+        } else if !MISSING_EVIDENCE_REASONS.contains(&row.reason.as_str())
+            && row.reason != "already_entered"
+        {
+            summary.missing_reasons.push(row.reason.clone());
+        }
+        #[cfg(test)]
+        {
+            self.fixture_candidate = candidate;
+        }
+        Ok(Some(diagnostic))
     }
 
     /// The first reason this tick cannot decide, in the frozen priority order.
@@ -800,9 +1207,29 @@ impl Driver {
             .markets
             .get(&payload.market_id)
             .and_then(|market| market.pending_candidate.clone());
+        let terminated = self.markets.get(&payload.market_id).is_some_and(|market| {
+            market
+                .terminated_candidates
+                .contains(&payload.candidate_event_id)
+        });
         match pending {
             Some(candidate) if candidate == payload.candidate_event_id => {}
             _ => {
+                // A candidate that was replaced may still be answered with a
+                // refusal; it can never be answered with a fill.
+                if terminated && payload.status == ResultStatus::Blocked {
+                    let market = self
+                        .markets
+                        .get_mut(&payload.market_id)
+                        .expect("the market exists");
+                    market
+                        .terminated_candidates
+                        .remove(&payload.candidate_event_id);
+                    row.market_id = Some(payload.market_id);
+                    row.result_status = Some(payload.status);
+                    row.reason = "blocked".to_string();
+                    return Ok(());
+                }
                 return Err(DriverFailure::new(
                     EXIT_CONTRACT,
                     "result_invalid",
@@ -810,7 +1237,7 @@ impl Driver {
                         "result: market {} has no pending candidate {}",
                         payload.market_id, payload.candidate_event_id
                     ),
-                ))
+                ));
             }
         }
         let entered_before = self.core.is_entered(payload.market_id);
@@ -970,7 +1397,7 @@ impl Driver {
                 format!("value: horizon_secs must be {PROXY_HORIZON_SECS}"),
             ));
         }
-        let spot = self.spots.get(&payload.symbol).copied().ok_or_else(|| {
+        let spot = self.spots.get(&payload.symbol).cloned().ok_or_else(|| {
             DriverFailure::new(
                 EXIT_CONTRACT,
                 "value_invalid",
@@ -1005,6 +1432,50 @@ impl Driver {
         Ok(())
     }
 
+    /// Check that the clock of an input agrees with the envelope that
+    /// carries it.
+    ///
+    /// The envelope's available time is the moment the row became available
+    /// and the elapsed clock is the process's own reading at that moment: the
+    /// two cannot disagree with the clock the input carries.
+    fn check_clock(
+        &self,
+        clock: &ObservationClock,
+        available_at_ms: i64,
+        elapsed_ms: u64,
+        row: &mut OutputRow,
+        kind: &str,
+    ) -> Result<(), DriverFailure> {
+        let received_at_ms = clock.received_at.timestamp_millis();
+        if received_at_ms != available_at_ms {
+            return Err(DriverFailure::new(
+                EXIT_CONTRACT,
+                "time_order",
+                format!("{kind}: available_at_ms must be the moment the input was received"),
+            ));
+        }
+        if clock.received_elapsed_ms != elapsed_ms {
+            return Err(DriverFailure::new(
+                EXIT_CONTRACT,
+                "time_order",
+                format!("{kind}: elapsed_ms must be the received elapsed clock"),
+            ));
+        }
+        // The source's own time and the event's own time are the same fact,
+        // or both are absent. Neither one is allowed to cover the other.
+        match (row.event_at_ms, clock.source_at) {
+            (None, None) => Ok(()),
+            (Some(event_at), Some(source_at)) if event_at == source_at.timestamp_millis() => Ok(()),
+            _ => Err(DriverFailure::new(
+                EXIT_CONTRACT,
+                "time_order",
+                format!(
+                    "{kind}: event_at_ms and the source's own time must agree, or both be absent"
+                ),
+            )),
+        }
+    }
+
     /// The market state, or a failure if the market was never established.
     fn market_mut(&mut self, market_id: u64) -> Result<&mut MarketState, DriverFailure> {
         self.markets.get_mut(&market_id).ok_or_else(|| {
@@ -1025,13 +1496,17 @@ impl Driver {
             .count() as u64;
         for market in self.markets.values() {
             if market.pending_candidate.is_some() {
-                summary.missing_reasons.push("candidate_unconfirmed".to_string());
+                summary
+                    .missing_reasons
+                    .push("candidate_unconfirmed".to_string());
             }
         }
         if self.mode == ReplayMode::Proxy {
             summary.missing_reasons.push("proxy_only".to_string());
         } else if self.saw_real_market && !self.saw_official_label {
-            summary.missing_reasons.push("official_labels_missing".to_string());
+            summary
+                .missing_reasons
+                .push("official_labels_missing".to_string());
         }
         let mut reasons = summary.missing_reasons.clone();
         reasons.sort();
@@ -1069,6 +1544,20 @@ fn tradable_market(market: &MarketState) -> TradableMarket {
         payout_yes: None,
         labels: None,
         round_facts: None,
+    }
+}
+
+/// The market as the net-share path sees it.
+///
+/// The market keeps its own identity: the core checks the frozen inputs
+/// against it, so the round the driver offers is the round it holds.
+fn tradable_market_v2(market: &MarketState) -> TradableMarket {
+    TradableMarket {
+        id: market.market_id,
+        open: market.open == Some(true)
+            && market.paused == Some(false)
+            && !market.fixed_strike_conflict,
+        ..tradable_market(market)
     }
 }
 
@@ -1113,4 +1602,31 @@ fn levels(levels: &[BookLevelPayload], side: &str) -> Result<Vec<BookLevel>, Dri
         });
     }
     Ok(out)
+}
+
+/// The stable text of a diagnostic reason.
+///
+/// The reason is an enum with one spelling; the text comes from the enum
+/// itself, so it cannot drift away from the contract.
+fn reason_text(reason: Reason) -> &'static str {
+    match reason {
+        Reason::RunStopped => "RUN_STOPPED",
+        Reason::AlreadyEntered => "ALREADY_ENTERED",
+        Reason::MarketInvalid => "MARKET_INVALID",
+        Reason::MissingInput => "MISSING_INPUT",
+        Reason::InputInvalid => "INPUT_INVALID",
+        Reason::ClockInvalid => "CLOCK_INVALID",
+        Reason::RequestTooSlow => "REQUEST_TOO_SLOW",
+        Reason::SpotStale => "SPOT_STALE",
+        Reason::BookStale => "BOOK_STALE",
+        Reason::RoundTooLate => "ROUND_TOO_LATE",
+        Reason::InputChanged => "INPUT_CHANGED",
+        Reason::Warmup => "WARMUP",
+        Reason::NetSharesInvalid => "NET_SHARES_INVALID",
+        Reason::EdgeBelowMin => "EDGE_BELOW_MIN",
+        Reason::DiagnosticLimit => "DIAGNOSTIC_LIMIT",
+        Reason::BrokerBlocked => "BROKER_BLOCKED",
+        Reason::ContextMissing => "CONTEXT_MISSING",
+        Reason::Eligible => "ELIGIBLE",
+    }
 }

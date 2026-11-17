@@ -18,6 +18,8 @@ impl Drop for EventScope {
         set_controlled_clock_expired(false);
         CLOCK_EXPIRE_AFTER.with(|clock| clock.set(None));
         CLOCK_CHECKS.with(|checks| checks.set(0));
+        ENCODING_LIMIT.with(|fault| fault.set(false));
+        OUTPUT_FAILURE.with(|fault| fault.set(false));
         clear_recorded_events();
     }
 }
@@ -57,6 +59,382 @@ async fn deadline_after_reservation_releases_cash_before_fill() {
     assert_eq!(broker.paper_snapshot().unwrap().cash, 100.0);
 }
 
+/// A failure at the final application sample must release, never fill.
+#[test]
+fn phase1_final_clock_failure_releases_once() {
+    use crate::bot::arbitrage::phase1::{EvaluationInputs, SettlementProvider};
+    use crate::service::observation::{FreshnessBasis, ObservationClock, SourceTimeStatus};
+    use crate::service::spot::SpotSource;
+    struct FinalClock {
+        now: CheckTime,
+        calls: std::sync::atomic::AtomicUsize,
+        final_delay_ms: Option<i64>,
+        encoding_limit: bool,
+        output_failure: bool,
+    }
+    impl Clock for FinalClock {
+        fn now(&self) -> Result<CheckTime> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call >= 2 {
+                if call == 2 && self.encoding_limit {
+                    ENCODING_LIMIT.with(|fault| fault.set(true));
+                }
+                if call == 2 && self.output_failure {
+                    OUTPUT_FAILURE.with(|fault| fault.set(true));
+                }
+                let Some(delay) = self.final_delay_ms else {
+                    bail!("CLOCK_UNAVAILABLE");
+                };
+                return Ok(CheckTime {
+                    utc: self.now.utc + chrono::Duration::milliseconds(delay),
+                    elapsed_ms: self.now.elapsed_ms + delay as u64,
+                });
+            }
+            Ok(self.now)
+        }
+    }
+    let _events = EventScope::new();
+    for (final_delay_ms, encoding_limit, output_failure, sequence_exhausted) in [
+        (None, false, false, false),
+        (Some(1), false, false, false),
+        (Some(0), true, false, false),
+        (Some(0), false, true, false),
+        (Some(0), false, false, true),
+        (Some(0), false, false, false),
+    ] {
+        clear_recorded_events();
+        let now = Utc::now();
+        let mut market = market(1);
+        market.start_price = Some(100.0);
+        market.starts_at = Some(now - chrono::Duration::seconds(270));
+        market.ends_at = Some(now + chrono::Duration::seconds(30));
+        let book = book(&[(0.39, 100.0)], &[(0.4, 100.0)]);
+        let observation = ObservationClock {
+            source_at: None,
+            source_time_status: SourceTimeStatus::Missing,
+            freshness_basis: FreshnessBasis::ReceiptBound,
+            request_at: now,
+            received_at: now,
+            request_elapsed_ms: 100_000,
+            received_elapsed_ms: 100_000,
+        };
+        let checked = CheckTime {
+            utc: now,
+            elapsed_ms: 100_000,
+        };
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(Default::default());
+        for index in 0..=20 {
+            let mut sample = observation.clone();
+            sample.request_at -= chrono::Duration::seconds(100 - index * 5);
+            sample.received_at = sample.request_at;
+            sample.request_elapsed_ms = index as u64 * 5_000;
+            sample.received_elapsed_ms = sample.request_elapsed_ms;
+            core.observe_phase1(
+                "BTCUSDT",
+                101.0,
+                SpotSource::Binance,
+                "BTCUSDT",
+                &sample,
+                CheckTime {
+                    utc: sample.received_at,
+                    elapsed_ms: sample.received_elapsed_ms,
+                },
+            )
+            .unwrap();
+        }
+        let evaluation = core.evaluate_phase1(&EvaluationInputs {
+            market: &market,
+            book: &book,
+            spot_price: 101.0,
+            spot_source: Some(SpotSource::Binance),
+            actual_pair: Some("BTCUSDT".into()),
+            spot_clock: Some(observation.clone()),
+            book_clock: Some(observation),
+            now: checked,
+            order_usd: 2.0,
+            min_edge: 0.03,
+            min_secs_left: 30.0,
+            entered: false,
+            identity_available_at: Some(now),
+            strike_available_at: Some(now),
+            settlement_provider: SettlementProvider::Unknown,
+        });
+        assert_eq!(evaluation.diagnostic.reason, Reason::Eligible);
+        let candidate = evaluation.candidate.unwrap();
+        let broker = controlled(100.0)
+            .with_phase1(
+                Arc::new(FinalClock {
+                    now: checked,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    final_delay_ms,
+                    encoding_limit,
+                    output_failure,
+                }),
+                StrategyContract::Phase1NetShares,
+                0.03,
+                30.0,
+            )
+            .unwrap();
+        broker.observe(&market, &book);
+        broker.emit_phase1_evaluation(&market, &evaluation.diagnostic, Some(&candidate));
+        if sequence_exhausted {
+            broker
+                .state
+                .lock()
+                .paper
+                .as_ref()
+                .unwrap()
+                .phase1
+                .as_ref()
+                .unwrap()
+                .event_seq
+                .store(u64::MAX - 3, Ordering::SeqCst);
+        }
+        let result = broker.take_candidate(&market, &book, &candidate);
+        if sequence_exhausted {
+            assert!(
+                matches!(result.unwrap(), TakeResult::Blocked(_)),
+                "exhausted output sequence must refuse before applying cash"
+            );
+            assert_eq!(broker.paper_snapshot().unwrap().cash, 100.0);
+            assert_eq!(broker.paper_snapshot().unwrap().reserved, 0.0);
+            let events = recorded_events();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["event_kind"] == "reservation"
+                        || event["event_kind"] == "fill")
+            );
+            assert_eq!(
+                events.last().unwrap()["source"]["diagnostic_reason"],
+                "DIAGNOSTIC_LIMIT"
+            );
+            continue;
+        }
+        if output_failure {
+            assert!(result.is_err());
+            let snapshot = broker.paper_snapshot().unwrap();
+            assert_eq!(
+                snapshot.cash, 98.0,
+                "output failure must not undo a real fill"
+            );
+            assert_eq!(snapshot.reserved, 0.0);
+            assert!(broker.phase1_entries_stopped());
+            let state = broker.state.lock();
+            assert!(
+                state
+                    .paper
+                    .as_ref()
+                    .unwrap()
+                    .phase1
+                    .as_ref()
+                    .unwrap()
+                    .output_failed
+                    .load(Ordering::SeqCst),
+                "a failed direct PRE_APPLY flush must mark run evidence incomplete"
+            );
+            assert!(!recorded_events()
+                .iter()
+                .any(|event| event["event_kind"] == "fill"));
+            continue;
+        }
+        let result = result.unwrap();
+        if final_delay_ms == Some(0) && !encoding_limit {
+            assert!(matches!(result, TakeResult::Filled { shares, .. } if shares > 0.0));
+            assert_eq!(broker.paper_snapshot().unwrap().cash, 98.0);
+            let events = recorded_events();
+            let apply = events
+                .iter()
+                .find(|event| event["source"]["decision"]["phase"] == "PRE_APPLY")
+                .unwrap();
+            let fill = events
+                .iter()
+                .find(|event| event["event_kind"] == "fill")
+                .unwrap();
+            assert_eq!(apply["accounting"]["cash"], 100.0);
+            assert_eq!(apply["accounting"]["reserved"], 2.0);
+            assert_eq!(fill["accounting"]["cash"], 98.0);
+            assert_eq!(fill["accounting"]["reserved"], 0.0);
+            assert_eq!(apply["event_seq"].as_u64().unwrap() + 1, fill["event_seq"]);
+            for (index, event) in events.iter().enumerate() {
+                assert_eq!(event["event_seq"].as_u64().unwrap(), index as u64 + 1);
+            }
+            continue;
+        }
+        assert_eq!(result, TakeResult::Blocked(Blocked::DataIncomplete));
+        assert!(broker.holdings().is_empty());
+        assert_eq!(broker.paper_snapshot().unwrap().cash, 100.0);
+        assert_eq!(broker.paper_snapshot().unwrap().reserved, 0.0);
+        let events = recorded_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_kind"] == "release")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_kind"] == "fill")
+                .count(),
+            0
+        );
+        let expected = if encoding_limit {
+            "DIAGNOSTIC_LIMIT"
+        } else if final_delay_ms.is_none() {
+            "CLOCK_INVALID"
+        } else {
+            "ROUND_TOO_LATE"
+        };
+        assert_eq!(
+            events.last().unwrap()["source"]["diagnostic_reason"],
+            expected
+        );
+        if encoding_limit {
+            let apply = events
+                .iter()
+                .find(|event| event["source"]["decision"]["phase"] == "PRE_APPLY")
+                .expect("encoding refusal must keep the final recheck snapshot");
+            let decision = &apply["source"]["decision"];
+            assert_eq!(decision["reason"], "DIAGNOSTIC_LIMIT");
+            assert_eq!(decision["candidate_id"], candidate.candidate_id());
+            assert_eq!(decision["decision_id"], candidate.decision_id());
+            assert_eq!(decision["selected_token"], candidate.token());
+            assert!(decision["up"]["depth_levels"].is_null());
+            assert!(decision["up"]["depth_complete"].is_null());
+            assert_eq!(apply["accounting"]["reserved"], 2.0);
+        }
+    }
+}
+
+/// A deadline that arrives after the reservation releases the cash once, and
+/// both the release and the terminal refusal carry RUN_STOPPED.
+///
+/// The money is released either way; what the diagnostic says is the point.
+#[test]
+fn a_deadline_after_the_reservation_is_recorded_as_run_stopped() {
+    use crate::bot::arbitrage::phase1::{EvaluationInputs, SettlementProvider};
+    use crate::service::observation::{FreshnessBasis, ObservationClock, SourceTimeStatus};
+    use crate::service::spot::SpotSource;
+    /// A clock that always answers with the same reading.
+    struct FixedClock {
+        now: CheckTime,
+    }
+    impl Clock for FixedClock {
+        fn now(&self) -> Result<CheckTime> {
+            Ok(self.now)
+        }
+    }
+    let _events = EventScope::new();
+    clear_recorded_events();
+    let now = Utc::now();
+    let mut market = market(1);
+    market.start_price = Some(100.0);
+    market.starts_at = Some(now - chrono::Duration::seconds(270));
+    market.ends_at = Some(now + chrono::Duration::seconds(30));
+    let book = book(&[(0.39, 100.0)], &[(0.4, 100.0)]);
+    let observation = ObservationClock {
+        source_at: None,
+        source_time_status: SourceTimeStatus::Missing,
+        freshness_basis: FreshnessBasis::ReceiptBound,
+        request_at: now,
+        received_at: now,
+        request_elapsed_ms: 100_000,
+        received_elapsed_ms: 100_000,
+    };
+    let checked = CheckTime {
+        utc: now,
+        elapsed_ms: 100_000,
+    };
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(Default::default());
+    for index in 0..=20 {
+        let mut sample = observation.clone();
+        sample.request_at -= chrono::Duration::seconds(100 - index * 5);
+        sample.received_at = sample.request_at;
+        sample.request_elapsed_ms = index as u64 * 5_000;
+        sample.received_elapsed_ms = sample.request_elapsed_ms;
+        core.observe_phase1(
+            "BTCUSDT",
+            101.0,
+            SpotSource::Binance,
+            "BTCUSDT",
+            &sample,
+            CheckTime {
+                utc: sample.received_at,
+                elapsed_ms: sample.received_elapsed_ms,
+            },
+        )
+        .unwrap();
+    }
+    let evaluation = core.evaluate_phase1(&EvaluationInputs {
+        market: &market,
+        book: &book,
+        spot_price: 101.0,
+        spot_source: Some(SpotSource::Binance),
+        actual_pair: Some("BTCUSDT".into()),
+        spot_clock: Some(observation.clone()),
+        book_clock: Some(observation),
+        now: checked,
+        order_usd: 2.0,
+        min_edge: 0.03,
+        min_secs_left: 30.0,
+        entered: false,
+        identity_available_at: Some(now),
+        strike_available_at: Some(now),
+        settlement_provider: SettlementProvider::Unknown,
+    });
+    assert_eq!(evaluation.diagnostic.reason, Reason::Eligible);
+    let candidate = evaluation.candidate.unwrap();
+    let broker = controlled(100.0)
+        .with_phase1(
+            Arc::new(FixedClock { now: checked }),
+            StrategyContract::Phase1NetShares,
+            0.03,
+            30.0,
+        )
+        .unwrap();
+    broker.observe(&market, &book);
+    broker.emit_phase1_evaluation(&market, &evaluation.diagnostic, Some(&candidate));
+    // The deadline arrives after the run passed its own pre-submit check and
+    // reserved the worst case, so the reservation has to be released.
+    set_controlled_clock_expire_after(2);
+    let result = broker.take_candidate(&market, &book, &candidate).unwrap();
+    assert!(matches!(result, TakeResult::Blocked(_)));
+    let events = recorded_events();
+    let execution: Vec<_> = events
+        .iter()
+        .filter(|event| event["event_kind"] != "summary")
+        .collect();
+    let kinds: Vec<_> = execution
+        .iter()
+        .map(|event| event["event_kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["reservation", "release", "blocked"], "{kinds:?}");
+    for event in &execution[1..] {
+        assert_eq!(
+            event["source"]["diagnostic_reason"], "RUN_STOPPED",
+            "{event}"
+        );
+    }
+    assert_eq!(execution[1]["accounting"]["reserved"], 0.0);
+    assert_eq!(execution[1]["accounting"]["cash"], 100.0);
+    assert_eq!(execution[2]["accounting"]["reserved"], 0.0);
+    assert_eq!(execution[2]["accounting"]["cash"], 100.0);
+    assert_eq!(
+        execution
+            .iter()
+            .filter(|event| event["event_kind"] == "fill")
+            .count(),
+        0
+    );
+    let snapshot = broker.paper_snapshot().unwrap();
+    assert_eq!(snapshot.cash, 100.0);
+    assert_eq!(snapshot.reserved, 0.0);
+    assert_eq!(snapshot.cost, 0.0);
+    assert!(broker.holdings().is_empty());
+}
+
 struct BlockedMarketData(tokio::sync::Notify);
 #[async_trait::async_trait]
 impl crate::service::venue::MarketData for BlockedMarketData {
@@ -77,6 +455,63 @@ impl crate::service::venue::MarketData for BlockedMarketData {
     }
     async fn books(&self, _: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
         panic!("BOOK_FORBIDDEN")
+    }
+}
+
+/// Encoding-bound probe, not a market-data or account-state fixture.
+#[test]
+fn phase1_output_capacity_reserves_dynamic_scalar_widths() {
+    use crate::service::observation::FixtureClock;
+    let run = Phase1Run {
+        clock: Arc::new(FixtureClock::new(Utc::now())),
+        contract: StrategyContract::Phase1NetShares,
+        min_edge: 0.03,
+        min_secs_left: 30.0,
+        event_seq: Arc::new(AtomicU64::new(9)),
+        output_failed: Arc::new(AtomicBool::new(false)),
+    };
+    let mut link = CandidateLink {
+        decision_id: "1".into(),
+        candidate_id: "1".into(),
+        diagnostic_reason: Reason::Eligible,
+    };
+    let before = serde_json::json!({"cash":9.0, "available":9.0, "cost":0.0, "reserved":0.0,
+        "fees_in_cash":0.0, "loss_latched":false, "nav":null, "net_pnl":null, "realized":0.0, "unrealized":null});
+    for kind in ["fill", "release"] {
+        let encode = |padding: usize, accounting: &serde_json::Value, link: &CandidateLink| {
+            prepare_event(
+                None,
+                kind,
+                Some(1),
+                Some("yes-1"),
+                Some(accounting.clone()),
+                Some(serde_json::json!({"padding": "x".repeat(padding)})),
+                Some(&run),
+                None,
+                Some(link),
+            )
+        };
+        let base = encode(0, &before, &link).unwrap().line.len() + EVENT_PREFIX.len() + 1;
+        assert!(
+            encode(64 * 1024 - base - 4, &before, &link).is_err(),
+            "a nearly full pre-state record must not promise room for wider post-state numbers"
+        );
+        let padding = 64 * 1024 - base - 1024;
+        assert!(encode(padding, &before, &link).is_ok());
+        let mut after = before.clone();
+        for value in after.as_object_mut().unwrap().values_mut() {
+            *value = if value.is_boolean() {
+                serde_json::json!(true)
+            } else {
+                serde_json::json!(-f64::MAX)
+            };
+        }
+        run.event_seq.store(u64::MAX - 1, Ordering::SeqCst);
+        link.diagnostic_reason = Reason::DiagnosticLimit;
+        let final_record = encode(padding, &after, &link).unwrap();
+        assert!(final_record.line.len() + EVENT_PREFIX.len() + 1 <= 64 * 1024);
+        run.event_seq.store(9, Ordering::SeqCst);
+        link.diagnostic_reason = Reason::Eligible;
     }
 }
 
@@ -342,9 +777,103 @@ fn signed_ctx_uses_original_factory_and_identity_bound_budget_gate() {
     }
 }
 
+/// Fixture of the same core/Broker context used by unsigned protocol consumers.
+struct ProtocolHarness {
+    broker: Broker,
+    core: crate::bot::arbitrage::DecisionCore,
+    clock: Arc<crate::service::observation::FixtureClock>,
+    observation: crate::service::observation::ObservationClock,
+}
+
+impl ProtocolHarness {
+    fn new() -> Self {
+        use crate::service::observation::{
+            FixtureClock, FreshnessBasis, ObservationClock, SourceTimeStatus,
+        };
+        let origin = Utc::now() - chrono::Duration::seconds(100);
+        let clock = Arc::new(FixtureClock::new(origin));
+        clock.advance(100_000);
+        let broker = controlled(100.0)
+            .with_phase1(clock.clone(), StrategyContract::Phase1NetShares, 0.03, 30.0)
+            .unwrap();
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(Default::default());
+        let mut observation = ObservationClock {
+            source_at: None,
+            source_time_status: SourceTimeStatus::Missing,
+            freshness_basis: FreshnessBasis::ReceiptBound,
+            request_at: origin,
+            received_at: origin,
+            request_elapsed_ms: 0,
+            received_elapsed_ms: 0,
+        };
+        for index in 0..=20 {
+            observation.request_at = origin + chrono::Duration::seconds(index * 5);
+            observation.received_at = observation.request_at;
+            observation.request_elapsed_ms = index as u64 * 5000;
+            observation.received_elapsed_ms = observation.request_elapsed_ms;
+            core.observe_phase1(
+                "BTCUSDT",
+                101.0,
+                crate::service::spot::SpotSource::Binance,
+                "BTCUSDT",
+                &observation,
+                CheckTime {
+                    utc: observation.received_at,
+                    elapsed_ms: observation.received_elapsed_ms,
+                },
+            )
+            .unwrap();
+        }
+        Self {
+            broker,
+            core,
+            clock,
+            observation,
+        }
+    }
+
+    fn take(
+        broker: &Broker,
+        core: &mut crate::bot::arbitrage::DecisionCore,
+        clock: &crate::service::observation::FixtureClock,
+        observation: &crate::service::observation::ObservationClock,
+        market: &TradableMarket,
+        book: &BookSnapshot,
+    ) -> TakeResult {
+        use crate::bot::arbitrage::phase1::{EvaluationInputs, SettlementProvider};
+        clock.set_utc(Utc::now());
+        let now = clock.now().unwrap();
+        let evaluation = core.evaluate_phase1(&EvaluationInputs {
+            market,
+            book,
+            spot_price: 101.0,
+            spot_source: Some(crate::service::spot::SpotSource::Binance),
+            actual_pair: Some("BTCUSDT".into()),
+            spot_clock: Some(observation.clone()),
+            book_clock: Some(observation.clone()),
+            now,
+            order_usd: 2.0,
+            min_edge: 0.03,
+            min_secs_left: 30.0,
+            entered: false,
+            identity_available_at: Some(now.utc),
+            strike_available_at: Some(now.utc),
+            settlement_provider: SettlementProvider::Unknown,
+        });
+        let candidate = evaluation.candidate.unwrap();
+        assert!(broker.emit_phase1_evaluation(market, &evaluation.diagnostic, Some(&candidate)));
+        broker.take_candidate(market, book, &candidate).unwrap()
+    }
+}
+
 #[tokio::test]
 async fn protocol_consumer_fixture() {
-    let broker = controlled(100.0);
+    let ProtocolHarness {
+        broker,
+        mut core,
+        clock,
+        observation,
+    } = ProtocolHarness::new();
     let mut market = market(1);
     market.yes_token = "77".into();
     market.no_token = "88".into();
@@ -352,15 +881,23 @@ async fn protocol_consumer_fixture() {
     broker.observe(&market, &book);
     broker.record_source("77", "Binance", Utc::now());
     emit_summary(&broker);
-    broker
-        .take(&market, "77", Side::Buy, 5.0, 0.4, &book)
-        .await
-        .unwrap();
+    ProtocolHarness::take(
+        &broker,
+        &mut core,
+        clock.as_ref(),
+        &observation,
+        &market,
+        &book,
+    );
     assert_eq!(
-        broker
-            .take(&market, "77", Side::Buy, 5.0, 0.4, &book)
-            .await
-            .unwrap(),
+        ProtocolHarness::take(
+            &broker,
+            &mut core,
+            clock.as_ref(),
+            &observation,
+            &market,
+            &book
+        ),
         TakeResult::Blocked(Blocked::MarketCap)
     );
     market.open = false;
@@ -388,8 +925,14 @@ async fn extended_protocol_consumer_fixture() {
         "pending",
         "conflict",
         "paid-conflict",
+        "draw",
     ] {
-        let mut broker = controlled(100.0);
+        let ProtocolHarness {
+            mut broker,
+            mut core,
+            clock,
+            observation,
+        } = ProtocolHarness::new();
         broker.controlled.as_mut().unwrap().run_id = format!("test-{scenario}");
         emit_summary(&broker);
         let book = book(&[(0.4, 100.0)], &[(0.4, 100.0)]);
@@ -401,10 +944,14 @@ async fn extended_protocol_consumer_fixture() {
             if scenario == "release" {
                 set_controlled_clock_expire_after(2);
             }
-            let result = broker
-                .take(&market, &market.yes_token, Side::Buy, 5.0, 0.4, &book)
-                .await
-                .unwrap();
+            let result = ProtocolHarness::take(
+                &broker,
+                &mut core,
+                clock.as_ref(),
+                &observation,
+                &market,
+                &book,
+            );
             if scenario == "release" {
                 assert_eq!(result, TakeResult::Blocked(Blocked::Deadline));
                 set_controlled_clock_expired(false);
@@ -431,6 +978,10 @@ async fn extended_protocol_consumer_fixture() {
                 market.open = false;
                 market.end_price = Some(if scenario == "loss" { 99.0 } else { 101.0 });
                 market.payout_yes = Some(if scenario == "loss" { 0.0 } else { 1.0 });
+                if scenario == "draw" {
+                    market.end_price = market.start_price;
+                    market.payout_yes = Some(0.5);
+                }
                 market.round_facts = Some(if scenario == "loss" {
                     facts("LOST", "WON")
                 } else {

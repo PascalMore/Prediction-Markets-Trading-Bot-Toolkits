@@ -7,9 +7,12 @@
 //! being right on average, and the model is a plain driftless lognormal with
 //! trailing volatility, not a fitted one.
 //!
-//! Rounds settle on Binance's top of book. Where Binance isn't reachable the bot
-//! still runs on a Coinbase price to exercise the path, but only ever on paper:
-//! the feeds differ by enough to swamp a small edge.
+//! The price feeds are prediction proxies, not the settlement feed: Binance and
+//! Coinbase both feed the model, and neither of them settles a round. The
+//! official settlement provider comes from the round's own facts, and a round
+//! whose provider is unknown stays unknown. Where Binance isn't reachable the
+//! bot still runs on a Coinbase price to exercise the path, but only ever on
+//! paper: the feeds differ by enough to swamp a small edge.
 
 pub mod history;
 pub mod phase1;
@@ -19,7 +22,7 @@ use crate::bot::quoting::Known;
 use crate::bot::runtime::{drive, shares_for, Ctx, Strategy, TakeResult};
 use crate::config::{AppConfig, BtcArbConfig};
 use crate::models::{BookSnapshot, Side};
-use crate::service::observation::{CheckTime, Clock, ObservedBook, ObservedSpot};
+use crate::service::observation::{Clock, ObservedBook, ObservedSpot};
 use crate::service::spot::{digital_up, EwmaVol, SpotFeed, SpotQuote, SpotSource};
 use crate::service::venue::TradableMarket;
 use anyhow::Result;
@@ -30,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use phase1::{Phase1Core, StrategyContract};
+use phase1::StrategyContract;
 
 const VOL_HALF_LIFE_SECS: f64 = 300.0;
 /// Spot samples before the volatility estimate is trusted.
@@ -49,14 +52,16 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         known: Known::default(),
         rounds: Vec::new(),
         last_scan: None,
-        phase1: None,
+        availability: HashMap::new(),
         #[cfg(test)]
         inputs: None,
+        #[cfg(test)]
+        rounds_error: false,
     };
     // Only an unsigned controlled run speaks the phase1 protocol. Every other
     // path keeps the legacy cash-fee core.
     if ctx.broker.is_phase1() {
-        bot.phase1 = Some(Phase1Core::new(StrategyContract::Phase1NetShares));
+        bot.core = DecisionCore::phase1(bot.cfg.clone());
     }
     drive(&mut bot, &ctx).await
 }
@@ -69,10 +74,56 @@ struct RoundTaker {
     known: Known,
     rounds: Vec<TradableMarket>,
     last_scan: Option<Instant>,
-    /// The phase1 core, when this run speaks the phase1 protocol.
-    phase1: Option<Phase1Core>,
+
+    /// When each round's official identity and strike became locally
+    /// available. The first valid reading is frozen: a later poll cannot
+    /// move the moment the fact was first had.
+    availability: HashMap<u64, Availability>,
     #[cfg(test)]
     inputs: Option<(Vec<TradableMarket>, SpotQuote, DateTime<Utc>)>,
+    #[cfg(test)]
+    rounds_error: bool,
+}
+
+/// When a round's official facts became locally available.
+///
+/// The two moments are separate: the identity of a round and the fixed strike
+/// it trades against can arrive at different times, and each is frozen at its
+/// own first valid reading.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Availability {
+    identity_at: Option<DateTime<Utc>>,
+    strike_at: Option<DateTime<Utc>>,
+    identity: Option<(String, String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>,
+    strike: Option<f64>,
+    conflict: bool,
+}
+
+impl Availability {
+    /// Freeze the moments this round's facts were first had.
+    fn record(&mut self, market: &TradableMarket, at: DateTime<Utc>) {
+        let identity = (
+            market.yes_token.clone(),
+            market.no_token.clone(),
+            market.starts_at,
+            market.ends_at,
+        );
+        if let Some(original) = &self.identity {
+            self.conflict |= original != &identity;
+        } else if !market.yes_token.is_empty() && market.yes_token != market.no_token {
+            self.identity = Some(identity);
+            self.identity_at = Some(at);
+        }
+        if let Some(strike) = self.strike {
+            self.conflict |= market.start_price != Some(strike);
+        } else if market
+            .start_price
+            .is_some_and(|strike| strike.is_finite() && strike > 0.0)
+        {
+            self.strike = market.start_price;
+            self.strike_at = Some(at);
+        }
+    }
 }
 
 /// The decision core shared by the live tick and the offline replay driver.
@@ -80,7 +131,7 @@ struct RoundTaker {
 /// It owns the volatility estimate and the set of markets already bought. The
 /// live path feeds it quotes from the spot feed; the replay path feeds it
 /// events on an explicit clock. Neither path re-implements the model.
-struct DecisionCore {
+pub(crate) struct DecisionCore {
     cfg: BtcArbConfig,
     /// The volatility half-life, in seconds.
     half_life_secs: f64,
@@ -90,6 +141,11 @@ struct DecisionCore {
     /// Markets already bought: one entry a round, so a wrong model can't average
     /// into a losing round.
     entered: HashSet<u64>,
+    contract: StrategyContract,
+    symbols: HashMap<String, phase1::SymbolState>,
+    next_decision_id: u64,
+    market_revisions: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
+    last_phase1_check: Option<crate::service::observation::CheckTime>,
 }
 
 impl DecisionCore {
@@ -104,6 +160,11 @@ impl DecisionCore {
             min_vol_samples,
             vols: HashMap::new(),
             entered: HashSet::new(),
+            contract: StrategyContract::LegacyCashFee,
+            symbols: HashMap::new(),
+            next_decision_id: 0,
+            market_revisions: HashMap::new(),
+            last_phase1_check: None,
         }
     }
 
@@ -182,10 +243,23 @@ struct Valuation {
     p_up: f64,
 }
 
+/// An empty book, used when a market's book could not be read at all.
+///
+/// It is a real absence, not a price: the evaluation that uses it says the
+/// input was missing instead of valuing a round against nothing.
+fn empty_book() -> BookSnapshot {
+    BookSnapshot {
+        bids: Vec::new(),
+        asks: Vec::new(),
+    }
+}
+
 /// The live tick's adapter to the shared core.
 ///
 /// It repeats the tick's own source guard so the seam can be falsified
-/// offline: on a live account only the settlement feed may be traded.
+/// offline: on a live account only the primary prediction feed may be traded.
+/// The official settlement provider is a separate fact of the round and is
+/// never derived from this feed.
 fn live_entry(
     core: &DecisionCore,
     market: &TradableMarket,
@@ -210,6 +284,10 @@ impl RoundTaker {
     }
 
     async fn read_rounds(&self, ctx: &Ctx) -> Result<Vec<TradableMarket>> {
+        #[cfg(test)]
+        if self.rounds_error {
+            anyhow::bail!("SYNTHETIC_ROUND_SCAN");
+        }
         #[cfg(test)]
         if let Some((rounds, _, _)) = &self.inputs {
             return Ok(rounds.clone());
@@ -259,7 +337,25 @@ impl Strategy for RoundTaker {
         // seen in this tick can make one valid again.
         ctx.broker.invalidate_paper_marks();
         if self.last_scan.is_none_or(|t| t.elapsed() >= ROUND_RESCAN) {
-            let rounds = self.read_rounds(ctx).await?;
+            let rounds = match self.read_rounds(ctx).await {
+                Ok(rounds) => rounds,
+                Err(error) => {
+                    // Retain selected attempts on a failed rescan, without
+                    // pretending cached facts supplied a new quote or book.
+                    if self.core.contract() == StrategyContract::Phase1NetShares {
+                        if let Some(clock) = ctx.broker.phase1_clock() {
+                            self.trade_phase1(
+                                ctx.broker.as_ref(),
+                                &HashMap::new(),
+                                &HashMap::new(),
+                                clock.as_ref(),
+                            )
+                            .await?;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
             self.known.remember(&rounds);
             self.select_rounds(rounds, self.now());
             self.last_scan = Some(Instant::now());
@@ -267,7 +363,7 @@ impl Strategy for RoundTaker {
         }
 
         let ids: Vec<u64> = self.rounds.iter().map(|m| m.id).collect();
-        if self.phase1.is_some() {
+        if self.core.contract() == StrategyContract::Phase1NetShares {
             return self.tick_phase1(ctx, ids).await;
         }
 
@@ -304,12 +400,29 @@ impl RoundTaker {
         let Some(clock) = ctx.broker.phase1_clock() else {
             anyhow::bail!("CONTROLLED_MODE: the phase1 run has no clock");
         };
+        // The official facts were read by the rescan above: the moment a
+        // round's identity or strike was first had is frozen here, once.
+        let scan_at = clock.now()?;
+        for market in &self.rounds {
+            self.availability
+                .entry(market.id)
+                .or_default()
+                .record(market, scan_at.utc);
+        }
+        let mut failed = false;
         let mut quotes: HashMap<String, ObservedSpot> = HashMap::new();
         for symbol in self.cfg.symbols.clone() {
-            let quote = self.spot.quote_observed(&symbol, clock.as_ref()).await?;
-            if let Some(core) = self.phase1.as_mut() {
+            let quote = match self.spot.quote_observed(&symbol, clock.as_ref()).await {
+                Ok(quote) => quote,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            {
+                let core = &mut self.core;
                 let now = clock.now()?;
-                if let Err(reason) = core.observe(
+                if let Err(reason) = core.observe_phase1(
                     &symbol,
                     quote.price,
                     quote.source,
@@ -323,29 +436,23 @@ impl RoundTaker {
             quotes.insert(symbol, quote);
         }
 
-        let mut all: Vec<u64> = ids.to_vec();
-        for id in ctx.broker.tracked_markets() {
-            if !all.contains(&id) {
-                all.push(id);
-            }
-        }
-        for id in &all {
-            if self.known.get(*id).is_none() {
-                let market = ctx.data.market(*id).await?;
-                self.known.remember(&[market]);
-            }
-        }
-        let books = ctx.data.observed_books(&all, clock.as_ref()).await?;
-        for (id, observed) in &books {
-            if let Some(market) = self.known.get(*id) {
-                ctx.broker.observe(market, &observed.book);
-            }
-        }
-        if ctx.broker.is_halted() {
-            return Ok(());
-        }
-        self.trade_phase1(ctx.broker.as_ref(), &quotes, &books, clock.as_ref())
+        let books = match self
+            .known
+            .observe_with_clock(ctx, &ids, clock.as_ref())
             .await
+        {
+            Ok(books) => books,
+            Err(_) => {
+                failed = true;
+                HashMap::new()
+            }
+        };
+        self.trade_phase1(ctx.broker.as_ref(), &quotes, &books, clock.as_ref())
+            .await?;
+        if failed {
+            anyhow::bail!("DATA_INCOMPLETE");
+        }
+        Ok(())
     }
 }
 
@@ -435,44 +542,84 @@ impl RoundTaker {
         books: &HashMap<u64, ObservedBook>,
         clock: &dyn Clock,
     ) -> Result<()> {
-        let Some(core) = self.phase1.as_mut() else {
-            return Ok(());
-        };
-        for market in self.rounds.clone() {
-            let Some(symbol) = market.feed_symbol.clone() else {
-                continue;
-            };
-            let Some(quote) = quotes.get(&symbol) else {
-                continue;
-            };
-            let Some(observed) = books.get(&market.id) else {
-                continue;
-            };
+        for mut market in self.rounds.clone() {
+            let availability = self.availability.get(&market.id).cloned();
+            if availability
+                .as_ref()
+                .is_some_and(|available| available.conflict)
+            {
+                market.open = false;
+            }
+            let symbol = market.feed_symbol.as_deref().unwrap_or("BTCUSDT");
+            self.core
+                .refresh_phase1_market(market.id)
+                .map_err(|_| anyhow::anyhow!("INPUT_CHANGED"))?;
+            // A market without a spot quote or without a book cannot be
+            // valued, but it was still selected: the attempt is recorded with
+            // the reason it could not be evaluated.
+            let quote = quotes.get(symbol);
+            let observed = books.get(&market.id);
             let now = clock.now()?;
+
+            let no_book = empty_book();
             let inputs = phase1::EvaluationInputs {
                 market: &market,
-                book: &observed.book,
-                spot_price: quote.price,
-                spot_source: quote.source,
-                actual_pair: quote.actual_pair.clone(),
-                spot_clock: Some(quote.clock.clone()),
-                book_clock: Some(observed.clock.clone()),
+                book: observed.map(|observed| &observed.book).unwrap_or(&no_book),
+                spot_price: quote.map(|quote| quote.price).unwrap_or(f64::NAN),
+                spot_source: quote.map(|quote| quote.source),
+                actual_pair: quote.map(|quote| quote.actual_pair.clone()),
+                spot_clock: quote.map(|quote| quote.clock.clone()),
+                book_clock: observed.map(|observed| observed.clock.clone()),
                 now,
                 order_usd: self.cfg.order_usd,
                 min_edge: self.cfg.min_edge,
                 min_secs_left: self.cfg.min_secs_left as f64,
                 entered: self.core.is_entered(market.id),
-                identity_available_at: None,
-                strike_available_at: None,
-                settlement_provider: phase1::SettlementProvider::Unknown,
+                identity_available_at: availability
+                    .as_ref()
+                    .and_then(|available| available.identity_at),
+                strike_available_at: availability
+                    .as_ref()
+                    .and_then(|available| available.strike_at),
+                settlement_provider: if market
+                    .round_facts
+                    .as_ref()
+                    .and_then(|facts| facts.price_feed_provider.as_deref())
+                    == Some("CHAINLINK")
+                {
+                    phase1::SettlementProvider::Chainlink
+                } else {
+                    phase1::SettlementProvider::Unknown
+                },
             };
-            let evaluation = core.evaluate(&inputs);
+            let mut evaluation = self.core.evaluate_phase1(&inputs);
+            if broker.phase1_entries_stopped() {
+                evaluation.diagnostic.reason = phase1::Reason::RunStopped;
+                evaluation.diagnostic.candidate_id = None;
+                evaluation.diagnostic.selected_token = None;
+                evaluation.candidate = None;
+            }
+            // Every selected market leaves its evaluation on the record, and
+            // only the eligible one continues to the broker.
+            if !broker.emit_phase1_evaluation(
+                &market,
+                &evaluation.diagnostic,
+                evaluation.candidate.as_ref(),
+            ) {
+                continue;
+            }
             let Some(candidate) = evaluation.candidate else {
                 debug!(
                     market = market.id,
                     reason = ?evaluation.diagnostic.reason,
                     "phase1 evaluation refused"
                 );
+                continue;
+            };
+            let Some(quote) = quote else {
+                continue;
+            };
+            let Some(observed) = observed else {
                 continue;
             };
             let token = candidate.token().to_string();
@@ -601,9 +748,11 @@ mod tests {
             known: Known::default(),
             rounds: Vec::new(),
             last_scan: None,
-            phase1: None,
+            availability: HashMap::new(),
             #[cfg(test)]
             inputs: None,
+            #[cfg(test)]
+            rounds_error: false,
         }
     }
 
@@ -1144,7 +1293,7 @@ mod tests {
         assert!(live_entry(&core, &market, &stale, coinbase, now, true).is_none());
         // Paper on a substitute feed: allowed.
         assert!(live_entry(&core, &market, &stale, coinbase, now, false).is_some());
-        // Live on the settlement feed: allowed.
+        // Live on the primary prediction feed: allowed.
         let binance = SpotQuote {
             price: 100.1,
             source: SpotSource::Binance,

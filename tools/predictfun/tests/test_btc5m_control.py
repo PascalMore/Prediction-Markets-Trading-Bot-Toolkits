@@ -38,6 +38,7 @@ def public_config(**overrides):
 
 def final_event():
     return {"run_id": "run-1", "event_kind": "final", "market_id": None, "token": None,
+            "schema_version": control.SCHEMA_VERSION_V2, "event_seq": 1,
             "event_time": "2026-11-16T00:00:00Z",
             "accounting": {"cash": 100, "available": 100, "reserved": 0, "cost": 0,
                            "realized": 0, "unrealized": 0, "nav": 100, "net_pnl": 0,
@@ -47,6 +48,8 @@ def final_event():
 
 def signed_final_event():
     event = final_event()
+    event.pop("schema_version")
+    event.pop("event_seq")
     event["accounting"] = {name: None for name in event["accounting"]}
     event["source"].update(markets=None, finalized=False, accounting_reason="LIVE_ACCOUNTING_UNAVAILABLE")
     return event
@@ -491,6 +494,7 @@ class LauncherTest(LauncherFixture):
         first = final_event()
         first.update(event_kind="summary", source=None)
         second = final_event()
+        second["event_seq"] = 2
         second["accounting"].update(cash=101, available=101, realized=1, nav=101, net_pnl=1)
         # Both satisfy per-event equations, but no fill or payout explains the extra cash.
         lines = "\n".join(control.EVENT_PREFIX + json.dumps(event) for event in (first, second))
@@ -1009,7 +1013,7 @@ class RustProtocolTest(unittest.TestCase):
                 event = json.loads(line[len(control.EVENT_PREFIX):])
                 scenarios.setdefault(event["run_id"], []).append(event)
         self.assertEqual(set(scenarios), {"test-" + name for name in
-                         ("release", "sell", "loss", "pending", "conflict", "paid-conflict")})
+                         ("release", "sell", "loss", "pending", "conflict", "paid-conflict", "draw")})
         original_open = open
         writes = []
 
@@ -1052,7 +1056,10 @@ class RustProtocolTest(unittest.TestCase):
                     self.assertEqual(writes[-1], final)
                     if run_id == "test-release":
                         self.assertEqual([event["event_kind"] for event in writes],
-                            ["summary", "reservation", "release", "blocked", "final"])
+                            ["summary", "summary", "summary", "reservation", "release", "blocked", "final"])
+                        self.assertEqual([event["source"]["decision"]["phase"] for event in writes
+                            if isinstance(event["source"], dict) and "decision" in event["source"]],
+                            ["EVALUATE", "PRE_SUBMIT"])
                         self.assertEqual(final["accounting"]["cash"], 100)
                     if run_id == "test-sell":
                         sell = next(event for event in writes if (event["source"] or {}).get("side") == "sell")
@@ -1064,12 +1071,33 @@ class RustProtocolTest(unittest.TestCase):
                         self.assertEqual(sum(event["event_kind"] == "loss_latch" for event in writes), 1)
                         self.assertEqual(final["accounting"]["net_pnl"], -20)
                         self.assertTrue(final["accounting"]["loss_latched"])
+                    if run_id == "test-draw":
+                        paid = next(event for event in writes if event["event_kind"] == "settlement")
+                        self.assertEqual(paid["source"]["payout"], .5)
+                        self.assertAlmostEqual(paid["source"]["income"], 2.45)
+                        self.assertAlmostEqual(final["accounting"]["realized"], .45)
+                        self.assertAlmostEqual(final["accounting"]["cash"], 100.45)
                     if run_id in {"test-pending", "test-conflict", "test-paid-conflict"}:
                         expected = "PENDING" if run_id == "test-pending" else "CONFLICT"
                         self.assertEqual(final["source"]["markets"][0]["status"], expected)
                         self.assertFalse(final["source"]["finalized"])
                         self.assertAlmostEqual(final["accounting"]["cash"],
                                                102.9 if run_id == "test-paid-conflict" else 98)
+            # Offline folds use actual emitter facts, never a second execution model.
+            for run_id in ("test-draw", "test-loss", "test-pending"):
+                metrics = fold_phase1_metrics(scenarios[run_id])
+                if run_id == "test-draw":
+                    self.assertEqual((metrics["direction_total"], metrics["draw"],
+                                      metrics["entry_total"], metrics["cash_positive"]), (0, 1, 0, 1))
+                elif run_id == "test-loss":
+                    self.assertEqual((metrics["direction_total"], metrics["direction_hits"],
+                                      metrics["entry_total"], metrics["entry_wins"]), (10, 0, 10, 0))
+                else:
+                    self.assertEqual((metrics["pending"], metrics["fills_pending"]), (1, 1))
+                    self.assertIsNone(metrics["cash_pnl"])
+                if metrics["cash_pnl"] is not None:
+                    self.assertAlmostEqual(metrics["cash_pnl"],
+                                           scenarios[run_id][-1]["accounting"]["realized"], delta=1e-9)
             # Single-field corruption of actual Rust facts must never be persisted.
             mutations = {
                 "sell": [("pnl", 1.9008), ("price", .9), ("fee_rate_bps", 0),
@@ -1102,6 +1130,8 @@ class RustProtocolTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         lines = [line for line in result.stdout.decode().splitlines() if line.startswith(control.EVENT_PREFIX)]
         self.assertTrue(lines)
+        for line in lines:
+            control.validate_event(line[len(control.EVENT_PREFIX):].encode(), "test-run")
         writes = []
         original_open = open
         class WriteSpy:
@@ -1128,9 +1158,14 @@ class RustProtocolTest(unittest.TestCase):
             self.assertEqual(facts["launcher_exit"], 0)
             self.assertEqual(len(writes), len(lines))
             self.assertEqual([item["event_kind"] for item in writes],
-                             ["summary", "reservation", "fill", "blocked", "settlement", "final"])
-            self.assertEqual(writes[1]["accounting"]["reserved"], 2)
-            fill = writes[2]
+                ["summary", "summary", "summary", "reservation", "summary", "fill",
+                 "summary", "summary", "blocked", "settlement", "final"])
+            self.assertEqual([event["source"]["decision"]["phase"] for event in writes
+                if isinstance(event["source"], dict) and "decision" in event["source"]],
+                ["EVALUATE", "PRE_SUBMIT", "PRE_APPLY", "EVALUATE", "PRE_SUBMIT"])
+            reservation = next(event for event in writes if event["event_kind"] == "reservation")
+            self.assertEqual(reservation["accounting"]["reserved"], 2)
+            fill = next(event for event in writes if event["event_kind"] == "fill")
             self.assertAlmostEqual(fill["source"]["fee_shares"], .1)
             self.assertAlmostEqual(fill["accounting"]["cash"], 98)
             self.assertAlmostEqual(final["accounting"]["cash"], 102.9)
@@ -1145,6 +1180,306 @@ class RustProtocolTest(unittest.TestCase):
                     bad["source"]["markets"] *= 2
                 with self.assertRaises(ValueError):
                     control.validate_event(json.dumps(bad).encode(), "test-run")
+
+
+def fold_phase1_metrics(events: list[dict]) -> dict:
+    """Offline test fold of actual v2 facts; never an execution or balance ledger."""
+    if any(event.get("schema_version") != control.SCHEMA_VERSION_V2 for event in events):
+        raise ValueError("DIAGNOSTICS_UNAVAILABLE")
+    final = events[-1]
+    markets = {str(item["market_id"]): item for item in final["source"]["markets"]}
+    result: dict = dict(direction_hits=0, direction_total=0, abstain=0, draw=0, pending=0,
+                  unvalued=0, entry_wins=0, entry_total=0, cash_positive=0, cash_total=0,
+                  fills_pending=0, cash_pnl=0.0, net_by_token={}, strata={})
+    fills = {event["source"]["candidate_id"]: event for event in events
+             if event["event_kind"] == "fill" and event["source"]["side"] == "buy"}
+    settlements = {event["source"]["candidate_id"]: event for event in events
+                   if event["event_kind"] == "settlement"}
+    for event in events:
+        decision = (event["source"] or {}).get("decision")
+        if decision is None or decision["phase"] != "EVALUATE":
+            continue
+        key = (decision["prediction_source"], decision["source_epoch"])
+        result["strata"][key] = result["strata"].get(key, 0) + 1
+        fair = decision["p_up"]
+        market = markets.get(str(event["market_id"]), {})
+        payout = market.get("payout_yes") if market.get("status") == "CONFIRMED" else None
+        if fair is None: result["unvalued"] += 1
+        elif fair == .5: result["abstain"] += 1
+        elif payout is None: result["pending"] += 1
+        elif payout == .5: result["draw"] += 1
+        else:
+            result["direction_total"] += 1
+            result["direction_hits"] += (fair > .5) == (payout == 1)
+    for candidate, event in fills.items():
+        source = event["source"]
+        result["net_by_token"][str(event["token"])] = {
+            name: source[name] for name in ("gross_shares", "fee_shares", "net_shares")}
+        settlement = settlements.get(candidate)
+        if settlement is None:
+            result["fills_pending"] += 1
+            continue
+        settled = settlement["source"]
+        pnl = settled["income"] - settled["basis"]
+        result["cash_pnl"] += pnl
+        result["cash_total"] += 1
+        result["cash_positive"] += pnl > 0
+        if settled["payout"] != .5:
+            result["entry_total"] += 1
+            result["entry_wins"] += settled["payout"] == 1
+    if result["fills_pending"]:
+        result["cash_pnl"] = None  # An open mark is not a final cash outcome.
+    return result
+
+
+class Phase1ProtocolTest(LauncherFixture):
+    """Actual Rust v2 output traverses the original first-write consumer."""
+
+    @classmethod
+    def setUpClass(cls):
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib",
+            "bot::arbitrage::phase1::tests::phase1_protocol_consumer_fixture",
+            "--", "--exact", "--nocapture"], cwd=control.BOT, capture_output=True, timeout=120)
+        if result.returncode or b"1 passed" not in result.stdout:
+            raise AssertionError(result.stderr.decode() + result.stdout.decode())
+        cls.events = [json.loads(line[len(control.EVENT_PREFIX):])
+                      for line in result.stdout.decode().splitlines()
+                      if line.startswith(control.EVENT_PREFIX)]
+        # Existing id schema canonicalizes numeric market ids, not diagnostic numbers.
+        for event in cls.events:
+            if event["market_id"] is not None:
+                event["market_id"] = str(event["market_id"])
+            if event["event_kind"] == "final":
+                for market in event["source"]["markets"]:
+                    market["market_id"] = str(market["market_id"])
+        if len(cls.events) != 9:
+            raise AssertionError("real v2 fixture must produce nine events")
+
+    def consume(self, events, *, raw_lines=None):
+        writes = []
+        original_open = open
+
+        class WriteSpy:
+            def __init__(self, handle): self.handle = handle
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.handle.__exit__(*args)
+            def write(self, text):
+                writes.append(json.loads(text))
+                return self.handle.write(text)
+            def flush(self): self.handle.flush()
+
+        def spy(path, *args, **kwargs):
+            handle = original_open(path, *args, **kwargs)
+            return WriteSpy(handle) if str(path).endswith("events.jsonl") else handle
+
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            root = Path(directory)
+            lines = raw_lines if raw_lines is not None else [json.dumps(event) for event in events]
+            stream = "\n".join(control.EVENT_PREFIX + line for line in lines)
+            process = subprocess.Popen([sys.executable, "-B", str(self.script), "stream", stream],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            evidence = control.Evidence(root, self.events[0]["run_id"], "", "", "unsigned-paper")
+            with patch("builtins.open", side_effect=spy):
+                facts, final = control.supervise(process, evidence, now, control.boottime())
+            self.assertEqual(writes, [json.loads(line) for line in
+                                      (root / "events.jsonl").read_text().splitlines()])
+        return facts, final, writes
+
+    def test_candidate_lifecycle_is_checked_before_write(self):
+        cases = [(1, "seq"), (1, "repeat-evaluate"), (2, "phase"),
+                 (3, "candidate"), (4, "epoch"), (5, "token"), (7, "settlement")]
+        for index, fault in cases:
+            events = copy.deepcopy(self.events)
+            event = events[index]
+            if fault == "seq": event["event_seq"] = events[index - 1]["event_seq"]
+            elif fault == "repeat-evaluate":
+                event["source"]["decision"].update(decision_id="1", candidate_id="1")
+            elif fault == "phase": event["source"]["decision"]["phase"] = "PRE_APPLY"
+            elif fault == "candidate": event["source"].update(candidate_id="999", decision_id="999")
+            elif fault == "epoch": event["source"]["decision"]["source_epoch"] += 1
+            elif fault == "token": event["token"] = "999"
+            else: event["source"]["candidate_id"] = "999"
+            with self.subTest(fault=fault):
+                facts, final, writes = self.consume(events)
+                self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                self.assertIsNone(final)
+                self.assertEqual(writes, self.events[:index])
+        events = copy.deepcopy(self.events[:2] + [self.events[-1]])
+        events[-1] = final_event()
+        events[-1].update(run_id=self.events[0]["run_id"], schema_version=control.SCHEMA_VERSION_V2,
+                          event_seq=3)
+        facts, final, writes = self.consume(events)
+        self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+        self.assertIsNone(final)
+        self.assertEqual(writes, self.events[:2])
+
+    def test_attempt_ids_and_reservation_reasons_are_not_free_labels(self):
+        for index, fault in ((0, "attempt-id"), (3, "reservation-reason")):
+            events = copy.deepcopy(self.events)
+            if fault == "attempt-id":
+                events[index]["source"]["decision"]["decision_id"] = "999"
+            else:
+                events[index]["source"]["diagnostic_reason"] = "BOOK_STALE"
+            with self.subTest(fault=fault):
+                facts, final, writes = self.consume(events)
+                self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                self.assertIsNone(final)
+                self.assertEqual(writes, self.events[:index])
+
+    def test_fill_must_match_the_frozen_book_walk_not_just_the_limit(self):
+        events = copy.deepcopy(self.events)
+        event = events[5]
+        fill = event["source"]
+        price = fill["price"] - .01
+        gross = fill["gross_shares"]
+        fee = gross * fill["fee_rate_bps"] / 10000 * min(price, 1 - price)
+        net = gross - fee / price
+        cost = gross * price
+        fill.update(price=price, cost=cost, fee=fee, fee_shares=fee / price, net_shares=net)
+        mark = events[1]["source"]["decision"]["best_yes_bid"]
+        unrealized = net * mark - cost
+        event["accounting"].update(cash=100 - cost, available=100 - cost, cost=cost,
+                                  fees_in_cash=fee, unrealized=unrealized,
+                                  net_pnl=unrealized, nav=100 + unrealized)
+        # All single-event fee/cash equations are consistent; only the frozen walk disagrees.
+        control.validate_event(json.dumps(event).encode(), event["run_id"])
+        facts, final, writes = self.consume(events)
+        self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+        self.assertIsNone(final)
+        self.assertEqual(writes, self.events[:5])
+
+    def test_required_v2_diagnostic_fields_are_not_nullable(self):
+        for name in ("phase", "reason", "symbol", "source_state", "reset_reason",
+                     "settlement_provider", "decision_at", "checked_at", "samples",
+                     "decision_elapsed_ms", "checked_elapsed_ms"):
+            events = copy.deepcopy(self.events)
+            events[0]["source"]["decision"][name] = None
+            with self.subTest(field=name):
+                facts, final, writes = self.consume(events)
+                self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                self.assertIsNone(final)
+                self.assertEqual(writes, [])
+
+    def test_missing_input_is_a_legal_non_candidate_not_a_protocol_failure(self):
+        missing = copy.deepcopy(self.events[0])
+        decision = missing["source"]["decision"]
+        decision.update(reason="MISSING_INPUT", candidate_id=None, selected_token=None,
+                        prediction_source=None, actual_pair=None, source_state="UNAVAILABLE",
+                        source_epoch=None, spot=None, spot_clock=None, book_clock=None,
+                        sigma=None, p_up=None, up=None, down=None)
+        end = final_event()
+        end.update(run_id=missing["run_id"], event_seq=2)
+        facts, final, writes = self.consume([missing, end])
+        self.assertEqual(facts["launcher_exit"], 0)
+        self.assertEqual(writes, [missing, end])
+        self.assertEqual(final, end)
+
+    def test_v2_shape_and_version_corruption_never_reaches_first_write(self):
+        baseline = self.events[0]
+        mutations = []
+        for version in (None, control.SCHEMA_VERSION, "unknown"):
+            event = copy.deepcopy(baseline)
+            event["schema_version"] = version
+            mutations.append(json.dumps(event))
+        for field, value in (("samples", True), ("reason", "UNKNOWN"),
+                             ("phase", "UNKNOWN"), ("source_epoch", True)):
+            event = copy.deepcopy(baseline)
+            event["source"]["decision"][field] = value
+            mutations.append(json.dumps(event))
+        event = copy.deepcopy(baseline)
+        event["source"]["decision"]["spot_clock"].pop("received_at")
+        mutations.append(json.dumps(event))
+        event = copy.deepcopy(baseline)
+        event["source"]["decision"]["up"]["UnKnOwN"] = "must-not-persist"
+        mutations.append(json.dumps(event))
+        event = copy.deepcopy(baseline)
+        event["source"]["decision"]["decision_at"] = "2025-11-08T21:21:41Z"
+        mutations.append(json.dumps(event))
+        raw = json.dumps(baseline)
+        mutations.extend([raw.replace('"event_seq": 1', '"event_seq": 1, "event_seq": 1'),
+                          raw.replace('"samples": 0', '"samples": NaN')])
+        for index, raw in enumerate(mutations):
+            with self.subTest(mutation=index):
+                facts, final, writes = self.consume([], raw_lines=[raw])
+                self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                self.assertIsNone(final)
+                self.assertEqual(writes, [])
+
+    def test_full_side_arithmetic_and_depth_are_checked_before_write(self):
+        changes = {"roi": .123, "breakeven_fair": .123, "walk_vwap": .123,
+                   "execution_net_shares": .123, "execution_cost": .123,
+                   "execution_ev": .123, "execution_edge": .123,
+                   "depth_complete": False, "depth_levels": [{"price": .4, "size": .1}]}
+        for index in (0, 1):  # Actual WARMUP and ELIGIBLE snapshots, not invented values.
+            for name, value in changes.items():
+                events = copy.deepcopy(self.events)
+                events[index]["source"]["decision"]["up"][name] = value
+                with self.subTest(index=index, field=name):
+                    facts, final, writes = self.consume(events)
+                    self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                    self.assertIsNone(final)
+                    self.assertEqual(writes, self.events[:index])
+
+    def test_eligible_requires_computable_inputs_and_valid_acquisition(self):
+        for field, value in (("p_up", None), ("spot", None), ("sigma", None),
+                             ("samples", 0), ("source_epoch", None), ("selected_token", None),
+                             ("selected_token", "999"),
+                             ("actual_pair", "BTC-USD"), ("source_state", "UNAVAILABLE"),
+                             ("spot_clock", None), ("secs_left", 29.999)):
+            events = copy.deepcopy(self.events)
+            events[1]["source"]["decision"][field] = value
+            with self.subTest(field=field):
+                facts, final, writes = self.consume(events)
+                self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+                self.assertIsNone(final)
+                self.assertEqual(writes, self.events[:1])
+
+    def test_actual_event_metrics_keep_denominators_and_net_cash_separate(self):
+        metrics = fold_phase1_metrics(self.events)
+        self.assertEqual((metrics["direction_hits"], metrics["direction_total"],
+                          metrics["entry_wins"], metrics["entry_total"]), (1, 1, 1, 1))
+        self.assertEqual(metrics["unvalued"], 2)
+        self.assertAlmostEqual(metrics["cash_pnl"], self.events[-1]["accounting"]["realized"], delta=1e-9)
+        fill = next(event for event in self.events if event["event_kind"] == "fill")
+        net = metrics["net_by_token"][fill["token"]]
+        self.assertAlmostEqual(net["gross_shares"] - net["fee_shares"], net["net_shares"], delta=1e-9)
+        self.assertAlmostEqual(net["net_shares"], self.events[7]["source"]["shares"], delta=1e-9)
+        self.assertEqual(sum(metrics["strata"].values()), 3)
+        # Pure classifier boundary mutation, NOT a claimed Rust model output or executable stream.
+        boundary = copy.deepcopy(self.events)
+        boundary[1]["source"]["decision"]["p_up"] = .5
+        classified = fold_phase1_metrics(boundary)
+        self.assertEqual((classified["direction_total"], classified["abstain"]), (0, 1))
+        self.assertEqual(classified["entry_total"], 1)  # Entry and attempt denominators differ.
+
+    def test_legacy_read_only_does_not_upgrade_or_enter_an_unsigned_run(self):
+        legacy = final_event()
+        legacy.pop("schema_version")
+        legacy.pop("event_seq")
+        raw = json.dumps(legacy).encode()
+        parsed = control.read_legacy_event(raw, "run-1")
+        self.assertEqual(parsed, {"event": legacy, "diagnostics_status": "DIAGNOSTICS_UNAVAILABLE"})
+        self.assertEqual(json.loads(raw), legacy)
+        with self.assertRaises(ValueError):
+            control.validate_event(raw, "run-1")
+        with self.assertRaises(ValueError):
+            control.read_legacy_event(json.dumps(final_event()).encode(), "run-1")
+
+    def test_global_summary_preserves_null_shape(self):
+        event = final_event()
+        event.update(event_kind="summary", source=None)
+        rebuilt = control.validate_event(json.dumps(event).encode(), "run-1")
+        self.assertIsNone(rebuilt["source"])
+
+    def test_actual_v2_stream_reaches_every_first_write(self):
+        # Validate directly as well, so a producer/consumer shape error is visible.
+        for event in self.events:
+            self.assertEqual(control.validate_event(json.dumps(event).encode(), event["run_id"]), event)
+        facts, final, writes = self.consume(self.events)
+        self.assertEqual(facts["launcher_exit"], 0)
+        self.assertEqual(writes, self.events)
+        self.assertEqual(final, self.events[-1])
 
 
 class IdentityTest(unittest.TestCase):
@@ -1166,6 +1501,12 @@ class IdentityTest(unittest.TestCase):
                      "src/service/predict_fun.rs", "tools/predictfun/cli.py", "tools/predictfun/sdk_ops.py",
                      "tools/predictfun/btc5m_control.py", "tools/predictfun/tests/test_sdk_ops.py",
                      "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/btc5m-controlled-paper.json",
+                     "src/service/spot.rs", "src/service/observation.rs", "src/service/mod.rs",
+                     "src/service/predict_fun/books.rs", "src/bot/quoting.rs",
+                     "src/bot/arbitrage/phase1.rs", "src/bot/arbitrage/phase1/tests.rs",
+                     "src/bot/runtime/paper/tests.rs", "src/bot/arbitrage/replay.rs",
+                     "src/bot/arbitrage/replay/types.rs", "src/bot/arbitrage/replay/tests.rs",
+                     "src/bin/btc_arb_replay.rs",
                      "target/debug/polymarket-toolkits")
             for name in names:
                 path = bot / name
@@ -1173,6 +1514,13 @@ class IdentityTest(unittest.TestCase):
                 path.write_bytes(b"public fixture bytes")
             with patch.object(control, "BOT", bot):
                 identity = control.public_identity({})
+                self.assertEqual(set(identity["files"]), set(names[:-1]))
+                for name in names[:-1]:
+                    path = bot / name
+                    path.unlink()
+                    with self.subTest(missing=name), self.assertRaises(control.Refused):
+                        control.public_identity({})
+                    path.write_bytes(b"public fixture bytes")
                 self.assertEqual(identity["binary_sha256"], hashlib.sha256(b"public fixture bytes").hexdigest())
                 for label, repo in (("main", root), ("bot", bot)):
                     head = subprocess.run(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],

@@ -46,6 +46,32 @@ tools/predictfun/.venv/bin/python -B tools/predictfun/btc5m_control.py --mode un
 纸面回款只在严格官方终态确认后释放现金，不等于live redeem到账；模型spot的Binance/Coinbase
 来源与官方provider分开记录。无真实Gas、排队、部分成交或赎回等待实测，不证明持续alpha。
 
+### 07-005 一期协议与兼容边界
+
+新 `unsigned-paper` 固定使用 `phase1_net_shares`：BUY 现金仅扣 `gross×price`，
+费用从到账份额扣除，`EV=net×fair-cost`、`edge=EV/gross`，门槛仍为 0.03；
+ROI 只作诊断。普通 paper、其他策略及旧回放保持 `legacy_cash_fee`，不能混合收益口径。
+
+started/ended 和每条事件标记 `btc5m-controlled-paper.v2`；事件序号从 1 连续递增。
+诊断仅在 `summary.source.decision`，依次关联 EVALUATE、PRE_SUBMIT、预占、PRE_APPLY、
+成交或释放/阻断及官方结算。缺输入/预热/拒绝是合法诊断：未计算值为 `null`，不是 0。
+首次写入前校验字段、费用/净份额/EV、深度前缀、候选身份和相邻账务；坏行不落盘。
+候选未终结、预占未释放或缺 final 时记录不完整，不补造成功事件。
+
+Binance/BTCUSDT 是 PRIMARY，Coinbase/BTC-USD 是独立 DEGRADED 输入；切源或长断流后重新预热。
+它们都是预测代理，不是官方 Chainlink 流。REST 没有可核实的源时间时，`source_at=null`、
+`freshness_basis=RECEIPT_BOUND` 只表示本地请求/接收边界，不证明远端缓存新鲜度。
+同一候选提交前和记账前重验时间、净 EV 与被冻结输入；不自动提价、缩单或切另一侧凑成交。
+
+现有 replay CLI 通过配置 `schema_version="btc-arb-replay/2"` 和固定 `order_usd=2`
+显式选择一期，输出带 `strategy_contract="phase1_net_shares"`；不新增入口或配置字段。
+`/1`、proxy、history `/1` 保持旧语义。历史 v1 只能用 `read_legacy_event` 只读解析并标
+`DIAGNOSTICS_UNAVAILABLE`，不能作为新 unsigned run 输入，也不补造 clock/fair/book。
+方向命中、正成交方向胜率、逐 token 净份额和现金收益分别复算；DRAW、abstain、pending 单列，
+pending 的最终现金收益为 N/A，不以报价当概率，不改写旧 49 笔证据。
+候选身份使用 `public_identity` 中固定、逐项必需的公开源码 manifest 和实际二进制字节 SHA；
+缺文件即拒绝，不递归扫描凭据。本期离线工程验证不授权启动新行情 paper 或实盘。
+
 signed-future-live是未来独立审批分支，不是本轮实盘启动许可；没有虚拟cash账本，未知账户账务
 输出null和LIVE_ACCOUNTING_UNAVAILABLE，Gas仅NOT_MEASURED，不宣称NOT_INCURRED。
 SDK原四命令的`--keyring`复用原FD loader/官方builder：公开确认与只读预检后才lazy读取，

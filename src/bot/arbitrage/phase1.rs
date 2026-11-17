@@ -24,7 +24,7 @@ use crate::service::spot::{digital_up, EwmaVol, SpotSource};
 use crate::service::venue::TradableMarket;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -190,16 +190,22 @@ pub struct DecisionDiagnostic {
     pub source_epoch: Option<u64>,
     pub reset_reason: ResetReason,
     pub settlement_provider: SettlementProvider,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis_option")]
     pub starts_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis_option")]
     pub ends_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis_option")]
     pub identity_available_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis_option")]
     pub strike_available_at: Option<DateTime<Utc>>,
     pub strike: Option<f64>,
     pub spot: Option<f64>,
     pub spot_clock: Option<ObservationClock>,
     pub book_clock: Option<ObservationClock>,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis")]
     pub decision_at: DateTime<Utc>,
     pub decision_elapsed_ms: u64,
+    #[serde(serialize_with = "crate::service::observation::serialize_millis")]
     pub checked_at: DateTime<Utc>,
     pub checked_elapsed_ms: u64,
     pub secs_left: Option<f64>,
@@ -248,7 +254,12 @@ pub struct CandidateContext {
     revision: u64,
     /// The shared counter the inputs' revision lives in.
     revision_counter: Arc<AtomicU64>,
-    /// The book levels the candidate was built on.
+    market_revision: u64,
+    market_revision_counter: Arc<AtomicU64>,
+    frozen_market: TradableMarket,
+    frozen_book: BookSnapshot,
+    /// The book levels the candidate was built on: the asks of the side it
+    /// selected, in the order the walk consumes them.
     book_levels: Vec<(f64, f64)>,
     /// The evaluation that produced this candidate.
     diagnostic: Option<DecisionDiagnostic>,
@@ -285,6 +296,11 @@ impl CandidateContext {
 
     pub fn ends_at(&self) -> DateTime<Utc> {
         self.ends_at
+    }
+
+    /// The official fixed strike this candidate was built on.
+    pub fn strike(&self) -> f64 {
+        self.strike
     }
 
     pub fn source(&self) -> &SourceKey {
@@ -335,6 +351,47 @@ impl CandidateContext {
     /// Whether the inputs this candidate froze are still the current ones.
     pub fn inputs_unchanged(&self) -> bool {
         self.revision_counter.load(Ordering::SeqCst) == self.revision
+            && self.revision < u64::MAX
+            && self.market_revision_counter.load(Ordering::SeqCst) == self.market_revision
+            && self.market_revision < u64::MAX
+    }
+
+    pub(crate) fn same_candidate(&self, other: &Self) -> bool {
+        self.candidate_id == other.candidate_id
+            && Arc::ptr_eq(&self.revision_counter, &other.revision_counter)
+            && Arc::ptr_eq(
+                &self.market_revision_counter,
+                &other.market_revision_counter,
+            )
+    }
+
+    /// Compare the actual Broker inputs, not merely the selected touch.
+    pub fn matches_inputs(&self, market: &TradableMarket, book: &BookSnapshot) -> bool {
+        let frozen = &self.frozen_market;
+        frozen.id == market.id
+            && frozen.yes_token == market.yes_token
+            && frozen.no_token == market.no_token
+            && frozen.feed_symbol == market.feed_symbol
+            && frozen.starts_at == market.starts_at
+            && frozen.ends_at == market.ends_at
+            && frozen.start_price == market.start_price
+            && frozen.fee_rate_bps == market.fee_rate_bps
+            && frozen.tick == market.tick
+            && frozen.open == market.open
+            && frozen.contested == market.contested
+            && frozen.round_facts == market.round_facts
+            && self
+                .frozen_book
+                .bids
+                .iter()
+                .map(|level| (level.price, level.size))
+                .eq(book.bids.iter().map(|level| (level.price, level.size)))
+            && self
+                .frozen_book
+                .asks
+                .iter()
+                .map(|level| (level.price, level.size))
+                .eq(book.asks.iter().map(|level| (level.price, level.size)))
     }
 
     /// The value of the side this candidate selected.
@@ -362,6 +419,16 @@ pub struct Recheck {
     pub cost: f64,
     pub ev: f64,
     pub edge: f64,
+    /// The price the frozen book would actually fill at.
+    pub walk_vwap: Option<f64>,
+    /// The net shares that price leaves, after the fee.
+    pub execution_net_shares: Option<f64>,
+    /// The cost at that price.
+    pub execution_cost: Option<f64>,
+    /// The expected value at that price.
+    pub execution_ev: Option<f64>,
+    /// The edge per gross share at that price.
+    pub execution_edge: Option<f64>,
 }
 
 /// The inputs one evaluation works from.
@@ -369,8 +436,10 @@ pub struct EvaluationInputs<'a> {
     pub market: &'a TradableMarket,
     pub book: &'a BookSnapshot,
     pub spot_price: f64,
-    pub spot_source: SpotSource,
-    pub actual_pair: String,
+    /// The feed that answered, when there was one.
+    pub spot_source: Option<SpotSource>,
+    /// The pair that was actually requested, when there was one.
+    pub actual_pair: Option<String>,
     pub spot_clock: Option<ObservationClock>,
     pub book_clock: Option<ObservationClock>,
     pub now: CheckTime,
@@ -384,32 +453,27 @@ pub struct EvaluationInputs<'a> {
 }
 
 /// One symbol's source state.
-struct SymbolState {
+pub(super) struct SymbolState {
     key: Option<SourceKey>,
     epoch: u64,
     reset_reason: ResetReason,
     vol: EwmaVol,
     last_receive: Option<(DateTime<Utc>, u64)>,
+    last_source: Option<DateTime<Utc>>,
+    revision: Arc<AtomicU64>,
 }
 
 /// The phase1 state of the shared decision core.
-pub struct Phase1Core {
-    contract: StrategyContract,
-    symbols: HashMap<String, SymbolState>,
-    /// The identity of the current inputs. It changes whenever an input is
-    /// refreshed, so a candidate can tell that its frozen inputs are stale.
-    revision: Arc<AtomicU64>,
-    next_decision_id: u64,
-}
-
-impl Phase1Core {
-    pub fn new(contract: StrategyContract) -> Self {
-        Self {
-            contract,
-            symbols: HashMap::new(),
-            revision: Arc::new(AtomicU64::new(0)),
-            next_decision_id: 0,
-        }
+///
+/// It lives beside the legacy volatility state: the core keeps one contract,
+/// one set of bought markets and one revision identity. This state adds the
+/// source epochs and the input revisions, and nothing else.
+impl super::DecisionCore {
+    /// Explicitly opt the original decision core into net-share semantics.
+    pub(crate) fn phase1(cfg: crate::config::BtcArbConfig) -> Self {
+        let mut core = Self::new(cfg);
+        core.contract = StrategyContract::Phase1NetShares;
+        core
     }
 
     pub fn contract(&self) -> StrategyContract {
@@ -417,8 +481,13 @@ impl Phase1Core {
     }
 
     /// The current revision of the inputs.
-    pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::SeqCst)
+    /// Invalidate this market before delivering refreshed facts or a book.
+    pub fn refresh_phase1_market(&mut self, market_id: u64) -> Result<(), Reason> {
+        bump(
+            self.market_revisions
+                .entry(market_id)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
     }
 
     /// The samples of a symbol's current epoch.
@@ -429,7 +498,7 @@ impl Phase1Core {
     }
 
     /// The volatility of a symbol's current epoch.
-    pub fn sigma(&self, symbol: &str, floor: f64) -> Option<f64> {
+    pub fn phase1_sigma(&self, symbol: &str, floor: f64) -> Option<f64> {
         self.symbols.get(symbol).map(|state| state.vol.vol(floor))
     }
 
@@ -450,7 +519,7 @@ impl Phase1Core {
     /// A price that is not a price changes nothing. A clock that is broken
     /// starts a new epoch and drops the observation: a broken clock cannot
     /// extend an estimate.
-    pub fn observe(
+    pub fn observe_phase1(
         &mut self,
         symbol: &str,
         price: f64,
@@ -459,7 +528,11 @@ impl Phase1Core {
         clock: &ObservationClock,
         now: CheckTime,
     ) -> Result<(), Reason> {
-        if !price.is_finite() || price <= 0.0 {
+        if !price.is_finite()
+            || price <= 0.0
+            || symbol != "BTCUSDT"
+            || !valid_source(Some(source), Some(actual_pair))
+        {
             return Err(Reason::InputInvalid);
         }
         let key = SourceKey {
@@ -467,34 +540,58 @@ impl Phase1Core {
             source,
             actual_pair: actual_pair.to_string(),
         };
-        let state = self.symbols.entry(symbol.to_string()).or_insert_with(|| SymbolState {
-            key: None,
-            epoch: 0,
-            reset_reason: ResetReason::None,
-            vol: EwmaVol::new(VOL_HALF_LIFE_SECS),
-            last_receive: None,
-        });
+        let state = self
+            .symbols
+            .entry(symbol.to_string())
+            .or_insert_with(|| SymbolState {
+                key: None,
+                epoch: 0,
+                reset_reason: ResetReason::None,
+                vol: EwmaVol::new(VOL_HALF_LIFE_SECS),
+                last_receive: None,
+                last_source: None,
+                revision: Arc::new(AtomicU64::new(0)),
+            });
+        bump(&state.revision)?;
+        let switched = state.key.as_ref().is_some_and(|current| current != &key);
         let broken_clock = !clock.is_consistent()
+            || now.elapsed_ms > i64::MAX as u64
+            || now.utc.timestamp_millis() < 0
             || clock.received_at > now.utc
             || clock.received_elapsed_ms > now.elapsed_ms
-            || state
-                .last_receive
-                .is_some_and(|(at, elapsed)| {
-                    clock.received_at < at || clock.received_elapsed_ms < elapsed
-                });
+            || state.last_receive.is_some_and(|(at, elapsed)| {
+                clock.received_at <= at || clock.received_elapsed_ms <= elapsed
+            })
+            || (!switched
+                && clock
+                    .source_at
+                    .zip(state.last_source)
+                    .is_some_and(|(new, old)| new <= old));
         if broken_clock {
             Self::reset(state, ResetReason::ClockInvalid);
-            self.revision.fetch_add(1, Ordering::SeqCst);
             return Err(Reason::ClockInvalid);
         }
-        let switched = state.key.as_ref().is_some_and(|current| current != &key);
+        if clock.request_span_ms() > MAX_REQUEST_SPAN_MS {
+            return Err(Reason::RequestTooSlow);
+        }
+        if clock.acquisition_age_ms(now) > MAX_ACQUISITION_AGE_MS
+            || clock
+                .source_at
+                .is_some_and(|at| (now.utc - at).num_milliseconds() > MAX_ACQUISITION_AGE_MS)
+        {
+            return Err(Reason::SpotStale);
+        }
         if switched {
             Self::reset(state, ResetReason::SourceSwitch);
         } else if state.key.is_none() {
             state.epoch = 1;
             state.reset_reason = ResetReason::FirstSample;
-        } else if let Some((_, elapsed)) = state.last_receive {
-            if clock.received_elapsed_ms.saturating_sub(elapsed) > GAP_RESET_MS {
+        } else if let Some((at, elapsed)) = state.last_receive {
+            // The gap is the slower of the two clocks: a wall clock that froze
+            // while the process kept running must not look continuous.
+            let wall = clock.received_at.timestamp_millis() - at.timestamp_millis();
+            let elapsed_gap = clock.received_elapsed_ms as i64 - elapsed as i64;
+            if wall.max(elapsed_gap) > GAP_RESET_MS as i64 {
                 Self::reset(state, ResetReason::LongGap);
             }
         }
@@ -503,9 +600,14 @@ impl Phase1Core {
             .vol
             .update(price, clock.received_elapsed_ms as f64 / 1000.0);
         state.last_receive = Some((clock.received_at, clock.received_elapsed_ms));
-        self.revision.fetch_add(1, Ordering::SeqCst);
+        state.last_source = clock.source_at;
         Ok(())
     }
+
+    /// Move the inputs' revision on, and fail closed if it cannot.
+    ///
+    /// The revision is the identity of the current inputs: a counter that
+    /// wrapped would make a stale candidate look current again.
 
     /// Start a new epoch and drop the estimate that belonged to the old one.
     fn reset(state: &mut SymbolState, reason: ResetReason) {
@@ -513,62 +615,120 @@ impl Phase1Core {
         state.reset_reason = reason;
         state.vol = EwmaVol::new(VOL_HALF_LIFE_SECS);
         state.last_receive = None;
+        state.last_source = None;
     }
 
     /// Value one market and decide whether it is worth buying.
     ///
     /// The checks run in the frozen order: the first failure is the reason,
     /// and every value that could be computed safely is kept.
-    pub fn evaluate(&mut self, inputs: &EvaluationInputs<'_>) -> Phase1Evaluation {
+    pub fn evaluate_phase1(&mut self, inputs: &EvaluationInputs<'_>) -> Phase1Evaluation {
+        let rollback = self.last_phase1_check.is_some_and(|previous| {
+            inputs.now.utc < previous.utc || inputs.now.elapsed_ms < previous.elapsed_ms
+        });
+        if rollback {
+            for state in self.symbols.values_mut() {
+                Self::reset(state, ResetReason::ClockInvalid);
+                let _ = bump(&state.revision); // An exhausted revision remains poisoned.
+            }
+        }
+        self.last_phase1_check = Some(inputs.now);
         self.next_decision_id += 1;
         let decision_id = self.next_decision_id.to_string();
+        let symbol = inputs
+            .market
+            .feed_symbol
+            .clone()
+            .unwrap_or_else(|| "BTCUSDT".to_string());
         let mut diagnostic = DecisionDiagnostic {
             decision_id: decision_id.clone(),
             candidate_id: None,
             phase: Phase::Evaluate,
             strategy_contract: self.contract,
             reason: Reason::Eligible,
-            symbol: inputs
-                .market
-                .feed_symbol
-                .clone()
-                .unwrap_or_else(|| "BTCUSDT".to_string()),
-            prediction_source: Some(inputs.spot_source),
-            actual_pair: Some(inputs.actual_pair.clone()),
-            source_state: source_state(inputs.spot_source),
-            source_epoch: self.epoch(&diagnostic_symbol(inputs)),
-            reset_reason: self.reset_reason(&diagnostic_symbol(inputs)),
+            symbol: symbol.clone(),
+            prediction_source: inputs.spot_source,
+            actual_pair: inputs.actual_pair.clone(),
+            source_state: match inputs.spot_source {
+                Some(source) => source_state(source),
+                None => SourceState::Unavailable,
+            },
+            source_epoch: self.epoch(&symbol),
+            reset_reason: self.reset_reason(&symbol),
             settlement_provider: inputs.settlement_provider,
             starts_at: inputs.market.starts_at,
             ends_at: inputs.market.ends_at,
             identity_available_at: inputs.identity_available_at,
             strike_available_at: inputs.strike_available_at,
-            strike: inputs.market.start_price,
-            spot: None,
+            strike: inputs
+                .market
+                .start_price
+                .filter(|price| price.is_finite() && *price > 0.0),
+            spot: (inputs.spot_price.is_finite() && inputs.spot_price > 0.0)
+                .then_some(inputs.spot_price),
             spot_clock: inputs.spot_clock.clone(),
             book_clock: inputs.book_clock.clone(),
             decision_at: inputs.now.utc,
             decision_elapsed_ms: inputs.now.elapsed_ms,
             checked_at: inputs.now.utc,
             checked_elapsed_ms: inputs.now.elapsed_ms,
-            secs_left: None,
+            secs_left: inputs
+                .market
+                .ends_at
+                .map(|end| (end - inputs.now.utc).num_milliseconds() as f64 / 1000.0),
             samples: 0,
             sigma: None,
             p_up: None,
-            best_yes_bid: inputs.book.best_bid().map(|level| level.price),
-            best_yes_ask: inputs.book.best_ask().map(|level| level.price),
-            fee_rate_bps: Some(inputs.market.fee_rate_bps),
+            best_yes_bid: inputs
+                .book
+                .best_bid()
+                .map(|level| level.price)
+                .filter(|price| price.is_finite() && *price > 0.0 && *price < 1.0),
+            best_yes_ask: inputs
+                .book
+                .best_ask()
+                .map(|level| level.price)
+                .filter(|price| price.is_finite() && *price > 0.0 && *price < 1.0),
+            fee_rate_bps: (inputs.market.fee_rate_bps <= 10_000)
+                .then_some(inputs.market.fee_rate_bps),
             selected_token: None,
             up: None,
             down: None,
         };
-        let symbol = diagnostic.symbol.clone();
         diagnostic.samples = self.samples(&symbol);
         diagnostic.source_epoch = self.epoch(&symbol);
         diagnostic.reset_reason = self.reset_reason(&symbol);
+        for (side, slot, token) in [
+            (Side::Buy, &mut diagnostic.up, &inputs.market.yes_token),
+            (Side::Sell, &mut diagnostic.down, &inputs.market.no_token),
+        ] {
+            if !token.is_empty() {
+                *slot = Some(SideDiagnostic::empty(token.clone()));
+                if inputs.book_clock.is_some()
+                    && crate::bot::runtime::paper::mid_of(inputs.book).is_some()
+                    && inputs.market.fee_rate_bps <= 10_000
+                {
+                    *slot = self.side(inputs, side, None).diagnostic;
+                }
+            }
+        }
+        // The old single-entry protection comes before the market's own
+        // facts: a round this run already bought is not a new opportunity,
+        // whatever its identity says.
+        if inputs.entered {
+            diagnostic.reason = Reason::AlreadyEntered;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
 
         let market = inputs.market;
-        let Some(strike) = market.start_price.filter(|price| price.is_finite() && *price > 0.0)
+        // The round's own facts come first: without an identity, a period and
+        // a strike there is nothing to value, and no clock can repair that.
+        let Some(strike) = market
+            .start_price
+            .filter(|price| price.is_finite() && *price > 0.0)
         else {
             diagnostic.reason = Reason::MarketInvalid;
             return Phase1Evaluation {
@@ -590,7 +750,14 @@ impl Phase1Core {
                 candidate: None,
             };
         };
-        if !market.open || market.contested {
+        if !market.open
+            || market.contested
+            || market.feed_symbol.as_deref() != Some("BTCUSDT")
+            || ends_at - starts_at != chrono::Duration::seconds(300)
+            || market.yes_token == market.no_token
+            || market.yes_token.is_empty()
+            || market.no_token.is_empty()
+        {
             diagnostic.reason = Reason::MarketInvalid;
             return Phase1Evaluation {
                 diagnostic,
@@ -604,8 +771,26 @@ impl Phase1Core {
                 candidate: None,
             };
         }
-        if inputs.entered {
-            diagnostic.reason = Reason::AlreadyEntered;
+        // The official identity and the fixed strike must have been available
+        // locally before the decision: a fact that arrived afterwards cannot
+        // be the basis of this decision.
+        if inputs
+            .identity_available_at
+            .is_some_and(|at| at > inputs.now.utc)
+            || inputs
+                .strike_available_at
+                .is_some_and(|at| at > inputs.now.utc)
+        {
+            diagnostic.reason = Reason::MarketInvalid;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
+        // A missing input comes before an invalid one: a price that was never
+        // received cannot also be a price that is out of range.
+        if inputs.spot_clock.is_none() || inputs.book_clock.is_none() {
+            diagnostic.reason = Reason::MissingInput;
             return Phase1Evaluation {
                 diagnostic,
                 candidate: None,
@@ -625,14 +810,43 @@ impl Phase1Core {
                 candidate: None,
             };
         };
-        if !spot_clock.is_consistent() || !book_clock.is_consistent() {
+        // A value that is not a value is an invalid input, and it is checked
+        // before the clocks: a bad price is not a clock fault.
+        if !inputs.spot_price.is_finite() || inputs.spot_price <= 0.0 {
+            diagnostic.reason = Reason::InputInvalid;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
+        if market.fee_rate_bps > 10_000
+            || !valid_source(inputs.spot_source, inputs.actual_pair.as_deref())
+            || crate::bot::runtime::paper::mid_of(inputs.book).is_none()
+        {
+            diagnostic.reason = Reason::InputInvalid;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
+        if rollback
+            || !spot_clock.is_consistent()
+            || !book_clock.is_consistent()
+            || self.symbols.get(&symbol).is_some_and(|state| {
+                state.reset_reason == ResetReason::ClockInvalid && state.last_receive.is_none()
+            })
+        {
             diagnostic.reason = Reason::ClockInvalid;
             return Phase1Evaluation {
                 diagnostic,
                 candidate: None,
             };
         }
-        if spot_clock.received_at > inputs.now.utc || book_clock.received_at > inputs.now.utc {
+        if spot_clock.received_at > inputs.now.utc
+            || book_clock.received_at > inputs.now.utc
+            || spot_clock.received_elapsed_ms > inputs.now.elapsed_ms
+            || book_clock.received_elapsed_ms > inputs.now.elapsed_ms
+        {
             diagnostic.reason = Reason::ClockInvalid;
             return Phase1Evaluation {
                 diagnostic,
@@ -648,34 +862,31 @@ impl Phase1Core {
                 candidate: None,
             };
         }
-        if spot_clock.acquisition_age_ms(inputs.now) > MAX_ACQUISITION_AGE_MS {
+        if spot_clock.acquisition_age_ms(inputs.now) > MAX_ACQUISITION_AGE_MS
+            || spot_clock.source_at.is_some_and(|source| {
+                inputs.now.utc.timestamp_millis() - source.timestamp_millis()
+                    > MAX_ACQUISITION_AGE_MS
+            })
+        {
             diagnostic.reason = Reason::SpotStale;
             return Phase1Evaluation {
                 diagnostic,
                 candidate: None,
             };
         }
-        if book_clock.acquisition_age_ms(inputs.now) > MAX_ACQUISITION_AGE_MS {
+        if book_clock.acquisition_age_ms(inputs.now) > MAX_ACQUISITION_AGE_MS
+            || book_clock.source_at.is_some_and(|source| {
+                inputs.now.utc.timestamp_millis() - source.timestamp_millis()
+                    > MAX_ACQUISITION_AGE_MS
+            })
+        {
             diagnostic.reason = Reason::BookStale;
             return Phase1Evaluation {
                 diagnostic,
                 candidate: None,
             };
         }
-        if !inputs.spot_price.is_finite() || inputs.spot_price <= 0.0 {
-            diagnostic.reason = Reason::InputInvalid;
-            return Phase1Evaluation {
-                diagnostic,
-                candidate: None,
-            };
-        }
-        if market.fee_rate_bps > 10_000 {
-            diagnostic.reason = Reason::InputInvalid;
-            return Phase1Evaluation {
-                diagnostic,
-                candidate: None,
-            };
-        }
+
         let secs_left = (ends_at - inputs.now.utc).num_milliseconds() as f64 / 1000.0;
         diagnostic.secs_left = Some(secs_left);
         if secs_left < inputs.min_secs_left {
@@ -686,6 +897,19 @@ impl Phase1Core {
             };
         }
         diagnostic.spot = Some(inputs.spot_price);
+        if self.symbols.get(&symbol).is_some_and(|state| {
+            state.key.as_ref().is_some_and(|key| {
+                Some(key.source) != inputs.spot_source
+                    || Some(&key.actual_pair) != inputs.actual_pair.as_ref()
+            }) || state.last_receive
+                != Some((spot_clock.received_at, spot_clock.received_elapsed_ms))
+        }) {
+            diagnostic.reason = Reason::InputChanged;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
         if diagnostic.samples < MIN_VOL_SAMPLES {
             diagnostic.reason = Reason::Warmup;
             return Phase1Evaluation {
@@ -693,7 +917,9 @@ impl Phase1Core {
                 candidate: None,
             };
         }
-        let sigma = self.sigma(&symbol, self.floor(inputs.min_edge)).unwrap_or(0.0);
+        let sigma = self
+            .phase1_sigma(&symbol, self.floor(inputs.min_edge))
+            .unwrap_or(0.0);
         if !sigma.is_finite() || sigma <= 0.0 {
             diagnostic.reason = Reason::Warmup;
             return Phase1Evaluation {
@@ -712,35 +938,22 @@ impl Phase1Core {
         }
         diagnostic.p_up = Some(p_up);
 
-        let up = self.side(
-            inputs,
-            &diagnostic,
-            Side::Buy,
-            p_up,
-            strike,
-            sigma,
-            secs_left,
-        );
-        let down = self.side(
-            inputs,
-            &diagnostic,
-            Side::Sell,
-            1.0 - p_up,
-            strike,
-            sigma,
-            secs_left,
-        );
-        diagnostic.up = up.clone();
-        diagnostic.down = down.clone();
+        let up = self.side(inputs, Side::Buy, Some(p_up));
+        let down = self.side(inputs, Side::Sell, Some(1.0 - p_up));
+        diagnostic.up = up.diagnostic.clone();
+        diagnostic.down = down.diagnostic.clone();
+        // A side that cannot be valued at all is not a low edge: it is an
+        // invalid input, and it outranks the edge comparison.
+        if let Some(reason) = up.reason.or(down.reason) {
+            diagnostic.reason = reason;
+            return Phase1Evaluation {
+                diagnostic,
+                candidate: None,
+            };
+        }
 
-        let chosen = match (up, down) {
-            (Some(up), Some(down)) => {
-                if down.edge >= up.edge {
-                    Some(down)
-                } else {
-                    Some(up)
-                }
-            }
+        let chosen = match (up.diagnostic, down.diagnostic) {
+            (Some(up), Some(down)) => Some(choose_side(&up, &down).clone()),
             (Some(up), None) => Some(up),
             (None, Some(down)) => Some(down),
             (None, None) => None,
@@ -786,21 +999,27 @@ impl Phase1Core {
             book_clock: book_clock.clone(),
             source: SourceKey {
                 symbol: symbol.clone(),
-                source: inputs.spot_source,
-                actual_pair: inputs.actual_pair.clone(),
+                source: inputs.spot_source.unwrap_or(SpotSource::Binance),
+                actual_pair: inputs.actual_pair.clone().unwrap_or_else(|| symbol.clone()),
             },
             epoch: diagnostic.source_epoch.unwrap_or(0),
             settlement_provider: inputs.settlement_provider,
             identity_available_at: inputs.identity_available_at,
             strike_available_at: inputs.strike_available_at,
             starts_at: Some(starts_at),
-            revision: self.revision(),
-            revision_counter: Arc::clone(&self.revision),
-            book_levels: inputs
-                .book
+            revision: self.symbols[&symbol].revision.load(Ordering::SeqCst),
+            revision_counter: Arc::clone(&self.symbols[&symbol].revision),
+            market_revision: self
+                .market_revisions
+                .entry(market.id)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .load(Ordering::SeqCst),
+            market_revision_counter: Arc::clone(&self.market_revisions[&market.id]),
+            frozen_market: market.clone(),
+            frozen_book: inputs.book.clone(),
+            book_levels: token_book(market, &chosen.token, inputs.book)
                 .asks
                 .iter()
-                .chain(inputs.book.bids.iter())
                 .map(|level| (level.price, level.size))
                 .collect(),
             diagnostic: None,
@@ -820,16 +1039,11 @@ impl Phase1Core {
     }
 
     /// Value one side of the round on the net-share economics.
-    fn side(
-        &self,
-        inputs: &EvaluationInputs<'_>,
-        diagnostic: &DecisionDiagnostic,
-        side: Side,
-        fair: f64,
-        strike: f64,
-        sigma: f64,
-        secs_left: f64,
-    ) -> Option<SideDiagnostic> {
+    ///
+    /// The result says two things: what the side is worth, and — when it
+    /// cannot be valued at all — why. A side that has no usable price is an
+    /// invalid input, not a side with a zero edge.
+    fn side(&self, inputs: &EvaluationInputs<'_>, side: Side, fair: Option<f64>) -> SideValue {
         let market = inputs.market;
         let token = match side {
             Side::Buy => market.yes_token.clone(),
@@ -837,34 +1051,48 @@ impl Phase1Core {
         };
         let mut out = SideDiagnostic::empty(token.clone());
         let book = token_book(market, &token, inputs.book);
-        let limit = match side {
-            Side::Buy => book.best_ask().map(|level| level.price),
-            Side::Sell => book.best_ask().map(|level| level.price),
-        };
-        let Some(limit) = limit.filter(|price| price.is_finite() && *price > 0.0 && *price < 1.0)
+        let Some(limit) = book
+            .best_ask()
+            .map(|level| level.price)
+            .filter(|price| price.is_finite() && *price > 0.0 && *price < 1.0)
         else {
-            return Some(out);
+            return SideValue {
+                diagnostic: Some(out),
+                reason: Some(Reason::InputInvalid),
+            };
         };
         out.limit_price = Some(limit);
-        out.fair = Some(fair);
+        out.fair = fair;
         let shares = shares_for(inputs.order_usd, limit);
         if shares <= 0.0 {
-            return Some(out);
+            return SideValue {
+                diagnostic: Some(out),
+                reason: Some(Reason::InputInvalid),
+            };
         }
         out.gross_shares = Some(shares);
         let fee_per_gross = fee_per_gross_share(limit, market.fee_rate_bps);
         out.fee_per_gross_share = Some(fee_per_gross);
         let Some((net, _fee)) = net_shares(shares, limit, market.fee_rate_bps) else {
-            return Some(out);
+            return SideValue {
+                diagnostic: Some(out),
+                reason: Some(Reason::InputInvalid),
+            };
         };
+        // A price that leaves nothing to pay out is not a trade: the fee would
+        // eat the whole share.
+        if net <= 0.0 {
+            return SideValue {
+                diagnostic: Some(out),
+                reason: Some(Reason::NetSharesInvalid),
+            };
+        }
         out.net_shares = Some(net);
         let cost = shares * limit;
         out.cost = Some(cost);
-        let ev = net * fair - cost;
-        out.ev = Some(ev);
-        let edge = ev / shares;
-        out.edge = Some(edge);
-        out.roi = if cost > 0.0 { Some(ev / cost) } else { None };
+        out.ev = fair.map(|fair| net * fair - cost);
+        out.edge = out.ev.map(|ev| ev / shares);
+        out.roi = out.ev.map(|ev| ev / cost);
         out.breakeven_fair = {
             let ratio = net / shares;
             if ratio > 0.0 {
@@ -873,30 +1101,65 @@ impl Phase1Core {
                 None
             }
         };
-        out.qualifies = Some(edge >= inputs.min_edge);
-        let levels: Vec<BookLevel> = match side {
-            Side::Buy => book.asks.clone(),
-            Side::Sell => book.asks.clone(),
-        };
+        out.qualifies = out.edge.map(|edge| edge >= inputs.min_edge);
+        let levels: Vec<BookLevel> = book.asks.clone();
         let (prefix, complete) = depth_prefix(&levels, shares, limit);
-        out.depth_levels = Some(prefix.iter().map(|level| Level { price: level.price, size: level.size }).collect());
+        out.depth_levels = Some(
+            prefix
+                .iter()
+                .map(|level| Level {
+                    price: level.price,
+                    size: level.size,
+                })
+                .collect(),
+        );
         out.depth_complete = Some(complete);
         if complete {
             if let Some(vwap) = walk(&levels, Side::Buy, shares, limit) {
                 out.walk_vwap = Some(vwap);
                 if let Some((exec_net, _)) = net_shares(shares, vwap, market.fee_rate_bps) {
                     let exec_cost = shares * vwap;
-                    let exec_ev = exec_net * fair - exec_cost;
+                    let exec_ev = fair.map(|fair| exec_net * fair - exec_cost);
                     out.execution_net_shares = Some(exec_net);
                     out.execution_cost = Some(exec_cost);
-                    out.execution_ev = Some(exec_ev);
-                    out.execution_edge = Some(exec_ev / shares);
+                    out.execution_ev = exec_ev;
+                    out.execution_edge = exec_ev.map(|ev| ev / shares);
                 }
             }
         }
-        let _ = (diagnostic, strike, sigma, secs_left);
-        Some(out)
+        SideValue {
+            diagnostic: Some(out),
+            reason: None,
+        }
     }
+}
+
+/// What one side of a round is worth, and why it may be worth nothing.
+struct SideValue {
+    diagnostic: Option<SideDiagnostic>,
+    /// The reason the side cannot be valued, if it cannot.
+    reason: Option<Reason>,
+}
+
+/// The side the round is worth buying.
+///
+/// The larger edge wins. An exact tie keeps the old iteration order, which is
+/// the Down side: the choice is the production one, not a second rule.
+fn choose_side<'a>(up: &'a SideDiagnostic, down: &'a SideDiagnostic) -> &'a SideDiagnostic {
+    if down.edge >= up.edge {
+        down
+    } else {
+        up
+    }
+}
+
+fn bump(counter: &AtomicU64) -> Result<(), Reason> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .map(|_| ())
+        .map_err(|_| Reason::InputChanged)
 }
 
 /// The volatility floor, fixed by the contract.
@@ -925,6 +1188,14 @@ fn depth_prefix(levels: &[BookLevel], shares: f64, limit: f64) -> (Vec<BookLevel
 }
 
 /// Whether the source is the primary one or a degraded substitute.
+fn valid_source(source: Option<SpotSource>, pair: Option<&str>) -> bool {
+    matches!(
+        (source, pair),
+        (Some(SpotSource::Binance), Some("BTCUSDT"))
+            | (Some(SpotSource::Coinbase), Some("BTC-USD"))
+    )
+}
+
 fn source_state(source: SpotSource) -> SourceState {
     match source {
         SpotSource::Binance => SourceState::Primary,
@@ -932,41 +1203,73 @@ fn source_state(source: SpotSource) -> SourceState {
     }
 }
 
-/// The symbol of a diagnostic, before the market is known.
-fn diagnostic_symbol(inputs: &EvaluationInputs<'_>) -> String {
-    inputs
-        .market
-        .feed_symbol
-        .clone()
-        .unwrap_or_else(|| "BTCUSDT".to_string())
-}
-
 /// Recompute a candidate's value at a later moment.
 ///
 /// The inputs stay frozen: only the clock moves, so the remaining time and the
 /// model's value are recomputed, never remembered.
+///
+/// The effective now is the later of the wall clock and the decision moment
+/// plus the elapsed time since it. A clock that jumped backwards cannot
+/// extend the round: the elapsed time still says how much of it is left.
 pub fn recheck(
     candidate: &CandidateContext,
     now: CheckTime,
     min_edge: f64,
     min_secs_left: f64,
 ) -> Result<Recheck, Reason> {
-    if !candidate.inputs_unchanged() {
-        return Err(Reason::InputChanged);
+    let result = compute_recheck(candidate, now, min_secs_left)?;
+    if result.edge < min_edge || result.execution_edge.is_some_and(|edge| edge < min_edge) {
+        return Err(Reason::EdgeBelowMin);
     }
+    Ok(result)
+}
+
+fn compute_recheck(
+    candidate: &CandidateContext,
+    now: CheckTime,
+    min_secs_left: f64,
+) -> Result<Recheck, Reason> {
     if now.elapsed_ms < candidate.decision_elapsed_ms || now.utc < candidate.decision_at {
         return Err(Reason::ClockInvalid);
     }
-    // A clock that went backwards must not extend the round: the elapsed time
-    // decides how much of the round is left.
-    let effective = if now.utc > candidate.decision_at {
+    // The elapsed time decides how much of the round is left: a wall clock
+    // that went backwards must not extend it.
+    let elapsed = now.elapsed_ms.saturating_sub(candidate.decision_elapsed_ms) as i64;
+    let by_elapsed = candidate.decision_at + chrono::Duration::milliseconds(elapsed);
+    let effective = if now.utc > by_elapsed {
         now.utc
     } else {
-        candidate.decision_at
+        by_elapsed
     };
     let secs_left = (candidate.ends_at - effective).num_milliseconds() as f64 / 1000.0;
+
+    // The frozen inputs must still be fresh enough to act on. A price that
+    // was already old when the decision was made is refused here too: the
+    // check is about the input, not about when it was first seen.
+    if candidate.spot_clock.request_span_ms() > MAX_REQUEST_SPAN_MS
+        || candidate.book_clock.request_span_ms() > MAX_REQUEST_SPAN_MS
+    {
+        return Err(Reason::RequestTooSlow);
+    }
+    if candidate.spot_clock.acquisition_age_ms(now) > MAX_ACQUISITION_AGE_MS
+        || candidate.spot_clock.source_at.is_some_and(|source| {
+            now.utc.timestamp_millis() - source.timestamp_millis() > MAX_ACQUISITION_AGE_MS
+        })
+    {
+        return Err(Reason::SpotStale);
+    }
+    if candidate.book_clock.acquisition_age_ms(now) > MAX_ACQUISITION_AGE_MS
+        || candidate.book_clock.source_at.is_some_and(|source| {
+            now.utc.timestamp_millis() - source.timestamp_millis() > MAX_ACQUISITION_AGE_MS
+        })
+    {
+        return Err(Reason::BookStale);
+    }
     if secs_left < min_secs_left {
         return Err(Reason::RoundTooLate);
+    }
+    if !candidate.inputs_unchanged() {
+        return Err(Reason::InputChanged);
     }
     let fair_up = digital_up(candidate.spot, candidate.strike, candidate.sigma, secs_left);
     let fair = match candidate.side {
@@ -984,8 +1287,32 @@ pub fn recheck(
     let cost = shares * limit;
     let ev = net * fair - cost;
     let edge = ev / shares;
-    if edge < min_edge {
-        return Err(Reason::EdgeBelowMin);
+
+    // The price the frozen book would really fill at is the price that has to
+    // clear the threshold: a touch that looks good is not a trade.
+    let levels: Vec<BookLevel> = candidate
+        .book_levels
+        .iter()
+        .map(|(price, size)| BookLevel {
+            price: *price,
+            size: *size,
+        })
+        .collect();
+    let walk_vwap = walk(&levels, Side::Buy, shares, limit);
+    let mut execution_net_shares = None;
+    let mut execution_cost = None;
+    let mut execution_ev = None;
+    let mut execution_edge = None;
+    if let Some(vwap) = walk_vwap {
+        if let Some((exec_net, _)) = net_shares(shares, vwap, candidate.fee_rate_bps) {
+            let exec_cost = shares * vwap;
+            let exec_ev = exec_net * fair - exec_cost;
+            let exec_edge = exec_ev / shares;
+            execution_net_shares = Some(exec_net);
+            execution_cost = Some(exec_cost);
+            execution_ev = Some(exec_ev);
+            execution_edge = Some(exec_edge);
+        }
     }
     Ok(Recheck {
         fair,
@@ -994,6 +1321,11 @@ pub fn recheck(
         cost,
         ev,
         edge,
+        walk_vwap,
+        execution_net_shares,
+        execution_cost,
+        execution_ev,
+        execution_edge,
     })
 }
 
@@ -1008,8 +1340,10 @@ pub fn recheck_diagnostic(
     min_edge: f64,
     min_secs_left: f64,
 ) -> (DecisionDiagnostic, Option<Recheck>) {
-    let mut diagnostic = candidate.diagnostic.clone().unwrap_or_else(|| {
-        DecisionDiagnostic {
+    let mut diagnostic = candidate
+        .diagnostic
+        .clone()
+        .unwrap_or_else(|| DecisionDiagnostic {
             decision_id: candidate.decision_id.clone(),
             candidate_id: Some(candidate.candidate_id.clone()),
             phase,
@@ -1044,16 +1378,50 @@ pub fn recheck_diagnostic(
             selected_token: Some(candidate.token.clone()),
             up: None,
             down: None,
-        }
-    });
+        });
     diagnostic.phase = phase;
     diagnostic.checked_at = now.utc;
     diagnostic.checked_elapsed_ms = now.elapsed_ms;
     diagnostic.selected_token = Some(candidate.token.clone());
-    match recheck(candidate, now, min_edge, min_secs_left) {
+    match compute_recheck(candidate, now, min_secs_left) {
         Ok(result) => {
-            diagnostic.reason = Reason::Eligible;
+            let qualifies = result.edge >= min_edge
+                && result.execution_edge.is_none_or(|edge| edge >= min_edge);
+            diagnostic.reason = if qualifies {
+                Reason::Eligible
+            } else {
+                Reason::EdgeBelowMin
+            };
             diagnostic.secs_left = Some(result.secs_left);
+            let p_up = if candidate.side == Side::Buy {
+                result.fair
+            } else {
+                1.0 - result.fair
+            };
+            diagnostic.p_up = Some(p_up);
+            for (side, fair) in [
+                (&mut diagnostic.up, p_up),
+                (&mut diagnostic.down, 1.0 - p_up),
+            ] {
+                if let Some(side) = side {
+                    side.fair = Some(fair);
+                    side.ev = side
+                        .net_shares
+                        .zip(side.cost)
+                        .map(|(net, cost)| net * fair - cost);
+                    side.edge = side.ev.zip(side.gross_shares).map(|(ev, q)| ev / q);
+                    side.roi = side.ev.zip(side.cost).map(|(ev, cost)| ev / cost);
+                    side.qualifies = side.edge.map(|edge| edge >= min_edge);
+                    side.execution_ev = side
+                        .execution_net_shares
+                        .zip(side.execution_cost)
+                        .map(|(net, cost)| net * fair - cost);
+                    side.execution_edge = side
+                        .execution_ev
+                        .zip(side.gross_shares)
+                        .map(|(ev, q)| ev / q);
+                }
+            }
             let side = if candidate.side == Side::Buy {
                 &mut diagnostic.up
             } else {
@@ -1065,9 +1433,14 @@ pub fn recheck_diagnostic(
                 side.cost = Some(result.cost);
                 side.ev = Some(result.ev);
                 side.edge = Some(result.edge);
-                side.qualifies = Some(true);
+                side.walk_vwap = result.walk_vwap;
+                side.execution_net_shares = result.execution_net_shares;
+                side.execution_cost = result.execution_cost;
+                side.execution_ev = result.execution_ev;
+                side.execution_edge = result.execution_edge;
+                side.qualifies = Some(result.edge >= min_edge);
             }
-            (diagnostic, Some(result))
+            (diagnostic, qualifies.then_some(result))
         }
         Err(reason) => {
             diagnostic.reason = reason;
@@ -1081,6 +1454,47 @@ pub fn input_age_ms(clock: &ObservationClock, now: CheckTime) -> i64 {
     clock.acquisition_age_ms(now)
 }
 
+/// Whether every number in a diagnostic can be represented on the wire.
+///
+/// A value that is not finite has no place in the protocol: it would be
+/// written as a missing value or as a lie, and both are worse than a refusal.
+pub fn diagnostic_is_finite(diagnostic: &DecisionDiagnostic) -> bool {
+    let finite = |value: &Option<f64>| value.is_none_or(|number| number.is_finite());
+    finite(&diagnostic.strike)
+        && finite(&diagnostic.spot)
+        && finite(&diagnostic.sigma)
+        && finite(&diagnostic.p_up)
+        && finite(&diagnostic.best_yes_bid)
+        && finite(&diagnostic.best_yes_ask)
+        && finite(&diagnostic.secs_left)
+        && diagnostic.up.as_ref().is_none_or(side_is_finite)
+        && diagnostic.down.as_ref().is_none_or(side_is_finite)
+}
+
+/// Whether every number of one side can be represented on the wire.
+fn side_is_finite(side: &SideDiagnostic) -> bool {
+    let finite = |value: &Option<f64>| value.is_none_or(|number| number.is_finite());
+    finite(&side.fair)
+        && finite(&side.limit_price)
+        && finite(&side.gross_shares)
+        && finite(&side.fee_per_gross_share)
+        && finite(&side.net_shares)
+        && finite(&side.cost)
+        && finite(&side.ev)
+        && finite(&side.edge)
+        && finite(&side.roi)
+        && finite(&side.breakeven_fair)
+        && finite(&side.walk_vwap)
+        && finite(&side.execution_net_shares)
+        && finite(&side.execution_cost)
+        && finite(&side.execution_ev)
+        && finite(&side.execution_edge)
+        && side.depth_levels.as_ref().is_none_or(|levels| {
+            levels
+                .iter()
+                .all(|level| level.price.is_finite() && level.size.is_finite())
+        })
+}
+
 #[cfg(test)]
 mod tests;
-

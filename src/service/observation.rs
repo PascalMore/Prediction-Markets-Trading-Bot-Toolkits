@@ -56,15 +56,48 @@ pub enum FreshnessBasis {
 pub struct ObservationClock {
     /// The source's own event time, when it is known. The current REST feeds
     /// carry no such time, so this is `None` and never guessed.
+    #[serde(serialize_with = "serialize_millis_option")]
     pub source_at: Option<DateTime<Utc>>,
     pub source_time_status: SourceTimeStatus,
     pub freshness_basis: FreshnessBasis,
     /// When this request actually left, before the first byte came back.
+    #[serde(serialize_with = "serialize_millis")]
     pub request_at: DateTime<Utc>,
     /// When the response was decoded and checked.
+    #[serde(serialize_with = "serialize_millis")]
     pub received_at: DateTime<Utc>,
     pub request_elapsed_ms: u64,
     pub received_elapsed_ms: u64,
+}
+
+/// Write a timestamp with exactly millisecond precision.
+///
+/// The protocol's timestamps are read by a strict consumer, so a fixed width
+/// keeps them comparable and free of a nanosecond tail nobody asked for.
+pub fn format_millis(value: &DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Write a required timestamp.
+pub fn serialize_millis<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format_millis(value))
+}
+
+/// Write a timestamp that may be absent.
+pub fn serialize_millis_option<S>(
+    value: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_str(&format_millis(value)),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl ObservationClock {
@@ -87,11 +120,30 @@ impl ObservationClock {
     /// A future receipt, a receipt before its request or an elapsed clock that
     /// ran backwards are all clock faults: the observation is not usable.
     pub fn is_consistent(&self) -> bool {
-        self.received_at >= self.request_at
+        self.request_at.timestamp_millis() >= 0
+            && self.request_elapsed_ms <= i64::MAX as u64
+            && self.received_elapsed_ms <= i64::MAX as u64
+            && matches!(
+                (
+                    self.source_at,
+                    self.source_time_status,
+                    self.freshness_basis
+                ),
+                (
+                    None,
+                    SourceTimeStatus::Missing,
+                    FreshnessBasis::ReceiptBound
+                ) | (
+                    Some(_),
+                    SourceTimeStatus::Present,
+                    FreshnessBasis::SourceAndReceipt
+                )
+            )
+            && self.received_at >= self.request_at
             && self.received_elapsed_ms >= self.request_elapsed_ms
             && self
                 .source_at
-                .is_none_or(|source| source <= self.received_at)
+                .is_none_or(|source| source.timestamp_millis() >= 0 && source <= self.received_at)
     }
 }
 
@@ -132,7 +184,12 @@ impl Clock for SystemClock {
         let now = boottime().ok_or_else(|| anyhow!("CLOCK_UNAVAILABLE"))?;
         Ok(CheckTime {
             utc: Utc::now(),
-            elapsed_ms: now.saturating_sub(self.origin).as_millis() as u64,
+            elapsed_ms: u64::try_from(
+                now.checked_sub(self.origin)
+                    .ok_or_else(|| anyhow!("CLOCK_UNAVAILABLE"))?
+                    .as_millis(),
+            )
+            .map_err(|_| anyhow!("CLOCK_UNAVAILABLE"))?,
         })
     }
 }
@@ -177,7 +234,7 @@ impl Clock for FixtureClock {
 pub type ClockHandle = Arc<dyn Clock>;
 
 /// The Linux monotonic clock that includes suspend time.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 fn boottime() -> Option<Duration> {
     #[repr(C)]
     struct Timespec {
@@ -195,13 +252,13 @@ fn boottime() -> Option<Duration> {
     // SAFETY: `now` is a valid, writable `timespec`, and the ABI of
     // `clock_gettime` on Linux x86_64/aarch64 is the C one declared above.
     let code = unsafe { clock_gettime(CLOCK_BOOTTIME, &mut now as *mut Timespec) };
-    if code != 0 || now.tv_sec < 0 || now.tv_nsec < 0 {
+    if code != 0 || now.tv_sec < 0 || !(0..1_000_000_000).contains(&now.tv_nsec) {
         return None;
     }
     Some(Duration::new(now.tv_sec as u64, now.tv_nsec as u32))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 fn boottime() -> Option<Duration> {
     None
 }

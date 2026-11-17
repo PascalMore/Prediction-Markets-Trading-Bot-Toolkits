@@ -38,7 +38,7 @@ Every bot starts in dry run: it reads real markets, builds and signs orders, and
 
 - Removing an order on Predict doesn't cancel it on-chain. A removed order can stay fillable for a short time, and the bots keep watching it until the venue closes it.
 - Cross-Market Arbitrage only reports gaps. It refuses to run live.
-- BTC rounds settle on Binance's top of book. Where Binance isn't reachable, that bot uses Coinbase's price and refuses to go live.
+- BTC prediction uses Binance spot, with Coinbase as a paper-only fallback; these proxies are not the official settlement feed. Settlement requires the venue's verified round facts (provider CHAINLINK or UNKNOWN). The existing live source guard remains in force.
 - The bots don't redeem winnings. Redeem them on Predict.
 
 ## Controlled BTC5m paper (07-004)
@@ -76,6 +76,25 @@ Official paper payout releases virtual cash only once; live settlement is not re
 or confirmed wallet cash. Model Binance/Coinbase spot is not the official oracle
 provider (CHAINLINK/UNKNOWN). Gas, queueing, partial fills and redeem delay are not
 measured or simulated, and a profitable window would not establish sustained alpha.
+
+Phase1 (07-005) fixes new `unsigned-paper` runs to `phase1_net_shares` and the
+`btc5m-controlled-paper.v2` protocol. Entry uses `EV = net_shares * fair - cost`
+and `edge = EV / gross_shares`, not cash-fee EV or ROI as the gate. Defaults,
+cash/exposure limits and the 20 USDT stop are unchanged. Ordinary paper, signed
+mode and replay/history `/1` retain their prior semantics.
+
+The original launcher validates each v2 diagnostic and its candidate/reservation/
+fill/settlement relations before the first evidence write. Evaluations, submit
+and pre-apply rechecks use distinct check times; missing values remain null.
+Absent REST source timestamps mean RECEIPT_BOUND, not verified oracle freshness.
+Binance/BTCUSDT and Coinbase/BTC-USD have separate source epochs and warmup.
+Existing replay explicitly selects `btc-arb-replay/2` through its config; it does
+not create a second ledger. Old v1 evidence is read-only with
+DIAGNOSTICS_UNAVAILABLE, never silently upgraded or mixed into execution metrics.
+Attempt direction, settled-entry direction, per-token net shares and final cash
+PnL are separate metrics; DRAW/abstain/pending are excluded from the appropriate
+direction denominators and pending final cash PnL is unavailable. This is an
+offline correctness change, not a new paper/live authorization or an alpha claim.
 
 `signed-future-live` requires separate action approval and the original account/budget
 and signer gates. It has no paper ledger: unknown account amounts are null with

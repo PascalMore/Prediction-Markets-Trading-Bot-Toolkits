@@ -21,7 +21,7 @@ use crate::service::venue::{RoundFacts, TradableMarket};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -150,6 +150,10 @@ pub struct PaperCash {
     pub pending_candidate: Option<PendingCandidate>,
     /// The candidate that filled each token, for the settlement's reference.
     pub filled_candidates: HashMap<String, String>,
+    /// Why the last phase1 check refused, for the event that reports it.
+    pub last_phase1_reason: Option<Reason>,
+    /// Last consumed serial candidate id; terminal candidates cannot be reused.
+    pub last_candidate_id: u64,
 }
 
 impl std::fmt::Debug for PaperCash {
@@ -167,8 +171,8 @@ impl std::fmt::Debug for PaperCash {
 /// The phase1 state of a controlled run.
 ///
 /// It lives inside the broker's own lock, next to the cash: the event
-/// sequence, the one pending candidate and the filled candidates are part of
-/// the same state, not a second ledger.
+/// sequence, the one pending candidate and the filled candidates are part
+/// of the same state, not a second ledger.
 #[derive(Clone)]
 pub struct Phase1Run {
     /// The one clock the whole run reads.
@@ -181,6 +185,8 @@ pub struct Phase1Run {
     pub min_secs_left: f64,
     /// The next event sequence number.
     pub event_seq: Arc<AtomicU64>,
+    /// A failed output cannot be retried or presented as complete evidence.
+    pub output_failed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Phase1Run {
@@ -198,6 +204,7 @@ impl std::fmt::Debug for Phase1Run {
 pub struct PendingCandidate {
     pub context: CandidateContext,
     pub phase: Phase,
+    pub checked: CheckTime,
 }
 
 impl PaperCash {
@@ -216,6 +223,8 @@ impl PaperCash {
             phase1: None,
             pending_candidate: None,
             filled_candidates: HashMap::new(),
+            last_phase1_reason: None,
+            last_candidate_id: 0,
         }
     }
 
@@ -630,7 +639,7 @@ impl super::Broker {
     /// Only an unsigned controlled run gets it: the clock, the economics and
     /// the event sequence belong to that run and to no other.
     pub fn with_phase1(
-        mut self,
+        self,
         clock: Arc<dyn Clock>,
         contract: StrategyContract,
         min_edge: f64,
@@ -649,6 +658,7 @@ impl super::Broker {
             min_edge,
             min_secs_left,
             event_seq: Arc::new(AtomicU64::new(0)),
+            output_failed: Arc::new(AtomicBool::new(false)),
         });
         drop(state);
         Ok(self)
@@ -661,6 +671,20 @@ impl super::Broker {
             .paper
             .as_ref()
             .is_some_and(|paper| paper.phase1.is_some())
+    }
+
+    /// Same-lock lifecycle checks used before emitting a selected attempt.
+    pub fn phase1_entries_stopped(&self) -> bool {
+        let state = self.state.lock();
+        self.controlled_stopped()
+            || state.entry_stop_reason.is_some()
+            || state.halted
+            || state
+                .paper
+                .as_ref()
+                .and_then(|paper| paper.phase1.as_ref())
+                .is_some_and(|run| run.output_failed.load(Ordering::SeqCst))
+            || state.paper.as_ref().is_some_and(|paper| paper.loss_latched)
     }
 
     /// The clock of this run, when it speaks the phase1 protocol.
@@ -829,10 +853,11 @@ impl super::Broker {
         limit: f64,
         yes_book: &BookSnapshot,
     ) -> Result<TakeResult> {
-        let result =
-            self.controlled_take_locked(market, token, side, shares, limit, yes_book, None)?;
+        let mut state = self.state.lock();
+        let result = self.controlled_take_locked(
+            &mut state, market, token, side, shares, limit, yes_book, None,
+        )?;
         if let TakeResult::Blocked(reason) = &result {
-            let state = self.state.lock();
             self.emit(
                 &state,
                 "blocked",
@@ -859,7 +884,32 @@ impl super::Broker {
         candidate: &CandidateContext,
     ) -> Result<TakeResult> {
         let token = candidate.token().to_string();
+        let mut state = self.state.lock();
+        let paper = state
+            .paper
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("CONTROLLED_MODE"))?;
+        if paper.phase1.is_none() {
+            bail!("CONTEXT_MISSING");
+        }
+        if !paper
+            .pending_candidate
+            .as_ref()
+            .is_some_and(|pending| pending.context.same_candidate(candidate))
+        {
+            bail!("INPUT_CHANGED");
+        }
+        let serial: u64 = candidate
+            .candidate_id()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("INPUT_CHANGED"))?;
+        if serial <= paper.last_candidate_id {
+            bail!("INPUT_CHANGED");
+        }
+        paper.last_candidate_id = serial;
+        paper.last_phase1_reason = None;
         let result = self.controlled_take_locked(
+            &mut state,
             market,
             &token,
             Side::Buy,
@@ -869,21 +919,36 @@ impl super::Broker {
             Some(candidate),
         )?;
         if let TakeResult::Blocked(reason) = &result {
-            let state = self.state.lock();
-            let diagnostic = state
+            // The refusal carries the exact diagnostic reason when the phase1
+            // check produced one, and the broker's own reason otherwise.
+            let diagnostic_reason = state
                 .paper
                 .as_ref()
-                .and_then(|paper| paper.pending_candidate.as_ref())
-                .and_then(|pending| pending.context.diagnostic().cloned());
+                .and_then(|paper| paper.last_phase1_reason)
+                .unwrap_or(Reason::BrokerBlocked);
+            let link = CandidateLink {
+                decision_id: candidate.decision_id().to_string(),
+                candidate_id: candidate.candidate_id().to_string(),
+                diagnostic_reason,
+            };
+            let mut details = serde_json::json!({"reason": format!("{reason:?}")});
+            if let serde_json::Value::Object(fields) = &mut details {
+                for (name, value) in link.fields() {
+                    fields.insert(name, value);
+                }
+            }
+            // A blocked event carries the relation, not a second copy of the
+            // snapshot: the snapshot already travelled as a summary.
             self.emit(
                 &state,
                 "blocked",
                 Some(market.id),
                 Some(&token),
-                Some(serde_json::json!({"reason": format!("{reason:?}")})),
-                diagnostic.as_ref(),
+                Some(details),
+                None,
             );
         }
+        state.paper.as_mut().unwrap().pending_candidate = None;
         Ok(result)
     }
 
@@ -898,7 +963,7 @@ impl super::Broker {
         decision: Option<&DecisionDiagnostic>,
     ) {
         let phase1 = state.paper.as_ref().and_then(|paper| paper.phase1.as_ref());
-        emit_event_v2(
+        let _ = emit_event_v2(
             self.controlled.as_ref(),
             kind,
             market_id,
@@ -910,7 +975,91 @@ impl super::Broker {
             source,
             phase1,
             decision,
+            None,
         );
+    }
+
+    /// Record the evaluation of one attempt.
+    ///
+    /// The snapshot is the evidence of the attempt: it says what the run saw,
+    /// what it concluded and why. It travels in a summary, because a
+    /// diagnostic is not a trade.
+    pub fn emit_phase1_evaluation(
+        &self,
+        market: &TradableMarket,
+        diagnostic: &DecisionDiagnostic,
+        candidate: Option<&CandidateContext>,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let Some(run) = state.paper.as_ref().and_then(|paper| paper.phase1.clone()) else {
+            return false;
+        };
+        // An unevaluated replacement cannot silently abandon an older candidate.
+        if let Some(old) = state.paper.as_mut().unwrap().pending_candidate.take() {
+            let link = CandidateLink {
+                decision_id: old.context.decision_id().into(),
+                candidate_id: old.context.candidate_id().into(),
+                diagnostic_reason: Reason::InputChanged,
+            };
+            if emit_event_v2(
+                self.controlled.as_ref(),
+                "blocked",
+                Some(old.context.market_id()),
+                Some(old.context.token()),
+                Some(paper_accounting(state.paper.as_ref().unwrap(), &state)),
+                Some(serde_json::json!({"reason": "DataIncomplete"})),
+                Some(&run),
+                None,
+                Some(&link),
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        let prepare = |decision: &DecisionDiagnostic| {
+            prepare_event(
+                self.controlled.as_ref(),
+                "summary",
+                Some(market.id),
+                None,
+                Some(paper_accounting(state.paper.as_ref().unwrap(), &state)),
+                None,
+                Some(&run),
+                Some(decision),
+                None,
+            )
+        };
+        let (event, accepted) = match prepare(diagnostic) {
+            Ok(event) => (event, true),
+            Err(_) => {
+                let mut limited = scalar_refusal(diagnostic.clone());
+                limited.candidate_id = None;
+                limited.selected_token = None;
+                let Ok(event) = prepare(&limited) else {
+                    run.output_failed.store(true, Ordering::SeqCst);
+                    return false;
+                };
+                (event, false)
+            }
+        };
+        if event.flush(Some(&run)).is_err() {
+            run.output_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        if accepted {
+            if let Some(context) = candidate {
+                state.paper.as_mut().unwrap().pending_candidate = Some(PendingCandidate {
+                    context: context.clone(),
+                    phase: Phase::Evaluate,
+                    checked: CheckTime {
+                        utc: diagnostic.checked_at,
+                        elapsed_ms: diagnostic.checked_elapsed_ms,
+                    },
+                });
+            }
+        }
+        accepted
     }
 
     /// The first check of a candidate, before anything is reserved.
@@ -918,18 +1067,21 @@ impl super::Broker {
     /// It reads the run's own clock, recomputes the candidate's value and
     /// writes the PRE_SUBMIT snapshot. A candidate that no longer holds is
     /// refused here, before a single dollar is spoken for.
+    ///
+    /// A clock that cannot be read is a refusal, never an excuse: the check
+    /// either happens with a real reading or it does not happen at all.
     fn phase1_pre_submit(
         &self,
         state: &mut State,
         candidate: &CandidateContext,
         market: &TradableMarket,
-        token: &str,
-    ) -> Option<Blocked> {
-        let (phase1, now) = {
-            let paper = state.paper.as_ref()?;
-            let phase1 = paper.phase1.as_ref()?;
-            let now = phase1.clock.now().ok()?;
-            (phase1.clone(), now)
+    ) -> Option<(Blocked, Reason)> {
+        let phase1 = state.paper.as_ref()?.phase1.as_ref()?.clone();
+        // A clock that cannot be read is a refusal, not an excuse: the check
+        // either happens with a real reading or the candidate is refused.
+        let now = match phase1.clock.now() {
+            Ok(now) => now,
+            Err(_) => return Some((Blocked::DataIncomplete, Reason::ClockInvalid)),
         };
         let (diagnostic, recheck) = phase1::recheck_diagnostic(
             candidate,
@@ -946,18 +1098,24 @@ impl super::Broker {
         paper.pending_candidate = Some(PendingCandidate {
             context: candidate.clone(),
             phase: Phase::PreSubmit,
+            checked: now,
         });
-        emit_event_v2(
+        // A diagnostic summary carries the market and no token: the snapshot
+        // itself names the token it belongs to.
+        let _ = emit_event_v2(
             self.controlled.as_ref(),
             "summary",
             Some(market.id),
-            Some(token),
+            None,
             accounting,
             None,
             Some(&phase1),
             Some(&diagnostic),
+            None,
         );
-        recheck.is_none().then_some(Blocked::DataIncomplete)
+        recheck
+            .is_none()
+            .then_some((Blocked::DataIncomplete, diagnostic.reason))
     }
 
     /// The second check of a candidate, before the accounting happens.
@@ -967,48 +1125,76 @@ impl super::Broker {
     /// reservation was being made is released instead of filled.
     fn phase1_pre_apply(
         &self,
-        state: &mut State,
+        state: &State,
         candidate: &CandidateContext,
         market: &TradableMarket,
-        token: &str,
-    ) -> Option<Blocked> {
-        let (phase1, now) = {
-            let paper = state.paper.as_ref()?;
-            let phase1 = paper.phase1.as_ref()?;
-            let now = phase1.clock.now().ok()?;
-            (phase1.clone(), now)
-        };
-        let (diagnostic, recheck) = phase1::recheck_diagnostic(
-            candidate,
-            now,
-            Phase::PreApply,
-            phase1.min_edge,
-            phase1.min_secs_left,
-        );
-        let accounting = state
+    ) -> std::result::Result<(PreparedEvent, Reason), Reason> {
+        let run = state
             .paper
             .as_ref()
-            .map(|paper| paper_accounting(paper, state));
-        let paper = state.paper.as_mut()?;
-        paper.pending_candidate = Some(PendingCandidate {
-            context: candidate.clone(),
-            phase: Phase::PreApply,
-        });
-        emit_event_v2(
-            self.controlled.as_ref(),
-            "summary",
-            Some(market.id),
-            Some(token),
-            accounting,
-            None,
-            Some(&phase1),
-            Some(&diagnostic),
-        );
-        recheck.is_none().then_some(Blocked::DataIncomplete)
+            .and_then(|paper| paper.phase1.as_ref())
+            .ok_or(Reason::ContextMissing)?;
+        let prepare = |now| {
+            let (mut diagnostic, _) = phase1::recheck_diagnostic(
+                candidate,
+                now,
+                Phase::PreApply,
+                run.min_edge,
+                run.min_secs_left,
+            );
+            if self.controlled_stopped()
+                || state.entry_stop_reason.is_some()
+                || state.halted
+                || run.output_failed.load(Ordering::SeqCst)
+                || state.paper.as_ref().unwrap().loss_latched
+            {
+                diagnostic.reason = Reason::RunStopped;
+            }
+            let encode = |diagnostic: &DecisionDiagnostic| {
+                prepare_event(
+                    self.controlled.as_ref(),
+                    "summary",
+                    Some(market.id),
+                    None,
+                    Some(paper_accounting(state.paper.as_ref().unwrap(), state)),
+                    None,
+                    Some(run),
+                    Some(diagnostic),
+                    None,
+                )
+            };
+            let event = encode(&diagnostic)
+                .or_else(|_| {
+                    diagnostic = scalar_refusal(diagnostic.clone());
+                    encode(&diagnostic)
+                })
+                .map_err(|_| Reason::DiagnosticLimit)?;
+            Ok((event, diagnostic.reason))
+        };
+        // Preflight bounded local encoding; it must not write stdout. The second
+        // reading replaces this provisional snapshot, including its reason.
+        let first = run.clock.now().map_err(|_| Reason::ClockInvalid)?;
+        if state
+            .paper
+            .as_ref()
+            .and_then(|paper| paper.pending_candidate.as_ref())
+            .is_some_and(|pending| {
+                first.utc < pending.checked.utc || first.elapsed_ms < pending.checked.elapsed_ms
+            })
+        {
+            return Err(Reason::ClockInvalid);
+        }
+        let _ = prepare(first)?;
+        let final_now = run.clock.now().map_err(|_| Reason::ClockInvalid)?;
+        if final_now.utc < first.utc || final_now.elapsed_ms < first.elapsed_ms {
+            return Err(Reason::ClockInvalid);
+        }
+        prepare(final_now)
     }
 
     fn controlled_take_locked(
         &self,
+        mut state: &mut State,
         market: &TradableMarket,
         token: &str,
         side: Side,
@@ -1028,17 +1214,7 @@ impl super::Broker {
         {
             return Ok(TakeResult::Blocked(Blocked::MarketRulesUnknown));
         }
-        if let Some(candidate) = candidate {
-            // A phase1 BUY arrives with its context: the market, the token and
-            // the frozen inputs must be the ones the candidate was built on.
-            if candidate.market_id() != market.id
-                || candidate.token() != token
-                || (candidate.gross_shares() - shares).abs() > 1e-9
-                || (candidate.limit_price() - limit).abs() > 1e-9
-            {
-                return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
-            }
-        }
+
         let precision = market
             .round_facts
             .as_ref()
@@ -1052,22 +1228,37 @@ impl super::Broker {
         {
             return Ok(TakeResult::Blocked(Blocked::MarketRulesUnknown));
         }
-        let mut state = self.state.lock();
         if state.paper.is_none() {
             bail!("CONTROLLED_MODE: the controlled cash is missing");
         }
-        if state.entry_stop_reason.is_some() || self.controlled_stopped() {
+        if state.entry_stop_reason.is_some()
+            || self.controlled_stopped()
+            || state
+                .paper
+                .as_ref()
+                .and_then(|paper| paper.phase1.as_ref())
+                .is_some_and(|run| run.output_failed.load(Ordering::SeqCst))
+        {
+            state.paper.as_mut().unwrap().last_phase1_reason = Some(Reason::RunStopped);
             return Ok(TakeResult::Blocked(Blocked::Deadline));
         }
         self.check_controlled_loss_limit(&mut state);
         if state.halted || state.paper.as_ref().unwrap().loss_latched {
+            state.paper.as_mut().unwrap().last_phase1_reason = Some(Reason::RunStopped);
             return Ok(TakeResult::Blocked(Blocked::LossLatch));
         }
         // The first check of the candidate: the inputs are still the current
         // ones, and the round still has enough time left.
         if let Some(candidate) = candidate {
-            if let Some(reason) = self.phase1_pre_submit(&mut state, candidate, market, token) {
-                return Ok(TakeResult::Blocked(reason));
+            if !candidate.matches_inputs(market, yes_book) {
+                state.paper.as_mut().unwrap().last_phase1_reason = Some(Reason::InputChanged);
+                return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+            }
+            if let Some((blocked, reason)) = self.phase1_pre_submit(&mut state, candidate, market) {
+                if let Some(paper) = state.paper.as_mut() {
+                    paper.last_phase1_reason = Some(reason);
+                }
+                return Ok(TakeResult::Blocked(blocked));
             }
         }
         if mid_of(yes_book).is_none()
@@ -1096,6 +1287,8 @@ impl super::Broker {
         let Some(avg_price) = walk(levels, side, shares, limit) else {
             return Ok(TakeResult::Blocked(Blocked::ThinBook));
         };
+        // The run's own protocol version travels with every event it writes.
+        let phase1 = state.paper.as_ref().and_then(|paper| paper.phase1.clone());
 
         match side {
             Side::Buy => {
@@ -1142,6 +1335,74 @@ impl super::Broker {
                     // The walk promised a price no worse than the limit.
                     return Ok(TakeResult::Blocked(Blocked::ThinBook));
                 }
+                // Preflight immutable fields and worst-case scalar widths for
+                // both outcomes; final accounting still comes from real state.
+                if let Some(candidate) = candidate {
+                    // Leave room for reservation, PRE_APPLY, release and blocked.
+                    if phase1
+                        .as_ref()
+                        .unwrap()
+                        .event_seq
+                        .load(Ordering::SeqCst)
+                        .checked_add(4)
+                        .is_none()
+                    {
+                        state.paper.as_mut().unwrap().last_phase1_reason =
+                            Some(Reason::DiagnosticLimit);
+                        return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+                    }
+                    let Some((net, fee)) = net_shares(shares, avg_price, market.fee_rate_bps)
+                    else {
+                        state.paper.as_mut().unwrap().last_phase1_reason =
+                            Some(Reason::NetSharesInvalid);
+                        return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+                    };
+                    let source = buy_source(
+                        shares,
+                        net,
+                        avg_price,
+                        fee,
+                        market.fee_rate_bps,
+                        Some(
+                            serde_json::json!({"name": candidate.source().source, "clock": candidate.spot_clock()}),
+                        ),
+                    );
+                    let link = CandidateLink {
+                        decision_id: candidate.decision_id().into(),
+                        candidate_id: candidate.candidate_id().into(),
+                        diagnostic_reason: Reason::Eligible,
+                    };
+                    if prepare_event(
+                        self.controlled.as_ref(),
+                        "fill",
+                        Some(market.id),
+                        Some(token),
+                        Some(paper_accounting(state.paper.as_ref().unwrap(), state)),
+                        Some(source),
+                        phase1.as_ref(),
+                        None,
+                        Some(&link),
+                    )
+                    .and_then(|_| {
+                        prepare_event(
+                            self.controlled.as_ref(),
+                            "release",
+                            Some(market.id),
+                            Some(token),
+                            Some(paper_accounting(state.paper.as_ref().unwrap(), state)),
+                            None,
+                            phase1.as_ref(),
+                            None,
+                            Some(&link),
+                        )
+                    })
+                    .is_err()
+                    {
+                        state.paper.as_mut().unwrap().last_phase1_reason =
+                            Some(Reason::DiagnosticLimit);
+                        return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+                    }
+                }
                 // Reserve the worst case before the fill: the money is spoken
                 // for until the fill replaces it with the real cost.
                 state.paper.as_mut().unwrap().reservation = Some(Reservation {
@@ -1149,8 +1410,12 @@ impl super::Broker {
                     token: token.to_string(),
                     worst_case,
                 });
-                let phase1 = state.paper.as_ref().and_then(|paper| paper.phase1.clone());
-                emit_event_v2(
+                let link = candidate.map(|candidate| CandidateLink {
+                    decision_id: candidate.decision_id().to_string(),
+                    candidate_id: candidate.candidate_id().to_string(),
+                    diagnostic_reason: Reason::Eligible,
+                });
+                let _ = emit_event_v2(
                     self.controlled.as_ref(),
                     "reservation",
                     Some(market.id),
@@ -1159,14 +1424,27 @@ impl super::Broker {
                     None,
                     phase1.as_ref(),
                     None,
+                    link.as_ref(),
                 );
                 self.check_controlled_loss_limit(&mut state);
                 if self.controlled_stopped()
                     || state.entry_stop_reason.is_some()
                     || state.paper.as_ref().unwrap().loss_latched
                 {
-                    state.paper.as_mut().unwrap().reservation = None;
-                    emit_event_v2(
+                    let paper = state.paper.as_mut().unwrap();
+                    paper.reservation = None;
+                    // The run stopped after the reservation was made: the
+                    // candidate never got to be applied, and the terminal
+                    // refusal says so instead of the broker's own reason.
+                    paper.last_phase1_reason = Some(Reason::RunStopped);
+                    let link = candidate.map(|candidate| CandidateLink {
+                        decision_id: candidate.decision_id().to_string(),
+                        candidate_id: candidate.candidate_id().to_string(),
+                        // A deadline or a loss latch stops the run: the
+                        // candidate never got to be applied.
+                        diagnostic_reason: Reason::RunStopped,
+                    });
+                    let _ = emit_event_v2(
                         self.controlled.as_ref(),
                         "release",
                         Some(market.id),
@@ -1175,6 +1453,7 @@ impl super::Broker {
                         None,
                         phase1.as_ref(),
                         None,
+                        link.as_ref(),
                     );
                     return Ok(TakeResult::Blocked(if self.controlled_stopped() {
                         Blocked::Deadline
@@ -1182,26 +1461,44 @@ impl super::Broker {
                         Blocked::LossLatch
                     }));
                 }
-                // The second check of the candidate: it happens after the
-                // reservation and before any share is booked, so a candidate
-                // that went stale is released instead of filled.
+                let mut apply_event = None;
                 if let Some(candidate) = candidate {
-                    if let Some(blocked) = self.phase1_pre_apply(&mut state, candidate, market, token)
-                    {
-                        state.paper.as_mut().unwrap().reservation = None;
+                    let prepared = self.phase1_pre_apply(state, candidate, market);
+                    let reason = match prepared {
+                        Ok((event, reason)) => {
+                            apply_event = Some(event);
+                            reason
+                        }
+                        Err(reason) => reason,
+                    };
+                    if reason != Reason::Eligible {
+                        let paper = state.paper.as_mut().unwrap();
+                        paper.reservation = None;
+                        paper.last_phase1_reason = Some(reason);
+                        if let Some(event) = apply_event.take() {
+                            event.flush(phase1.as_ref())?;
+                        }
+                        let link = CandidateLink {
+                            decision_id: candidate.decision_id().to_string(),
+                            candidate_id: candidate.candidate_id().to_string(),
+                            diagnostic_reason: reason,
+                        };
                         emit_event_v2(
                             self.controlled.as_ref(),
                             "release",
                             Some(market.id),
                             Some(token),
-                            Some(paper_accounting(state.paper.as_ref().unwrap(), &state)),
+                            Some(paper_accounting(state.paper.as_ref().unwrap(), state)),
                             None,
                             phase1.as_ref(),
                             None,
-                        );
-                        return Ok(TakeResult::Blocked(blocked));
+                            Some(&link),
+                        )?;
+                        return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
                     }
                 }
+                // No blocking output between the final snapshot above and this
+                // mutation. The local PRE_APPLY is flushed before the fill below.
                 let (net, fee) = {
                     let paper = state.paper.as_mut().expect("the paper state is present");
                     let Some((net, fee)) = apply_buy(
@@ -1243,31 +1540,42 @@ impl super::Broker {
                             "observed_at": at.to_rfc3339(),
                         })
                     });
-                let candidate_id = candidate.map(|candidate| candidate.candidate_id().to_string());
+                // A phase1 fill reports the clock of the price it was decided
+                // on: the old observed_at was the decision time, not the
+                // source's receipt.
+                let price_source = match candidate {
+                    Some(candidate) => Some(serde_json::json!({
+                        "name": candidate.source().source,
+                        "clock": candidate.spot_clock(),
+                    })),
+                    None => price_source,
+                };
                 if let (Some(candidate), Some(paper)) = (candidate, state.paper.as_mut()) {
                     paper
                         .filled_candidates
                         .insert(token.to_string(), candidate.candidate_id().to_string());
                     paper.pending_candidate = None;
                 }
-                let mut details = serde_json::json!({
-                    "side": "buy",
-                    "gross_shares": shares,
-                    "net_shares": net,
-                    "price": avg_price,
-                    "cost": cost,
-                    "fee": fee,
-                    "fee_rate_bps": market.fee_rate_bps,
-                    "fee_direction": "shares",
-                    "fee_shares": fee / avg_price,
-                    "price_source": price_source,
+                let details = buy_source(
+                    shares,
+                    net,
+                    avg_price,
+                    fee,
+                    market.fee_rate_bps,
+                    price_source,
+                );
+                let link = candidate.map(|candidate| CandidateLink {
+                    decision_id: candidate.decision_id().to_string(),
+                    candidate_id: candidate.candidate_id().to_string(),
+                    diagnostic_reason: Reason::Eligible,
                 });
-                if let Some(candidate_id) = candidate_id {
-                    details["candidate_id"] = serde_json::json!(candidate_id);
-                    details["decision_id"] = serde_json::json!(candidate.map(|c| c.decision_id().to_string()));
-                    details["diagnostic_reason"] = serde_json::json!("ELIGIBLE");
+                if let Some(event) = apply_event {
+                    if event.flush(phase1.as_ref()).is_err() {
+                        state.entry_stop_reason = Some(ControlledStop::ControlChannel);
+                        bail!("OUTPUT_INVALID");
+                    }
                 }
-                emit_event_v2(
+                let _ = emit_event_v2(
                     self.controlled.as_ref(),
                     "fill",
                     Some(market.id),
@@ -1279,6 +1587,7 @@ impl super::Broker {
                     Some(details),
                     phase1.as_ref(),
                     None,
+                    link.as_ref(),
                 );
                 info!(
                     market = market.id,
@@ -1347,6 +1656,7 @@ impl super::Broker {
                         "fee_rate_bps": market.fee_rate_bps,
                         "fee_direction": "cash",
                     })),
+                    phase1.as_ref(),
                 );
                 info!(
                     market = market.id,
@@ -1407,6 +1717,7 @@ impl super::Broker {
                     &state,
                 )),
                 None,
+                state.paper.as_ref().and_then(|paper| paper.phase1.as_ref()),
             );
             error!(
                 limit = self.limits.max_loss_usd,
@@ -1456,7 +1767,7 @@ impl super::Broker {
     /// Only a confirmed official result pays out, and only once: a repeated
     /// result adds no cash, and a contradictory one is recorded as a conflict
     /// without touching the books.
-    pub(super) fn controlled_settle(&self, market: &TradableMarket) {
+    pub(crate) fn controlled_settle(&self, market: &TradableMarket) {
         let mut state = self.state.lock();
         let Some(paper) = state.paper.as_ref() else {
             return;
@@ -1555,6 +1866,24 @@ impl super::Broker {
                 .as_ref()
                 .expect("the paper state is present")
                 .cash;
+            let candidate_id = state
+                .paper
+                .as_ref()
+                .and_then(|paper| paper.filled_candidates.get(&token).cloned());
+            let mut details = serde_json::json!({
+                "shares": shares,
+                "payout": payout,
+                "income": income,
+                "basis": basis,
+                "provider": market.round_facts.as_ref()
+                    .and_then(|facts| facts.price_feed_provider.as_deref())
+                    .filter(|provider| *provider == "CHAINLINK").unwrap_or("UNKNOWN"),
+            });
+            if let (Some(candidate_id), Some(serde_json::Value::Object(fields))) =
+                (candidate_id, Some(&mut details))
+            {
+                fields.insert("candidate_id".into(), serde_json::json!(candidate_id));
+            }
             emit_event(
                 self.controlled.as_ref(),
                 "settlement",
@@ -1564,15 +1893,8 @@ impl super::Broker {
                     state.paper.as_ref().expect("the paper state is present"),
                     &state,
                 )),
-                Some(serde_json::json!({
-                    "shares": shares,
-                    "payout": payout,
-                    "income": income,
-                    "basis": basis,
-                    "provider": market.round_facts.as_ref()
-                        .and_then(|facts| facts.price_feed_provider.as_deref())
-                        .filter(|provider| *provider == "CHAINLINK").unwrap_or("UNKNOWN"),
-                })),
+                Some(details),
+                state.paper.as_ref().and_then(|paper| paper.phase1.as_ref()),
             );
             info!(
                 market = market.id,
@@ -1604,6 +1926,10 @@ pub const SCHEMA_VERSION_V2: &str = "btc5m-controlled-paper.v2";
 pub const STRATEGY_CONTRACT: &str = "phase1_net_shares";
 
 /// Write one controlled event as a single line of JSON.
+///
+/// A phase1 run speaks v2 for every one of its events, not only the ones
+/// about a candidate: the sequence number is what makes the whole run
+/// readable in order.
 fn emit_event(
     run: Option<&ControlledRun>,
     kind: &str,
@@ -1611,8 +1937,37 @@ fn emit_event(
     token: Option<&str>,
     accounting: Option<serde_json::Value>,
     mut source: Option<serde_json::Value>,
+    phase1: Option<&Phase1Run>,
 ) {
-    emit_event_v2(run, kind, market_id, token, accounting, source, None, None)
+    let _ = emit_event_v2(
+        run, kind, market_id, token, accounting, source, phase1, None, None,
+    );
+}
+
+/// The linkage a candidate's execution events carry.
+///
+/// It is the relation the protocol needs to follow one decision from its
+/// evaluation to its terminal event: which attempt it was, which candidate it
+/// produced, and why it ended the way it did. Nothing else is added.
+#[derive(Debug, Clone)]
+pub struct CandidateLink {
+    pub decision_id: String,
+    pub candidate_id: String,
+    pub diagnostic_reason: Reason,
+}
+
+impl CandidateLink {
+    /// The fields this linkage adds to an event's source.
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("decision_id".into(), serde_json::json!(self.decision_id));
+        fields.insert("candidate_id".into(), serde_json::json!(self.candidate_id));
+        fields.insert(
+            "diagnostic_reason".into(),
+            serde_json::json!(self.diagnostic_reason),
+        );
+        fields
+    }
 }
 
 /// Write one controlled event, with the phase1 envelope when there is one.
@@ -1620,8 +1975,103 @@ fn emit_event(
 /// The v2 envelope adds exactly two fields: the wire version and the event
 /// sequence. Everything else keeps the v1 shape, so a reader that knows the
 /// old protocol still recognises the old fields.
+///
+/// The diagnostic object may only travel in a summary: a decision snapshot is
+/// an evaluation, not a trade. The execution events carry the linkage
+/// instead, so the relation can be followed without a second copy of the
+/// snapshot.
 #[allow(clippy::too_many_arguments)]
 fn emit_event_v2(
+    run: Option<&ControlledRun>,
+    kind: &str,
+    market_id: Option<u64>,
+    token: Option<&str>,
+    accounting: Option<serde_json::Value>,
+    source: Option<serde_json::Value>,
+    phase1: Option<&Phase1Run>,
+    decision: Option<&DecisionDiagnostic>,
+    linkage: Option<&CandidateLink>,
+) -> Result<()> {
+    if phase1.is_some_and(|run| run.output_failed.load(Ordering::SeqCst)) {
+        bail!("OUTPUT_INVALID");
+    }
+    let result = prepare_event(
+        run, kind, market_id, token, accounting, source, phase1, decision, linkage,
+    )
+    .and_then(|event| event.flush(phase1));
+    if result.is_err() {
+        if let Some(run) = phase1 {
+            run.output_failed.store(true, Ordering::SeqCst);
+        }
+    }
+    result
+}
+
+fn scalar_refusal(mut diagnostic: DecisionDiagnostic) -> DecisionDiagnostic {
+    diagnostic.reason = Reason::DiagnosticLimit;
+    for side in [&mut diagnostic.up, &mut diagnostic.down]
+        .into_iter()
+        .flatten()
+    {
+        side.depth_levels = None;
+        side.depth_complete = None;
+        side.walk_vwap = None;
+        side.execution_cost = None;
+        side.execution_net_shares = None;
+        side.execution_ev = None;
+        side.execution_edge = None;
+    }
+    diagnostic
+}
+
+/// A single locally encoded record, owned by this same-lock call only.
+struct PreparedEvent {
+    event: serde_json::Value,
+    line: String,
+}
+
+impl PreparedEvent {
+    fn flush(self, run: Option<&Phase1Run>) -> Result<()> {
+        let result = (|| {
+            if let Some(run) = run {
+                if run.output_failed.load(Ordering::SeqCst) {
+                    bail!("OUTPUT_INVALID");
+                }
+                let seq = self.event["event_seq"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("OUTPUT_INVALID"))?;
+                run.event_seq
+                    .compare_exchange(seq - 1, seq, Ordering::SeqCst, Ordering::SeqCst)
+                    .map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?;
+            }
+            #[cfg(test)]
+            {
+                if OUTPUT_FAILURE.with(|fault| fault.replace(false)) {
+                    bail!("OUTPUT_INVALID");
+                }
+                RECORDED.with(|events| events.borrow_mut().push(self.event));
+                println!("{EVENT_PREFIX}{}", self.line);
+            }
+            #[cfg(not(test))]
+            {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(format!("{EVENT_PREFIX}{}\n", self.line).as_bytes())?;
+                stdout.flush()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            if let Some(run) = run {
+                run.output_failed.store(true, Ordering::SeqCst);
+            }
+        }
+        result
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_event(
     run: Option<&ControlledRun>,
     kind: &str,
     market_id: Option<u64>,
@@ -1630,7 +2080,12 @@ fn emit_event_v2(
     mut source: Option<serde_json::Value>,
     phase1: Option<&Phase1Run>,
     decision: Option<&DecisionDiagnostic>,
-) {
+    linkage: Option<&CandidateLink>,
+) -> Result<PreparedEvent> {
+    #[cfg(test)]
+    if ENCODING_LIMIT.with(|fault| fault.replace(false)) {
+        bail!("DIAGNOSTIC_LIMIT");
+    }
     if matches!(kind, "fill" | "settlement") {
         if let Some(serde_json::Value::Object(fields)) = source.as_mut() {
             fields.insert("cash_unit".into(), serde_json::json!("USDT"));
@@ -1638,7 +2093,10 @@ fn emit_event_v2(
         }
     }
     let mut event = serde_json::Map::new();
-    event.insert("run_id".into(), serde_json::json!(run.map(|run| run.run_id.as_str())));
+    event.insert(
+        "run_id".into(),
+        serde_json::json!(run.map(|run| run.run_id.as_str())),
+    );
     event.insert("event_kind".into(), serde_json::json!(kind));
     event.insert("market_id".into(), serde_json::json!(market_id));
     event.insert("token".into(), serde_json::json!(token));
@@ -1652,7 +2110,27 @@ fn emit_event_v2(
         None => serde_json::Map::new(),
     };
     if let Some(decision) = decision {
-        fields.insert("decision".into(), serde_json::to_value(decision).unwrap_or_default());
+        // A snapshot that cannot be represented is a limit, not a shorter
+        // snapshot: the values that are missing stay missing.
+        if !phase1::diagnostic_is_finite(decision)
+            || [&decision.up, &decision.down]
+                .into_iter()
+                .flatten()
+                .any(|side| {
+                    side.depth_levels
+                        .as_ref()
+                        .is_some_and(|levels| levels.len() > 1000)
+                })
+        {
+            return Err(anyhow::anyhow!("DIAGNOSTIC_LIMIT"));
+        }
+        let value = serde_json::to_value(decision)?;
+        fields.insert("decision".into(), value);
+    }
+    if let Some(linkage) = linkage {
+        for (name, value) in linkage.fields() {
+            fields.insert(name, value);
+        }
     }
     if !fields.is_empty() {
         event.insert("source".into(), serde_json::Value::Object(fields));
@@ -1670,16 +2148,42 @@ fn emit_event_v2(
         );
         event.insert(
             "event_seq".into(),
-            serde_json::json!(phase1.event_seq.fetch_add(1, Ordering::SeqCst) + 1),
+            serde_json::json!(phase1
+                .event_seq
+                .load(Ordering::SeqCst)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("DIAGNOSTIC_LIMIT"))?),
         );
     }
     let event = serde_json::Value::Object(event);
-    #[cfg(test)]
-    RECORDED.with(|events| events.borrow_mut().push(event.clone()));
-    println!(
-        "{EVENT_PREFIX}{}",
-        serde_json::to_string(&event).unwrap_or_default()
-    );
+    let line = serde_json::to_string(&event)?;
+    if phase1.is_some() && linkage.is_some() && matches!(kind, "fill" | "release") {
+        let Some(accounting) = event["accounting"].as_object() else {
+            bail!("DIAGNOSTIC_LIMIT");
+        };
+        // 64 bytes covers JSON f64/u64/bool/null, Chrono RFC3339 and Reason.
+        // Replacing their actual widths by this bound makes the capacity proof
+        // independent of post-state digits, nullable values and event sequence.
+        let mut bound = EVENT_PREFIX.len() + line.len() + 1;
+        for value in accounting.values().chain([
+            &event["event_seq"],
+            &event["event_time"],
+            &event["source"]["diagnostic_reason"],
+        ]) {
+            let width = serde_json::to_string(value)?.len();
+            if width > 64 {
+                bail!("DIAGNOSTIC_LIMIT");
+            }
+            bound += 64 - width;
+        }
+        if bound > 64 * 1024 {
+            bail!("DIAGNOSTIC_LIMIT");
+        }
+    }
+    if EVENT_PREFIX.len() + line.len() + 1 > 64 * 1024 {
+        bail!("DIAGNOSTIC_LIMIT");
+    }
+    Ok(PreparedEvent { event, line })
 }
 
 /// The events this test emitted, in order.
@@ -1687,13 +2191,13 @@ fn emit_event_v2(
 /// The recorder is test-only: the production path prints the events and keeps
 /// no second copy of them.
 #[cfg(test)]
-pub(super) fn recorded_events() -> Vec<serde_json::Value> {
+pub(crate) fn recorded_events() -> Vec<serde_json::Value> {
     RECORDED.with(|events| events.borrow().clone())
 }
 
 /// Forget the events recorded so far.
 #[cfg(test)]
-pub(super) fn clear_recorded_events() {
+pub(crate) fn clear_recorded_events() {
     RECORDED.with(|events| events.borrow_mut().clear());
 }
 
@@ -1701,6 +2205,8 @@ pub(super) fn clear_recorded_events() {
 thread_local! {
     static RECORDED: std::cell::RefCell<Vec<serde_json::Value>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static ENCODING_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OUTPUT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The controlled cash state, as the events report it.
@@ -1710,6 +2216,19 @@ fn state_snapshot(paper: &PaperCash, state: &State) -> PaperSnapshot {
     result.reserved += unclosed;
     result.available -= unclosed;
     result
+}
+
+fn buy_source(
+    gross: f64,
+    net: f64,
+    price: f64,
+    fee: f64,
+    bps: u32,
+    price_source: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({"side": "buy", "gross_shares": gross, "net_shares": net,
+        "price": price, "cost": gross * price, "fee": fee, "fee_rate_bps": bps,
+        "fee_direction": "shares", "fee_shares": fee / price, "price_source": price_source})
 }
 
 fn paper_accounting(paper: &PaperCash, state: &State) -> serde_json::Value {
@@ -1766,10 +2285,12 @@ pub(super) fn watch_control_channel(broker: Arc<Broker>) {
 ///
 /// Everything a reader needs to recompute the run line by line is in here.
 pub(super) fn emit_summary(broker: &super::Broker) {
-    let Some(snapshot) = broker.paper_snapshot() else {
+    let state = broker.state.lock();
+    let Some(paper) = state.paper.as_ref() else {
         return;
     };
-    let s = broker.summary();
+    let snapshot = state_snapshot(paper, &state);
+    let s = state.summary();
     emit_event(
         broker.controlled.as_ref(),
         "summary",
@@ -1789,10 +2310,11 @@ pub(super) fn emit_summary(broker: &super::Broker) {
             "holdings": s.holdings,
         })),
         None,
+        state.paper.as_ref().and_then(|paper| paper.phase1.as_ref()),
     );
 }
 
-pub(super) fn emit_final(broker: &Broker, cleanup_timed_out: bool) {
+pub(crate) fn emit_final(broker: &Broker, cleanup_timed_out: bool) {
     let state = broker.state.lock();
     let stop_reason = state.entry_stop_reason.map(|reason| reason.as_str());
     let Some(paper) = state.paper.as_ref() else {
@@ -1810,6 +2332,7 @@ pub(super) fn emit_final(broker: &Broker, cleanup_timed_out: bool) {
                 Some(serde_json::json!({"markets": null, "finalized": false,
                     "accounting_reason": "LIVE_ACCOUNTING_UNAVAILABLE",
                     "stop_reason": stop_reason, "cleanup_timed_out": cleanup_timed_out})),
+                None,
             );
         }
         return;
@@ -1836,9 +2359,12 @@ pub(super) fn emit_final(broker: &Broker, cleanup_timed_out: bool) {
         Some(paper_accounting(paper, &state)),
         Some(
             serde_json::json!({"markets": markets, "stop_reason": stop_reason,
-                "cleanup_timed_out": cleanup_timed_out, "finalized": paper.traded.keys().all(|id|
-            paper.settlements.get(id) == Some(&Settlement::Confirmed))}),
+                "cleanup_timed_out": cleanup_timed_out, "finalized": paper.reservation.is_none()
+                    && paper.pending_candidate.is_none()
+                    && paper.phase1.as_ref().is_none_or(|run| !run.output_failed.load(Ordering::SeqCst))
+                    && paper.traded.keys().all(|id| paper.settlements.get(id) == Some(&Settlement::Confirmed))}),
         ),
+        paper.phase1.as_ref(),
     );
 }
 

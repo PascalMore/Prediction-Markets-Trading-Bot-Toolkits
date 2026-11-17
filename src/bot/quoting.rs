@@ -4,6 +4,7 @@
 use crate::bot::runtime::{is_allowed, is_quotable, pick_quotable, reconcile, Ctx, Quote};
 use crate::config::FiltersConfig;
 use crate::models::BookSnapshot;
+use crate::service::observation::{Clock, ObservedBook};
 use crate::service::predict_fun::PredictFunClient;
 use crate::service::venue::{MarketData, MarketQuery, TradableMarket};
 use anyhow::Result;
@@ -43,6 +44,36 @@ impl Known {
     /// Fetch `ids` plus every market the broker is tracking, and show the broker
     /// those books.
     pub async fn observe(&mut self, ctx: &Ctx, ids: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
+        let all = self.observed_ids(ctx, ids).await?;
+        let books = ctx.data.books(&all).await?;
+        for (id, book) in &books {
+            self.show_book(ctx, *id, book);
+        }
+        Ok(books)
+    }
+
+    /// The same tracked-market/mark path, preserving acquisition clocks.
+    pub async fn observe_with_clock(
+        &mut self,
+        ctx: &Ctx,
+        ids: &[u64],
+        clock: &dyn Clock,
+    ) -> Result<HashMap<u64, ObservedBook>> {
+        let all = self.observed_ids(ctx, ids).await?;
+        let books = ctx.data.observed_books(&all, clock).await?;
+        for (id, observed) in &books {
+            self.show_book(ctx, *id, &observed.book);
+        }
+        Ok(books)
+    }
+
+    fn show_book(&self, ctx: &Ctx, id: u64, book: &BookSnapshot) {
+        if let Some(market) = self.markets.get(&id) {
+            ctx.broker.observe(market, book);
+        }
+    }
+
+    async fn observed_ids(&mut self, ctx: &Ctx, ids: &[u64]) -> Result<Vec<u64>> {
         let mut all: Vec<u64> = ids.to_vec();
         for id in ctx.broker.tracked_markets() {
             if !all.contains(&id) {
@@ -54,13 +85,7 @@ impl Known {
                 self.markets.insert(*id, ctx.data.market(*id).await?);
             }
         }
-        let books = ctx.data.books(&all).await?;
-        for (id, book) in &books {
-            if let Some(market) = self.markets.get(id) {
-                ctx.broker.observe(market, book);
-            }
-        }
-        Ok(books)
+        Ok(all)
     }
 }
 
@@ -222,8 +247,13 @@ impl Picker {
             let (Some(market), Some(book)) = (self.known.get(id).cloned(), books.get(&id)) else {
                 continue;
             };
-            let chosen = self.selected.contains(&id) && is_quotable(&market, self.min_secs_left, now);
-            let quotes = if chosen { wanted(&market, book) } else { Vec::new() };
+            let chosen =
+                self.selected.contains(&id) && is_quotable(&market, self.min_secs_left, now);
+            let quotes = if chosen {
+                wanted(&market, book)
+            } else {
+                Vec::new()
+            };
             reconcile(ctx, &market, book, &quotes, tolerance).await?;
         }
         Ok(())

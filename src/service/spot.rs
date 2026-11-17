@@ -57,6 +57,8 @@ struct CoinbasePrice {
 pub struct SpotFeed {
     http: Client,
     binance_refused_at: Option<Instant>,
+    #[cfg(test)]
+    fixture_quotes: Option<std::sync::Mutex<std::collections::VecDeque<(SpotSource, Option<f64>)>>>,
 }
 
 impl SpotFeed {
@@ -67,6 +69,21 @@ impl SpotFeed {
                 .timeout(Duration::from_secs(5))
                 .build()?,
             binance_refused_at: None,
+            #[cfg(test)]
+            fixture_quotes: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn fixture_price(&self, expected: SpotSource) -> Option<Result<f64>> {
+        self.fixture_quotes.as_ref().map(|quotes| {
+            let (source, price) = quotes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("spot fixture exhausted");
+            assert_eq!(source, expected);
+            price.ok_or_else(|| anyhow!("SYNTHETIC_SPOT_FAILURE"))
         })
     }
 
@@ -143,6 +160,10 @@ impl SpotFeed {
         clock: Option<&dyn Clock>,
     ) -> Result<(f64, Option<(CheckTime, CheckTime)>)> {
         let request_at = sample(clock)?;
+        #[cfg(test)]
+        if let Some(price) = self.fixture_price(SpotSource::Binance) {
+            return Ok((price?, times(request_at, sample(clock)?)));
+        }
         let resp = self
             .http
             .get(format!("{BINANCE}?symbol={symbol}"))
@@ -165,6 +186,10 @@ impl SpotFeed {
     ) -> Result<(f64, Option<(CheckTime, CheckTime)>)> {
         let pair = coinbase_pair(symbol)?;
         let request_at = sample(clock)?;
+        #[cfg(test)]
+        if let Some(price) = self.fixture_price(SpotSource::Coinbase) {
+            return Ok((price?, times(request_at, sample(clock)?)));
+        }
         let price: CoinbaseEnvelope = self
             .http
             .get(format!("{COINBASE}/{pair}/spot"))
@@ -296,6 +321,191 @@ pub fn digital_up(spot: f64, strike: f64, vol_per_root_sec: f64, secs_left: f64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_fallback_and_retry_keep_source_clocks_and_epochs() {
+        use crate::bot::arbitrage::{phase1::*, DecisionCore};
+        use crate::bot::runtime::{paper, Broker};
+        use crate::config::{BtcArbConfig, ControlledMode, ControlledRun, StrategyLimits};
+        use crate::models::{BookLevel, BookSnapshot};
+        use crate::service::observation::FixtureClock;
+        use crate::service::venue::{RoundFacts, TradableMarket};
+        use chrono::{DateTime, Utc};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        struct Times(Mutex<VecDeque<CheckTime>>);
+        impl Clock for Times {
+            fn now(&self) -> Result<CheckTime> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("clock fixture exhausted"))
+            }
+        }
+        let origin = DateTime::<Utc>::from_timestamp_millis(1_762_636_800_000).unwrap();
+        let clock = Times(Mutex::new(
+            [0_u64, 5000, 5100, 5200, 5300, 306000, 306100]
+                .into_iter()
+                .map(|elapsed_ms| CheckTime {
+                    utc: origin + chrono::Duration::milliseconds(elapsed_ms as i64),
+                    elapsed_ms,
+                })
+                .collect(),
+        ));
+        let mut feed = SpotFeed::new().unwrap();
+        feed.fixture_quotes = Some(Mutex::new(VecDeque::from([
+            (SpotSource::Binance, None),
+            (SpotSource::Coinbase, Some(100.0)),
+            (SpotSource::Coinbase, Some(100.1)),
+            (SpotSource::Binance, Some(100.2)),
+        ])));
+        let mut core = DecisionCore::phase1(BtcArbConfig {
+            order_usd: 2.0,
+            ..Default::default()
+        });
+        let broker = Broker::new(
+            StrategyLimits {
+                max_order_usd: 2.0,
+                max_market_usd: 2.0,
+                max_total_usd: 10.0,
+                max_loss_usd: 20.0,
+            },
+            false,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_controlled_paper(
+            ControlledRun::new(
+                ControlledMode::UnsignedPaper,
+                "source-fixture".into(),
+                Utc::now(),
+            )
+            .unwrap(),
+            100.0,
+        )
+        .unwrap()
+        .with_phase1(
+            Arc::new(FixtureClock::new(origin)),
+            StrategyContract::Phase1NetShares,
+            0.03,
+            30.0,
+        )
+        .unwrap();
+        let book = BookSnapshot {
+            bids: vec![BookLevel {
+                price: 0.4,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.45,
+                size: 100.0,
+            }],
+        };
+        paper::clear_recorded_events();
+        for index in 0..3 {
+            if index == 2 {
+                feed.binance_refused_at = Some(Instant::now() - BINANCE_RETRY_AFTER);
+            }
+            let quote = feed.quote_observed("BTCUSDT", &clock).await.unwrap();
+            let now = CheckTime {
+                utc: quote.clock.received_at,
+                elapsed_ms: quote.clock.received_elapsed_ms,
+            };
+            core.observe_phase1(
+                "BTCUSDT",
+                quote.price,
+                quote.source,
+                &quote.actual_pair,
+                &quote.clock,
+                now,
+            )
+            .unwrap();
+            let market = TradableMarket {
+                id: index + 1,
+                open: true,
+                contested: false,
+                tick: 0.01,
+                fee_rate_bps: 200,
+                feed_symbol: Some("BTCUSDT".into()),
+                yes_token: "1001".into(),
+                no_token: "1002".into(),
+                start_price: Some(100.0),
+                starts_at: Some(now.utc - chrono::Duration::seconds(1)),
+                ends_at: Some(now.utc + chrono::Duration::seconds(299)),
+                round_facts: Some(RoundFacts {
+                    price_feed_provider: Some("CHAINLINK".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let evaluation = core.evaluate_phase1(&EvaluationInputs {
+                market: &market,
+                book: &book,
+                spot_price: quote.price,
+                spot_source: Some(quote.source),
+                actual_pair: Some(quote.actual_pair.clone()),
+                spot_clock: Some(quote.clock.clone()),
+                book_clock: Some(quote.clock.clone()),
+                now,
+                order_usd: 2.0,
+                min_edge: 0.03,
+                min_secs_left: 30.0,
+                entered: false,
+                identity_available_at: market.starts_at,
+                strike_available_at: market.starts_at,
+                settlement_provider: SettlementProvider::Chainlink,
+            });
+            assert!(evaluation.candidate.is_none());
+            assert_eq!(evaluation.diagnostic.reason, Reason::Warmup);
+            assert!(broker.emit_phase1_evaluation(&market, &evaluation.diagnostic, None));
+            let event = paper::recorded_events().pop().unwrap();
+            let decision = &event["source"]["decision"];
+            assert_eq!(decision["settlement_provider"], "CHAINLINK");
+            assert_eq!(
+                decision["prediction_source"],
+                if index == 2 { "Binance" } else { "Coinbase" }
+            );
+            assert_eq!(
+                decision["actual_pair"],
+                if index == 2 { "BTCUSDT" } else { "BTC-USD" }
+            );
+            assert_eq!(
+                decision["source_state"],
+                if index == 2 { "PRIMARY" } else { "DEGRADED" }
+            );
+            assert_eq!(decision["source_epoch"], if index == 2 { 2 } else { 1 });
+            assert_eq!(decision["samples"], if index == 1 { 1 } else { 0 });
+            assert_eq!(
+                decision["reset_reason"],
+                if index == 2 {
+                    "SOURCE_SWITCH"
+                } else {
+                    "FIRST_SAMPLE"
+                }
+            );
+            assert!(decision["spot_clock"]["source_at"].is_null());
+            assert_eq!(decision["spot_clock"]["freshness_basis"], "RECEIPT_BOUND");
+            if index == 0 {
+                assert_eq!(quote.clock.request_elapsed_ms, 5000);
+                assert_eq!(quote.clock.received_elapsed_ms, 5100);
+            }
+            assert_eq!(event["accounting"]["cash"], 100.0);
+            assert_eq!(event["accounting"]["reserved"], 0.0);
+        }
+        assert!(feed
+            .fixture_quotes
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(clock.0.lock().unwrap().is_empty());
+        assert!(broker.holdings().is_empty());
+        paper::clear_recorded_events();
+    }
 
     #[test]
     fn normal_cdf_matches_known_values() {

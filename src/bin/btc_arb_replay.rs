@@ -75,7 +75,7 @@ fn main() {
             std::process::exit(EXIT_USAGE as i32);
         }
     };
-    if let Err(message) = config.validate() {
+    if let Err(message) = config.validate_for(args.mode) {
         eprintln!("usage_invalid: {message}");
         std::process::exit(EXIT_USAGE as i32);
     }

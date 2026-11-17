@@ -8,6 +8,464 @@ use super::*;
 
 mod state;
 
+// Keep phase1 coverage in the existing test file (Design §3.1/§3.6).
+mod v2 {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use serde_json::{json, Value};
+
+    fn config_v2() -> ReplayConfig {
+        ReplayConfig {
+            schema_version: SCHEMA_VERSION_V2.into(),
+            order_usd: 2.0,
+            ..config()
+        }
+    }
+
+    fn clock(at: i64, elapsed: u64) -> Value {
+        let timestamp = crate::service::observation::format_millis(
+            &DateTime::<Utc>::from_timestamp_millis(at).unwrap(),
+        );
+        json!({"source_at": null, "source_time_status": "MISSING",
+            "freshness_basis": "RECEIPT_BOUND", "request_at": timestamp,
+            "received_at": timestamp, "request_elapsed_ms": elapsed,
+            "received_elapsed_ms": elapsed})
+    }
+
+    fn envelope(id: &str, at: i64, seq: u64, payload: Value) -> Value {
+        json!({"schema_version": SCHEMA_VERSION_V2, "event_id": id,
+            "event_at_ms": null, "available_at_ms": at, "seq": seq,
+            "source": "test-fixture", "evidence_type": "fixture",
+            "elapsed_ms": (at - T0) as u64, "payload": payload})
+    }
+
+    // The final warm-up price is current, not ten rounds older than the tick.
+    fn prefix() -> Vec<Value> {
+        let mut lines: Vec<_> = (0..21)
+            .map(|index| {
+                let elapsed = index * 5_000;
+                let at = T0 + elapsed as i64;
+                envelope(
+                    &format!("spot-{index}"),
+                    at,
+                    index,
+                    json!({"type": "spot", "symbol": REPLAY_SYMBOL,
+                    "price": 100.0 + index as f64 * 0.01,
+                    "model_source": "Binance", "actual_pair": "BTCUSDT",
+                    "clock": clock(at, elapsed)}),
+                )
+            })
+            .collect();
+        lines.push(envelope(
+            "market-1",
+            T0 + 100_001,
+            21,
+            json!({"type": "market", "market_id": 1, "symbol": REPLAY_SYMBOL,
+                "starts_at_ms": T0, "ends_at_ms": T0 + ROUND,
+                "yes_token": "yes-1", "no_token": "no-1", "yes_name": "Up",
+                "no_name": "Down", "rules_source": "test-rules"}),
+        ));
+        lines.push(envelope(
+            "state-1",
+            T0 + 100_002,
+            22,
+            json!({"type": "state", "market_id": 1, "open": true,
+                "contested": false, "paused": false, "start_price": 100.0,
+                "fee_rate_bps": 200}),
+        ));
+        lines.push(envelope(
+            "book-1",
+            T0 + 100_003,
+            23,
+            json!({"type": "book", "market_id": 1, "yes_token": "yes-1",
+                "bids": [{"price": 0.4, "size": 50.0}],
+                "asks": [{"price": 0.45, "size": 50.0}],
+                "clock": clock(T0 + 100_003, 100_003)}),
+        ));
+        lines.push(envelope(
+            "tick-1",
+            T0 + 101_000,
+            24,
+            json!({"type": "tick", "market_id": 1}),
+        ));
+        lines
+    }
+
+    fn drive_with(
+        config: ReplayConfig,
+        mode: ReplayMode,
+        lines: &[Value],
+    ) -> (Result<ReplaySummary, ReplayError>, Vec<Value>) {
+        let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let mut output = Vec::new();
+        let result = run(
+            config,
+            mode,
+            T0,
+            T0 + 100 * ROUND,
+            std::io::Cursor::new(input),
+            &mut output,
+        );
+        let rows = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (result, rows)
+    }
+
+    fn drive(lines: &[Value]) -> (Vec<Value>, ReplaySummary) {
+        let (result, rows) = drive_with(config_v2(), ReplayMode::Replay, lines);
+        (rows, result.unwrap())
+    }
+
+    fn refused(lines: &[Value], code: &str, line: u64) {
+        let (result, output) = drive_with(config_v2(), ReplayMode::Replay, lines);
+        let error = result.unwrap_err();
+        assert_eq!(
+            (error.exit_code, error.code.as_str(), error.line),
+            (EXIT_CONTRACT, code, line)
+        );
+        assert!(output.is_empty(), "invalid streams must not be written");
+    }
+
+    #[test]
+    fn the_version_chooses_the_economics() {
+        assert!(config().validate().is_ok());
+        assert!(config_v2().validate_for(ReplayMode::Replay).is_ok());
+        assert!(config_v2().validate().is_err());
+        assert!(config().validate_for(ReplayMode::Proxy).is_ok());
+        for (version, dollars, mode) in [
+            (SCHEMA_VERSION_V2, 5.0, ReplayMode::Replay),
+            (SCHEMA_VERSION, 2.0, ReplayMode::Replay),
+            ("btc-arb-replay/3", 2.0, ReplayMode::Replay),
+            (SCHEMA_VERSION_V2, 2.0, ReplayMode::Proxy),
+        ] {
+            let cfg = ReplayConfig {
+                schema_version: version.into(),
+                order_usd: dollars,
+                ..config()
+            };
+            assert!(cfg.validate_for(mode).is_err());
+            // Test the actual facade, not only the configuration helper.
+            let (result, output) = drive_with(cfg, mode, &[]);
+            assert_eq!(result.unwrap_err().line, 0);
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_mixed_stream_is_refused_before_anything_is_decided() {
+        let original: Value = serde_json::from_str(&market_event("market-1", T0, 0, 1)).unwrap();
+        refused(&[original], "json_invalid", 1);
+        let stream = prefix();
+        let mut wrong_version = stream[0].clone();
+        wrong_version["schema_version"] = json!(SCHEMA_VERSION);
+        let mut output = Vec::new();
+        let error = run(
+            config_v2(),
+            ReplayMode::Replay,
+            T0 + ROUND,
+            T0 + 2 * ROUND,
+            std::io::Cursor::new(wrong_version.to_string()),
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "schema_invalid");
+        assert!(
+            output.is_empty(),
+            "a window filter must not hide a mixed wire version"
+        );
+        let (result, output) = drive_with(config(), ReplayMode::Replay, &stream[..1]);
+        assert!(result.is_err());
+        assert!(output.is_empty());
+        for mutation in [
+            "elapsed_ms",
+            "extra",
+            "bool",
+            "null",
+            "clock-extra",
+            "level-extra",
+        ] {
+            let mut lines = stream.clone();
+            match mutation {
+                "elapsed_ms" => {
+                    lines[0].as_object_mut().unwrap().remove("elapsed_ms");
+                }
+                "extra" => lines[0]["extra"] = json!(1),
+                "bool" => lines[0]["elapsed_ms"] = json!(true),
+                "null" => lines[0]["payload"]["clock"] = Value::Null,
+                "clock-extra" => lines[0]["payload"]["clock"]["extra"] = json!(1),
+                "level-extra" => lines[23]["payload"]["asks"][0]["extra"] = json!(1),
+                _ => unreachable!(),
+            }
+            let line = if mutation == "level-extra" { 24 } else { 1 };
+            refused(&lines, "json_invalid", line);
+        }
+    }
+
+    #[test]
+    fn the_elapsed_clock_never_goes_backwards() {
+        let mut lines = prefix();
+        lines.push(envelope(
+            "tick-2",
+            T0 + 102_000,
+            25,
+            json!({"type": "tick", "market_id": 1}),
+        ));
+        lines[25]["elapsed_ms"] = json!(100_000);
+        refused(&lines, "time_order", 26);
+        let mut lines = prefix();
+        lines[23]["payload"]["clock"]["received_at"] =
+            clock(T0 + 100_004, 100_004)["received_at"].clone();
+        refused(&lines, "time_order", 24);
+        let mut lines = prefix();
+        lines[23]["payload"]["clock"]["received_elapsed_ms"] = json!(100_004);
+        refused(&lines, "time_order", 24);
+        let mut lines = prefix();
+        lines[23]["event_at_ms"] = json!(T0 + 100_003);
+        refused(&lines, "time_order", 24);
+    }
+
+    #[test]
+    fn the_source_and_the_pair_must_agree() {
+        let mut lines = prefix();
+        lines[0]["payload"]["actual_pair"] = json!("BTC-USD");
+        refused(&lines, "identity_invalid", 1);
+        let mut lines = prefix();
+        for row in &mut lines[..21] {
+            row["payload"]["model_source"] = json!("Coinbase");
+            row["payload"]["actual_pair"] = json!("BTC-USD");
+        }
+        let (rows, _) = drive(&lines);
+        assert_eq!(rows[24]["decision"]["source_state"], "DEGRADED");
+        assert_eq!(rows[24]["decision"]["settlement_provider"], "UNKNOWN");
+    }
+
+    #[test]
+    fn the_net_share_version_decides_with_the_shared_core() {
+        let (rows, summary) = drive(&prefix());
+        assert_eq!(rows.len(), 25);
+        assert!(rows[21]["decision"].is_null());
+        for row in &rows {
+            assert_eq!(row["strategy_contract"], "phase1_net_shares");
+            assert_eq!(row["schema_version"], SCHEMA_VERSION_V2);
+        }
+        let tick = &rows[24];
+        let decision = &tick["decision"];
+        assert_eq!(decision["reason"], "ELIGIBLE");
+        assert_eq!(decision["samples"], 20);
+        assert!(decision["sigma"].as_f64().unwrap().is_finite());
+        assert!(decision["p_up"].as_f64().unwrap().is_finite());
+        assert_eq!(decision["candidate_id"], decision["decision_id"]);
+        assert!(decision["candidate_id"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok());
+        assert_eq!(tick["candidate"], true);
+        assert_eq!(summary.candidate_count, 1);
+        assert_eq!(decision["up"]["gross_shares"], 4.44);
+    }
+
+    #[test]
+    fn the_result_refers_to_the_core_candidate() {
+        let lines = prefix();
+        let (rows, _) = drive(&lines);
+        let id = rows[24]["decision"]["candidate_id"].clone();
+        for (named, shares, expected) in [
+            (json!("tick-1"), 4.0, false),
+            (id.clone(), 4.0, true),
+            (id, 0.0, false),
+        ] {
+            let mut stream = lines.clone();
+            stream.push(envelope(
+                "result-1",
+                T0 + 102_000,
+                25,
+                json!({"type": "result", "market_id": 1, "candidate_event_id": named,
+                    "status": "filled", "filled_shares": shares, "detail": null}),
+            ));
+            if named == json!("tick-1") {
+                refused(&stream, "result_invalid", 26);
+            } else {
+                let (rows, summary) = drive(&stream);
+                assert_eq!(rows[25]["entered_before"], false);
+                assert_eq!(rows[25]["entered_after"], expected);
+                assert_eq!(summary.positive_fill_count, u64::from(expected));
+                // A second terminal under a new event id is not idempotent.
+                let mut repeated = stream.last().unwrap().clone();
+                repeated["event_id"] = json!("result-2");
+                repeated["available_at_ms"] = json!(T0 + 102_001);
+                repeated["elapsed_ms"] = json!(102_001);
+                repeated["seq"] = json!(26);
+                stream.push(repeated);
+                refused(&stream, "result_invalid", 27);
+            }
+        }
+    }
+
+    #[test]
+    fn a_round_without_a_fee_is_refused() {
+        let mut lines = prefix();
+        lines[22]["payload"]["fee_rate_bps"] = Value::Null;
+        let (rows, _) = drive(&lines);
+        assert_eq!(rows[24]["decision"]["reason"], "MARKET_INVALID");
+        assert!(rows[24]["decision"]["candidate_id"].is_null());
+        assert_eq!(rows[24]["candidate"], false);
+    }
+
+    #[test]
+    fn the_identity_and_the_strike_freeze_their_first_availability() {
+        let mut lines = prefix();
+        let mut market = lines[21].clone();
+        market["event_id"] = json!("market-again");
+        market["available_at_ms"] = json!(T0 + 100_004);
+        market["elapsed_ms"] = json!(100_004);
+        market["seq"] = json!(24);
+        let mut state = lines[22].clone();
+        state["event_id"] = json!("state-again");
+        state["available_at_ms"] = json!(T0 + 100_005);
+        state["elapsed_ms"] = json!(100_005);
+        state["seq"] = json!(25);
+        lines.insert(24, market);
+        lines.insert(25, state);
+        lines[26]["seq"] = json!(26);
+        let (rows, _) = drive(&lines);
+        let decision = &rows.last().unwrap()["decision"];
+        for (field, ms) in [
+            ("identity_available_at", T0 + 100_001),
+            ("strike_available_at", T0 + 100_002),
+        ] {
+            let parsed = DateTime::parse_from_rfc3339(decision[field].as_str().unwrap()).unwrap();
+            assert_eq!(parsed.with_timezone(&Utc).timestamp_millis(), ms);
+        }
+    }
+
+    #[test]
+    fn a_conflicting_fixed_strike_stays_invalid() {
+        let mut lines = prefix();
+        let mut changed = lines[22].clone();
+        changed["event_id"] = json!("changed-strike");
+        changed["available_at_ms"] = json!(T0 + 100_004);
+        changed["elapsed_ms"] = json!(100_004);
+        changed["seq"] = json!(24);
+        changed["payload"]["start_price"] = json!(102.0);
+        lines.insert(24, changed);
+        lines[25]["seq"] = json!(25);
+        let (rows, _) = drive(&lines);
+        assert_eq!(rows[25]["decision"]["reason"], "MARKET_INVALID");
+        assert!(rows[25]["decision"]["candidate_id"].is_null());
+    }
+
+    #[test]
+    fn paused_and_unknown_results_cannot_offer_another_entry() {
+        let mut paused = prefix();
+        paused[22]["payload"]["paused"] = json!(true);
+        let (rows, _) = drive(&paused);
+        assert_eq!(rows[24]["candidate"], false);
+        assert_eq!(rows[24]["decision"]["reason"], "MARKET_INVALID");
+        let mut lines = prefix();
+        let (rows, _) = drive(&lines);
+        lines.push(envelope(
+            "unknown-result",
+            T0 + 102_000,
+            25,
+            json!({"type": "result", "market_id": 1,
+                "candidate_event_id": rows[24]["decision"]["candidate_id"],
+                "status": "unknown", "filled_shares": null, "detail": null}),
+        ));
+        lines.push(envelope(
+            "tick-again",
+            T0 + 103_000,
+            26,
+            json!({"type": "tick", "market_id": 1}),
+        ));
+        let (rows, summary) = drive(&lines);
+        assert_eq!(rows[26]["candidate"], false);
+        assert_eq!(rows[26]["entered_after"], false);
+        assert_eq!(rows[26]["reason"], "result_unknown");
+        assert_eq!(summary.candidate_count, 1);
+    }
+
+    #[test]
+    fn malformed_clock_and_duplicate_recursive_keys_are_refused() {
+        let value = prefix()[0].clone();
+        let first = value.to_string();
+        for field in [
+            "schema_version",
+            "price",
+            "received_at",
+            "source_at",
+            "model_source",
+            "type",
+        ] {
+            let needle = format!("\"{field}\":");
+            // Insert a duplicate before the existing value, without parsing it
+            // through Value (which would silently erase duplicate keys).
+            let original = value
+                .get(field)
+                .or_else(|| value["payload"].get(field))
+                .or_else(|| value["payload"]["clock"].get(field))
+                .unwrap();
+            let duplicate = first.replacen(&needle, &format!("{needle}{original},{needle}"), 1);
+            let mut output = Vec::new();
+            let error = run(
+                config_v2(),
+                ReplayMode::Replay,
+                T0,
+                T0 + ROUND,
+                std::io::Cursor::new(duplicate),
+                &mut output,
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code, EXIT_CONTRACT, "{field}");
+            assert!(output.is_empty());
+        }
+        let mut lines = prefix();
+        lines[0]["payload"]["clock"]["source_at"] = json!(i64::MAX);
+        refused(&lines, "json_invalid", 1);
+        let mut lines = prefix();
+        lines[0]["payload"]["clock"]["received_at"] = json!("2025-11-08T21:20:00Z");
+        refused(&lines, "value_invalid", 1);
+    }
+
+    /// Export the very same successful unit-test inputs for the real CLI.
+    /// Only synthetic fixtures are written, exclusively under this profile's TMPDIR.
+    #[test]
+    fn phase1_replay_cli_fixture() {
+        use std::io::Write;
+        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("profile scratch"));
+        let directory = root.join(format!("r2-replay-v2-cli-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let input: String = prefix().iter().map(|line| format!("{line}\n")).collect();
+        let files = [
+            ("config.json", serde_json::to_string(&config_v2()).unwrap()),
+            ("input.jsonl", input),
+        ];
+        for (name, content) in files {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(name))
+                .unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+        }
+        println!("REPLAY_V2_CLI_FIXTURE {}", directory.display());
+    }
+
+    #[test]
+    fn old_event_duplicates_are_ignored_before_elapsed_validation() {
+        let mut lines = prefix();
+        lines.push(lines[0].clone());
+        let (rows, summary) = drive(&lines);
+        assert_eq!(rows.len(), 25);
+        assert_eq!(summary.duplicate_count, 1);
+        assert_eq!(rows[24]["decision"]["samples"], 20);
+        lines[25]["payload"]["price"] = json!(123.0);
+        refused(&lines, "identity_invalid", 26);
+    }
+}
 
 const T0: i64 = 1_762_636_800_000; // 2025-11-08T21:20:00Z
 const ROUND: i64 = 300_000;
@@ -170,7 +628,11 @@ fn result_event(
 
 /// Run a stream and return the rows and the summary.
 fn drive(mode: ReplayMode, lines: &[String]) -> (Vec<OutputRow>, ReplaySummary) {
-    let input = if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" };
+    let input = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
     let mut output: Vec<u8> = Vec::new();
     let result = run(
         config(),
@@ -243,15 +705,21 @@ fn market_setup(at_ms: i64, first_seq: u64) -> Vec<String> {
 /// Cross-market ownership includes both token sides; restating an identity is legal.
 #[test]
 fn fr02_token_sets_must_be_disjoint() {
-    for (yes, no) in [("no-1", "no-2"), ("yes-2", "yes-1"),
-        ("yes-1", "no-2"), ("yes-2", "no-1"), ("same", "same")] {
+    for (yes, no) in [
+        ("no-1", "no-2"),
+        ("yes-2", "yes-1"),
+        ("yes-1", "no-2"),
+        ("yes-2", "no-1"),
+        ("same", "same"),
+    ] {
         let mut second: serde_json::Value =
             serde_json::from_str(&market_event("market-2", T0 + 1, 1, 2)).unwrap();
         second["payload"]["yes_token"] = yes.into();
         second["payload"]["no_token"] = no.into();
-        let failure = drive_failure(ReplayMode::Replay, &[
-            market_event("market-1", T0, 0, 1), second.to_string(),
-        ]);
+        let failure = drive_failure(
+            ReplayMode::Replay,
+            &[market_event("market-1", T0, 0, 1), second.to_string()],
+        );
         assert_eq!(failure.exit_code, EXIT_CONTRACT, "{yes}/{no}");
         assert_eq!(failure.line, 2);
         assert_eq!(failure.code, "identity_invalid");
@@ -260,11 +728,17 @@ fn fr02_token_sets_must_be_disjoint() {
         serde_json::from_str(&market_event("market-1", T0, 0, 1)).unwrap();
     restated["event_id"] = "market-1-restated".into();
     restated["seq"] = 2.into();
-    let (rows, summary) = drive(ReplayMode::Replay, &[
-        market_event("market-1", T0, 0, 1),
-        market_event("market-2", T0 + 1, 1, 2),
-        { restated["available_at_ms"] = (T0 + 2).into(); restated.to_string() },
-    ]);
+    let (rows, summary) = drive(
+        ReplayMode::Replay,
+        &[
+            market_event("market-1", T0, 0, 1),
+            market_event("market-2", T0 + 1, 1, 2),
+            {
+                restated["available_at_ms"] = (T0 + 2).into();
+                restated.to_string()
+            },
+        ],
+    );
     assert_eq!(rows.len(), 3);
     assert_eq!(summary.exit_code, 0);
     assert_eq!(rows[2].yes_token.as_deref(), Some("yes-1"));
@@ -412,9 +886,33 @@ fn identity_and_available_state() {
 #[test]
 fn tick_reasons_follow_the_frozen_priority() {
     let cases: Vec<(&str, bool, bool, bool, Option<f64>, Option<u32>, &str)> = vec![
-        ("closed", false, false, false, Some(100.0), Some(200), "closed"),
-        ("contested", true, true, false, Some(100.0), Some(200), "contested"),
-        ("paused", true, false, true, Some(100.0), Some(200), "paused"),
+        (
+            "closed",
+            false,
+            false,
+            false,
+            Some(100.0),
+            Some(200),
+            "closed",
+        ),
+        (
+            "contested",
+            true,
+            true,
+            false,
+            Some(100.0),
+            Some(200),
+            "contested",
+        ),
+        (
+            "paused",
+            true,
+            false,
+            true,
+            Some(100.0),
+            Some(200),
+            "paused",
+        ),
         (
             "no-start-price",
             true,
