@@ -576,7 +576,7 @@ impl super::State {
                 token: token.to_string(),
                 shares: 0.0,
                 cost: 0.0,
-                opened_at: Utc::now(),
+                opened_at: super::observer::paper_now(),
             });
         holding.shares += net_shares;
         holding.cost += cost;
@@ -1733,7 +1733,7 @@ impl super::Broker {
         market: &TradableMarket,
         yes_book: &BookSnapshot,
     ) {
-        let now = Utc::now();
+        let now = super::observer::paper_now();
         let mid = mid_of(yes_book);
         let Some(paper) = state.paper.as_mut() else {
             return;
@@ -2139,7 +2139,7 @@ fn prepare_event(
     }
     event.insert(
         "event_time".into(),
-        serde_json::json!(Utc::now().to_rfc3339()),
+        serde_json::json!(super::observer::paper_now().to_rfc3339()),
     );
     if let Some(phase1) = phase1 {
         event.insert(
@@ -2180,7 +2180,13 @@ fn prepare_event(
             bail!("DIAGNOSTIC_LIMIT");
         }
     }
-    if EVENT_PREFIX.len() + line.len() + 1 > 64 * 1024 {
+    // Only the aggregate final grows with the run; all ordinary events retain 64 KiB.
+    let limit = if kind == "final" && run.is_some_and(ControlledRun::is_paper72) {
+        1024 * 1024
+    } else {
+        64 * 1024
+    };
+    if EVENT_PREFIX.len() + line.len() + 1 > limit {
         bail!("DIAGNOSTIC_LIMIT");
     }
     Ok(PreparedEvent { event, line })

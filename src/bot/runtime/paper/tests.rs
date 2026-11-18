@@ -4,6 +4,146 @@ use crate::bot::runtime::tests::{limits, FakeVenue};
 use crate::config::{ControlledMode, StrategyLimits};
 use crate::service::venue::{LimitVenue, OrderVenue};
 
+/// Output-only capacity fixture: a seeded terminal inventory, not a backtest.
+#[test]
+fn paper72_terminal_sender_fixture() {
+    let Ok(start) = std::env::var("BTC5M_TEST_STARTED_AT") else {
+        return;
+    };
+    println!();
+    let end = std::env::var("BTC5M_TEST_DEADLINE_AT").unwrap();
+    let run = ControlledRun::from_arguments(
+        Some("unsigned-paper"),
+        Some("run-1"),
+        Some(&start),
+        Some(&end),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(run.is_paper72());
+    let broker = Broker::new(controlled_limits(), false, None, None)
+        .unwrap()
+        .with_controlled_paper(run, 100.0)
+        .unwrap()
+        .with_phase1(
+            Arc::new(crate::service::observation::SystemClock::new().unwrap()),
+            phase1::StrategyContract::Phase1NetShares,
+            0.03,
+            30.0,
+        )
+        .unwrap();
+    {
+        let mut state = broker.state.lock();
+        let paper = state.paper.as_mut().unwrap();
+        for index in 1..=865 {
+            let mut original = market(index);
+            original.yes_token = format!("{}{:04}", "1".repeat(74), 2 * index);
+            original.no_token = format!("{}0{:04}", "1".repeat(73), 2 * index + 1);
+            paper.traded.insert(index, original);
+            paper.settlements.insert(index, Settlement::Confirmed);
+            paper.applied_results.insert(index, (100.0, 101.0, 1.0));
+        }
+        // Keep one genuine terminal holding shape with unknown mark; do not drop it.
+        let token = paper.traded[&865].yes_token.clone();
+        paper.settlements.insert(865, Settlement::Pending);
+        paper.applied_results.remove(&865);
+        paper.cash = 98.0;
+        state.holdings.insert(
+            token.clone(),
+            Holding {
+                market_id: 865,
+                token,
+                shares: 3.0,
+                cost: 2.0,
+                opened_at: Utc::now(),
+            },
+        );
+    }
+    let before = broker.paper_snapshot().unwrap();
+    emit_final(&broker, false);
+    assert_eq!(before, broker.paper_snapshot().unwrap());
+    let event = recorded_events().last().unwrap().clone();
+    assert_eq!(event["source"]["markets"].as_array().unwrap().len(), 865);
+    assert!(serde_json::to_vec(&event).unwrap().len() > 64 * 1024);
+}
+
+#[test]
+fn paper72_terminal_capacity_is_bounded_and_kind_scoped() {
+    let start = Utc::now();
+    super::super::observer::freeze_paper_now(Some(start));
+    for seconds in [21_600, 259_200] {
+        let end = start + chrono::Duration::seconds(seconds);
+        let run = ControlledRun::from_arguments(
+            Some("unsigned-paper"),
+            Some("run-1"),
+            Some(&start.to_rfc3339()),
+            Some(&end.to_rfc3339()),
+        )
+        .unwrap()
+        .unwrap();
+        let limit = if seconds == 259_200 {
+            1024 * 1024
+        } else {
+            64 * 1024
+        };
+        let empty = prepare_event(
+            Some(&run),
+            "final",
+            None,
+            None,
+            None,
+            Some(serde_json::json!({"padding": ""})),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let width = EVENT_PREFIX.len() + empty.line.len() + 1;
+        let source = serde_json::json!({"padding": "x".repeat(limit - width)});
+        let before = run.elapsed();
+        assert!(prepare_event(
+            Some(&run),
+            "final",
+            None,
+            None,
+            None,
+            Some(source.clone()),
+            None,
+            None,
+            None
+        )
+        .is_ok());
+        assert!(prepare_event(
+            Some(&run),
+            "final",
+            None,
+            None,
+            None,
+            Some(serde_json::json!({"padding": "x".repeat(limit - width + 1)})),
+            None,
+            None,
+            None
+        )
+        .is_err());
+        if seconds == 259_200 {
+            assert!(prepare_event(
+                Some(&run),
+                "summary",
+                None,
+                None,
+                None,
+                Some(source),
+                None,
+                None,
+                None
+            )
+            .is_err());
+        }
+        assert!(run.elapsed() >= before && !run.stopped());
+    }
+    super::super::observer::freeze_paper_now(None);
+}
+
 // Each async test uses Tokio's current-thread runtime. Reset even after panic,
 // since the test clock and recorder are deliberately thread-local, not global.
 struct EventScope;

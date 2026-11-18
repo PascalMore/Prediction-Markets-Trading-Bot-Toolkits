@@ -637,6 +637,8 @@ pub struct ControlledRun {
 
 /// How long one controlled run may take, in seconds.
 pub const CONTROLLED_MAX_SECS: i64 = 21_600;
+/// The only extended budget, explicitly requested by an unsigned paper run.
+pub const CONTROLLED_PAPER72_SECS: i64 = 259_200;
 
 /// Whether a run id is a short public identifier.
 ///
@@ -662,8 +664,8 @@ impl ControlledRun {
     /// Build a controlled run from the launcher's public arguments.
     ///
     /// The four arguments belong together: a half-specified run is refused
-    /// rather than half assembled. The deadline must be exactly the start plus
-    /// the fixed budget, so it can't be lengthened from the outside.
+    /// rather than half assembled. The deadline selects exactly 6 hours, or
+    /// explicitly 72 hours for unsigned paper only; arbitrary extensions fail.
     pub fn from_arguments(
         mode: Option<&str>,
         run_id: Option<&str>,
@@ -693,7 +695,11 @@ impl ControlledRun {
         }
         let started_at = parse_utc(started_at.expect("the start is present"))?;
         let deadline_at = parse_utc(deadline_at.expect("the deadline is present"))?;
-        if deadline_at != started_at + chrono::Duration::seconds(CONTROLLED_MAX_SECS) {
+        let budget = deadline_at - started_at;
+        if budget != chrono::Duration::seconds(CONTROLLED_MAX_SECS)
+            && !(mode == ControlledMode::UnsignedPaper
+                && budget == chrono::Duration::seconds(CONTROLLED_PAPER72_SECS))
+        {
             bail!("CONTROLLED_MODE: the deadline must be the start plus the fixed budget");
         }
         Ok(Some(Self {
@@ -720,7 +726,14 @@ impl ControlledRun {
 
     /// Whether the run may still add risk.
     pub fn expired(&self) -> bool {
-        self.elapsed() >= CONTROLLED_MAX_SECS as f64
+        self.elapsed() >= (self.deadline_at - self.started_at).num_seconds() as f64
+    }
+
+    /// Whether output uses the explicitly selected unsigned 72-hour budget.
+    pub fn is_paper72(&self) -> bool {
+        self.mode == ControlledMode::UnsignedPaper
+            && self.deadline_at - self.started_at
+                == chrono::Duration::seconds(CONTROLLED_PAPER72_SECS)
     }
 
     /// Seconds since the run started, on the local monotonic clock.
@@ -1348,6 +1361,36 @@ mod tests {
             CONTROLLED_MAX_SECS
         );
         assert!(!run.stopped());
+    }
+
+    #[test]
+    fn paper72_selects_both_clocks_and_signed_refuses_extension() {
+        let start = Utc::now();
+        for mode in ["unsigned-paper", "signed-future-live"] {
+            for seconds in [0, 21_599, 21_600, 21_601, 259_199, 259_200, 259_201] {
+                let end = start + chrono::Duration::seconds(seconds);
+                let parsed = ControlledRun::from_arguments(
+                    Some(mode),
+                    Some("run-1"),
+                    Some(&start.to_rfc3339()),
+                    Some(&end.to_rfc3339()),
+                );
+                let accepted = seconds == CONTROLLED_MAX_SECS
+                    || (mode == "unsigned-paper" && seconds == CONTROLLED_PAPER72_SECS);
+                assert_eq!(parsed.is_ok(), accepted, "{mode}/{seconds}");
+                if let Ok(Some(mut run)) = parsed {
+                    assert!(!run.stopped());
+                    run.started_instant = Instant::now() - std::time::Duration::from_secs(21_601);
+                    assert_eq!(run.expired(), seconds == CONTROLLED_MAX_SECS);
+                    run.started_instant =
+                        Instant::now() - std::time::Duration::from_secs(seconds as u64);
+                    assert!(run.expired());
+                    run.started_instant = Instant::now();
+                    run.deadline_at = Utc::now() - chrono::Duration::seconds(1);
+                    assert!(run.past_deadline() && run.stopped());
+                }
+            }
+        }
     }
 }
 

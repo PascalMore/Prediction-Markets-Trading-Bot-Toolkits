@@ -42,9 +42,16 @@ STRATEGY_CONTRACT = "phase1_net_shares"
 MODE_UNSIGNED_PAPER = "unsigned-paper"
 MODE_SIGNED_FUTURE_LIVE = "signed-future-live"
 RUN_SECONDS = 21_600
+PAPER72_SECONDS = 259_200
+PAPER72_FINAL_BYTES = 1024 * 1024
+PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-18-btc5m-paper72-readiness/evidence/implement72/cargo-target/debug/polymarket-toolkits"
 CLEANUP_SECONDS = 30
 TAIL_SECONDS = 600
 MAX_LINE_BYTES = 64 * 1024
+# The observation channel's own bounds: a frame, and the number of frames the
+# launcher will read after the child is gone.
+MAX_OBSERVER_FRAME_BYTES = 64 * 1024
+MAX_OBSERVER_DRAIN = 64
 EVENT_PREFIX = "BTC5M_EVENT "
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # The single environment key the unsigned path may take from the fixed file.
@@ -105,6 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--predict-budget-confirmation")
     parser.add_argument("--predict-rpc-url")
+    parser.add_argument("--post-entry-observer", action="store_true")
+    parser.add_argument("--duration-hours", type=int, choices=(6, 72), default=6)
     return parser
 
 
@@ -362,9 +371,9 @@ def child_environment(environment: dict[str, str], api_key: str) -> dict[str, st
     return child
 
 
-def check_paths(config: Path) -> tuple[Path, Path]:
+def check_paths(config: Path, paper72: bool = False) -> tuple[Path, Path]:
     """Find the fixed child and refuse a credentials file that exists."""
-    binary = BOT / "target/debug/polymarket-toolkits"
+    binary = PAPER72_BINARY if paper72 else BOT / "target/debug/polymarket-toolkits"
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise Refused("CONTROLLED_MODE", "paths", "CHILD_PATH")
     credentials = BOT / "tools/predictfun/.keyring-no-credentials"
@@ -393,7 +402,7 @@ class Evidence:
         self.files.append(path)
 
 
-def public_identity(environment: dict[str, str]) -> dict[str, Any]:
+def public_identity(environment: dict[str, str], paper72: bool = False) -> dict[str, Any]:
     """Resolve fixed Git identities and actual public candidate bytes."""
     paths = ("src/config.rs", "src/main.rs", "src/bot/runtime.rs", "src/bot/runtime/paper.rs",
              "src/bot/arbitrage.rs", "src/bot/arbitrage/replay/driver.rs", "src/service/venue.rs",
@@ -405,6 +414,10 @@ def public_identity(environment: dict[str, str]) -> dict[str, Any]:
              "src/bot/arbitrage/phase1.rs", "src/bot/arbitrage/phase1/tests.rs",
              "src/bot/runtime/paper/tests.rs", "src/bot/arbitrage/replay.rs",
              "src/bot/arbitrage/replay/types.rs", "src/bot/arbitrage/replay/tests.rs",
+             "src/bot/arbitrage/observer.rs", "src/bot/arbitrage/observer/tests.rs",
+             "src/bot/runtime/observer.rs", "tools/predictfun/btc5m_observer.py",
+             "tools/predictfun/tests/test_btc5m_observer.py",
+             "tools/predictfun/tests/test_btc5m_paper72.py",
              "src/bin/btc_arb_replay.rs")
     root = BOT.parents[4]
     identity: dict[str, Any] = {}
@@ -417,8 +430,8 @@ def public_identity(environment: dict[str, str]) -> dict[str, Any]:
             if re.fullmatch("[0-9a-f]{40}", head) is None:
                 raise ValueError("HEAD")
             identity[f"{label}_head"] = head
-        identity["binary_sha256"] = hashlib.sha256(
-            (BOT / "target/debug/polymarket-toolkits").read_bytes()).hexdigest()
+        binary = PAPER72_BINARY if paper72 else BOT / "target/debug/polymarket-toolkits"
+        identity["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
         identity["files"] = {name: hashlib.sha256((BOT / name).read_bytes()).hexdigest()
                              for name in paths}
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -614,7 +627,7 @@ class _EventRelations:
         self.last_seq = event["event_seq"]
 
 
-def supervise(process, evidence, started_at, started_boot):
+def supervise(process, evidence, started_at, started_boot, observer=None, *, run_seconds=None):
     """Keep the sole control writer alive while draining both bounded streams."""
     facts = {"launcher_exit": 0, "child_returncode": None, "stop_reason": None,
              "forced_cleanup": False, "events": 0, "discarded": 0}
@@ -630,6 +643,20 @@ def supervise(process, evidence, started_at, started_boot):
     # they say which decision each event belongs to and whether that
     # decision has already reached its terminal event.
     relations = _EventRelations()
+    run_seconds = RUN_SECONDS if run_seconds is None else run_seconds
+    paper72 = evidence.mode == MODE_UNSIGNED_PAPER and run_seconds == PAPER72_SECONDS
+    line_limit = PAPER72_FINAL_BYTES if paper72 else MAX_LINE_BYTES
+    # The observation channel, when the run opted into it. It is read only
+    # after the original stream, and a failure in it never stops the run.
+    observer_socket = None
+    if observer is not None:
+        observer_socket = observer.get("socket")
+        if observer_socket is not None:
+            try:
+                os.set_blocking(observer_socket.fileno(), False)
+            except (OSError, ValueError):
+                observer["receiver"].store.reason("TRANSPORT_SETUP_FAILED")
+                observer_socket = None
 
     def stop(signum=None, _frame=None):
         nonlocal cleanup_at, final
@@ -644,6 +671,47 @@ def supervise(process, evidence, started_at, started_boot):
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
 
+    def drain_observer():
+        """Read at most one observation frame, after the trading stream.
+
+        The frame is validated and related before it is written; a frame that
+        fails is dropped and counted, never repaired and never retried.
+        """
+        if observer is None or observer_socket is None:
+            return
+        receiver = observer.get("receiver")
+        if receiver is None:
+            return
+        try:
+            chunk = observer_socket.recv(observer["max_bytes"] + 1)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            receiver.store.reason("INVALID_FRAME")
+            return
+        if not chunk:
+            return
+        if len(chunk) > observer["max_bytes"]:
+            receiver.store.reason("TRUNCATED_OUTPUT")
+            return
+        if not chunk.endswith(b"\n") or b"\n" in chunk[:-1] or b"\r" in chunk:
+            receiver.store.reason("INVALID_FRAME")
+            return
+        try:
+            frame = json.loads(chunk.decode("utf-8"),
+                               object_pairs_hook=_unique_object,
+                               parse_constant=_reject_constant)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            receiver.store.reason("INVALID_FRAME")
+            return
+        if not isinstance(frame, dict):
+            receiver.store.reason("INVALID_FRAME")
+            return
+        try:
+            receiver.receive(frame, len(chunk))
+        except Exception:
+            receiver.store.reason("INVALID_FRAME")
+
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             old_signals[signum] = signal.signal(signum, stop)
@@ -655,7 +723,7 @@ def supervise(process, evidence, started_at, started_boot):
             while selector.get_map() or process.poll() is None:
                 elapsed = max(boottime() - started_boot,
                               (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds())
-                if not deadline_sent and elapsed >= RUN_SECONDS and cleanup_at is None:
+                if not deadline_sent and elapsed >= run_seconds and cleanup_at is None:
                     deadline_sent = True
                     facts["stop_reason"] = "DEADLINE"
                     process.stdin.write(b"D")
@@ -679,7 +747,9 @@ def supervise(process, evidence, started_at, started_boot):
                     for fragment in chunk.splitlines(keepends=True):
                         if stream not in dropping:
                             buffers[stream].extend(fragment)
-                            if len(buffers[stream]) > MAX_LINE_BYTES:
+                            limit = (line_limit if stream is process.stdout
+                                     and buffers[stream].startswith(EVENT_PREFIX.encode()) else MAX_LINE_BYTES)
+                            if len(buffers[stream]) > limit:
                                 dropping.add(stream)
                                 buffers[stream].clear()
                                 stop()
@@ -696,6 +766,8 @@ def supervise(process, evidence, started_at, started_boot):
                                 if facts["stop_reason"] == "OUTPUT_INVALID":
                                     raise ValueError("OUTPUT_INVALID")
                                 event = validate_event(raw[len(EVENT_PREFIX):], evidence.run_id, evidence.mode)
+                                if len(raw) > MAX_LINE_BYTES and not (paper72 and event["event_kind"] == "final"):
+                                    raise ValueError("OUTPUT_INVALID")
                                 if event["event_kind"] == "final" and event["source"]["cleanup_timed_out"]:
                                     facts["launcher_exit"] = 1
                                 if final is not None:
@@ -725,8 +797,18 @@ def supervise(process, evidence, started_at, started_boot):
                                 events.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
                                 events.flush()
                                 facts["events"] += 1
+                                # The observation is related to the evidence that
+                                # has just been written, and only then.
+                                if observer is not None and observer.get("receiver") is not None:
+                                    try:
+                                        observer["receiver"].note_trade_event(event)
+                                    except Exception:
+                                        observer["receiver"].store.reason("RELATION_INVALID")
                             except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
                                 stop()
+                # The trading stream has had its turn; the observation may now
+                # be read, at most one frame per turn.
+                drain_observer()
                 # A dead child must not keep the parent waiting for unrelated inherited output FDs.
                 if process.poll() is not None and cleanup_at is None:
                     cleanup_at = boottime() + CLEANUP_SECONDS
@@ -754,6 +836,17 @@ def supervise(process, evidence, started_at, started_boot):
         selector.close()
         for signum, handler in old_signals.items():
             signal.signal(signum, handler)
+        # A bounded drain of the observation channel: the frames that are
+        # already there, and nothing more.
+        if observer is not None and observer.get("receiver") is not None:
+            for _ in range(MAX_OBSERVER_DRAIN):
+                if boottime() >= cleanup_at:
+                    break
+                drain_observer()
+            try:
+                observer["receiver"].finish()
+            except Exception:
+                observer["receiver"].store.reason("WRITE_FAILED")
     if process.returncode != 0 or final is None:
         facts["launcher_exit"] = facts["launcher_exit"] or 1
     facts["elapsed_secs"] = boottime() - started_boot
@@ -1479,8 +1572,16 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
     if RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise Refused("CONTROLLED_MODE", "args", "RUN_ID")
     unsigned = args.mode == MODE_UNSIGNED_PAPER
+    paper72 = args.duration_hours == 72
+    if paper72 and not unsigned:
+        raise Refused("CONTROLLED_MODE", "args", "DURATION_REFUSED")
+    run_seconds = PAPER72_SECONDS if paper72 else RUN_SECONDS
     if unsigned and (args.predict_budget_confirmation is not None or args.predict_rpc_url is not None):
         raise Refused("CONTROLLED_MODE", "args", "LIVE_OPTION_REFUSED")
+    # The post-entry observer is an unsigned-paper opt-in only: a signed run
+    # has no position that may be read.
+    if not unsigned and args.post_entry_observer:
+        raise Refused("CONTROLLED_MODE", "args", "OBSERVER_REFUSED")
     if not unsigned:
         from urllib.parse import urlsplit
         expected = f"56:{local_signer.TRADING_ADDRESS.lower()}:predict-account"
@@ -1499,9 +1600,9 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
             api_key = local_signer._api_source(environment)
         except Failure:
             raise Refused("ENV_CONFLICT", "env", "ENV_CONFLICT") from None
-    _config, binary = check_paths(Path(args.config))
-    identity = public_identity(environment)
-    deadline_at = started_at + datetime.timedelta(seconds=RUN_SECONDS)
+    _config, binary = check_paths(Path(args.config), True) if paper72 else check_paths(Path(args.config))
+    identity = public_identity(environment, True) if paper72 else public_identity(environment)
+    deadline_at = started_at + datetime.timedelta(seconds=run_seconds)
     started_text = started_at.isoformat().replace("+00:00", "Z")
     deadline_text = deadline_at.isoformat().replace("+00:00", "Z")
     date = started_at.astimezone(datetime.timezone(datetime.timedelta(hours=8))).date().isoformat()
@@ -1515,9 +1616,40 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
     facts = {"launcher_exit": 1, "child_returncode": None, "stop_reason": "STARTUP_FAILED",
              "forced_cleanup": False}
     final = None
+    observer = None
+    parent_socket = None
+    child_socket = None
+    observer_module = None
     try:
         if not unsigned:
             child_env = local_signer.build_child_env(local_signer._read_owned(), environment)
+        if args.post_entry_observer:
+            import btc5m_observer as observer_module
+            store = observer_module.ObservationStore(args.run_id, evidence.directory)
+            terminal_bytes = observer_module.PAPER72_END_BYTES if paper72 else MAX_OBSERVER_FRAME_BYTES
+            receiver = observer_module.ObserverReceiver(store, observer_module.TradeIndex(), terminal_bytes)
+            observer = {
+                "socket": None,
+                "receiver": receiver,
+                "run_id": args.run_id,
+                "wire_version": observer_module.WIRE_VERSION,
+                "max_bytes": terminal_bytes,
+            }
+            try:
+                store.open()
+                parent_socket, child_socket = observer_module.create_socketpair()
+                if paper72:
+                    child_socket.setsockopt(observer_module.socket.SOL_SOCKET,
+                                            observer_module.socket.SO_SNDBUF, terminal_bytes)
+                    child_env[observer_module.PAPER72_ENV] = str(PAPER72_SECONDS)
+                parent_socket.setblocking(False)
+                child_socket.setblocking(False)
+                os.set_inheritable(child_socket.fileno(), True)
+                observer["socket"] = parent_socket
+            except (OSError, ValueError):
+                store.reason("TRANSPORT_SETUP_FAILED")
+                observer_module.close_channel(parent_socket, child_socket, store)
+                parent_socket = child_socket = None
         command = child_arguments(binary, evidence.directory / "public-config.json", args.run_id,
                                   started_text, deadline_text)
         command[command.index("--controlled-mode") + 1] = args.mode
@@ -1525,15 +1657,35 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
             command[1:1] = ["--predict-budget-confirmation", args.predict_budget_confirmation,
                             "--predict-rpc-url", args.predict_rpc_url]
         if max(boottime() - started_boot,
-               (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds()) >= RUN_SECONDS:
+               (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds()) >= run_seconds:
             facts["stop_reason"] = "DEADLINE"
         else:
+            pass_fds = ()
+            if child_socket is not None and observer_module is not None:
+                # The child gets this one descriptor and nothing else: the
+                # parent environment is never inherited wholesale.
+                child_env.update(observer_module.child_fd_environment(child_socket.fileno()))
+                pass_fds = (child_socket.fileno(),)
             process = popen(command, cwd=BOT, env=child_env, shell=False, close_fds=True,
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            facts, final = supervise(process, evidence, started_at, started_boot)
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            pass_fds=pass_fds)
+            # The parent's own end of the channel is closed before the run
+            # starts: only the child writes to it.
+            if child_socket is not None:
+                observer_module.close_channel(child_socket, None, store)
+                child_socket = None
+            facts, final = supervise(process, evidence, started_at, started_boot, observer,
+                                     run_seconds=run_seconds)
     except (Exception, KeyboardInterrupt):
         facts["launcher_exit"] = 1
     finally:
+        if observer is not None and observer_module is not None:
+            observer_module.close_channel(child_socket, parent_socket, store)
+            store.close()
+            try:
+                observer_module.write_coverage(evidence.directory, store)
+            except Exception:
+                store.reason("COVERAGE_WRITE_FAILED")
         ended: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION if not unsigned else SCHEMA_VERSION_V2,
             "run_id": args.run_id, "exit_facts": facts,

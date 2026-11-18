@@ -15,12 +15,14 @@
 //! paper: the feeds differ by enough to swamp a small edge.
 
 pub mod history;
+pub mod observer;
 pub mod phase1;
+pub mod phase1_history;
 pub mod replay;
 
 use crate::bot::quoting::Known;
 use crate::bot::runtime::{drive, shares_for, Ctx, Strategy, TakeResult};
-use crate::config::{AppConfig, BtcArbConfig};
+use crate::config::{AppConfig, BtcArbConfig, ControlledMode};
 use crate::models::{BookSnapshot, Side};
 use crate::service::observation::{Clock, ObservedBook, ObservedSpot};
 use crate::service::spot::{digital_up, EwmaVol, SpotFeed, SpotQuote, SpotSource};
@@ -28,11 +30,12 @@ use crate::service::venue::TradableMarket;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use observer::{PostEntryObserver, TickClock};
 use phase1::StrategyContract;
 
 const VOL_HALF_LIFE_SECS: f64 = 300.0;
@@ -52,7 +55,12 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         known: Known::default(),
         rounds: Vec::new(),
         last_scan: None,
+        observer: None,
         availability: HashMap::new(),
+        #[cfg(test)]
+        observed_quote: None,
+        #[cfg(test)]
+        observed_symbols: Vec::new(),
         #[cfg(test)]
         inputs: None,
         #[cfg(test)]
@@ -63,7 +71,35 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     if ctx.broker.is_phase1() {
         bot.core = DecisionCore::phase1(bot.cfg.clone());
     }
-    drive(&mut bot, &ctx).await
+    // The post-entry observer is a read-only aside: it is only attached to the
+    // unsigned controlled run, and only when the launcher handed it a usable
+    // channel. Everything else runs exactly as it did before.
+    if let Some(observer) = attach_observer(&ctx) {
+        bot.observer = Some(observer);
+    }
+    let result = drive(&mut bot, &ctx).await;
+    if let Some(observer) = bot.observer.as_mut() {
+        observer.finish_with_snapshot(&ctx.broker.post_entry_snapshot());
+    }
+    result
+}
+
+/// The observer this run may use, when the run is allowed to have one.
+///
+/// A live run, a signed run, a history run and a replay have none: the
+/// observer reads a live position, and only the unsigned controlled run has
+/// one that may be read.
+fn attach_observer(ctx: &Ctx) -> Option<PostEntryObserver> {
+    if ctx.broker.is_live() || !ctx.broker.is_phase1() {
+        return None;
+    }
+    let run = ctx.broker.controlled_run()?;
+    if run.mode != ControlledMode::UnsignedPaper {
+        return None;
+    }
+    let paper = ctx.cfg.controlled_paper.as_ref()?;
+    let confirmed = paper.fee_model == crate::bot::runtime::paper::FEE_MODEL_NET_SHARES;
+    PostEntryObserver::attach(&run.run_id, confirmed)
 }
 
 struct RoundTaker {
@@ -74,6 +110,12 @@ struct RoundTaker {
     known: Known,
     rounds: Vec<TradableMarket>,
     last_scan: Option<Instant>,
+    /// The read-only post-entry observer, when the run opted into it.
+    observer: Option<PostEntryObserver>,
+    #[cfg(test)]
+    observed_quote: Option<Result<ObservedSpot, &'static str>>,
+    #[cfg(test)]
+    observed_symbols: Vec<String>,
 
     /// When each round's official identity and strike became locally
     /// available. The first valid reading is frozen: a later poll cannot
@@ -303,6 +345,32 @@ impl RoundTaker {
         self.spot.quote(symbol).await
     }
 
+    async fn read_observed_quote(
+        &mut self,
+        symbol: &str,
+        clock: &dyn Clock,
+    ) -> Result<ObservedSpot> {
+        #[cfg(test)]
+        if let Some(result) = &self.observed_quote {
+            assert_eq!(symbol, "BTCUSDT", "UNDECLARED_QUOTE_REQUEST");
+            self.observed_symbols.push(symbol.to_string());
+            let request = clock.now()?;
+            let mut quote = result.clone().map_err(anyhow::Error::msg)?;
+            let receive = clock.now()?;
+            quote.clock = crate::service::observation::ObservationClock {
+                source_at: None,
+                source_time_status: crate::service::observation::SourceTimeStatus::Missing,
+                freshness_basis: crate::service::observation::FreshnessBasis::ReceiptBound,
+                request_at: request.utc,
+                received_at: receive.utc,
+                request_elapsed_ms: request.elapsed_ms,
+                received_elapsed_ms: receive.elapsed_ms,
+            };
+            return Ok(quote);
+        }
+        self.spot.quote_observed(symbol, clock).await
+    }
+
     /// Apply the configured symbol and optional cadence together on every rescan.
     fn select_rounds(&mut self, rounds: Vec<TradableMarket>, now: DateTime<Utc>) {
         self.rounds = rounds
@@ -344,13 +412,34 @@ impl Strategy for RoundTaker {
                     // pretending cached facts supplied a new quote or book.
                     if self.core.contract() == StrategyContract::Phase1NetShares {
                         if let Some(clock) = ctx.broker.phase1_clock() {
-                            self.trade_phase1(
-                                ctx.broker.as_ref(),
+                            let eligibility = if self.observer.is_some() {
+                                self.eligibility(ctx)
+                            } else {
+                                Vec::new()
+                            };
+                            let proxy = TickClock::new(clock.clone());
+                            let clock: &dyn Clock = if self.observer.is_some() {
+                                &proxy
+                            } else {
+                                clock.as_ref()
+                            };
+                            let result = self
+                                .trade_phase1(
+                                    ctx.broker.as_ref(),
+                                    &HashMap::new(),
+                                    &HashMap::new(),
+                                    clock,
+                                )
+                                .await;
+                            self.observe_after_trade(
+                                ctx,
+                                &eligibility,
                                 &HashMap::new(),
                                 &HashMap::new(),
-                                clock.as_ref(),
-                            )
-                            .await?;
+                                proxy.last(),
+                                &Default::default(),
+                            );
+                            result?;
                         }
                     }
                     return Err(error);
@@ -400,59 +489,144 @@ impl RoundTaker {
         let Some(clock) = ctx.broker.phase1_clock() else {
             anyhow::bail!("CONTROLLED_MODE: the phase1 run has no clock");
         };
-        // The official facts were read by the rescan above: the moment a
-        // round's identity or strike was first had is frozen here, once.
-        let scan_at = clock.now()?;
-        for market in &self.rounds {
-            self.availability
-                .entry(market.id)
-                .or_default()
-                .record(market, scan_at.utc);
-        }
+        // The observer reads the run's own clock through a proxy that only
+        // remembers what it read. The proxy forwards every call unchanged, so
+        // the number and order of the clock's calls do not move.
+        let proxy = TickClock::new(clock.clone());
+        let clock: &dyn Clock = match self.observer.as_ref() {
+            Some(_) => &proxy,
+            None => clock.as_ref(),
+        };
+        // The eligibility of this tick: the positions that existed before it
+        // began. A fill made during this tick is first observed on the next
+        // one, so a new position never appears in the trade that opened it.
+        let eligibility = if self.observer.is_some() {
+            self.eligibility(ctx)
+        } else {
+            Vec::new()
+        };
         let mut failed = false;
         let mut quotes: HashMap<String, ObservedSpot> = HashMap::new();
-        for symbol in self.cfg.symbols.clone() {
-            let quote = match self.spot.quote_observed(&symbol, clock.as_ref()).await {
-                Ok(quote) => quote,
+        let mut books = HashMap::new();
+        let mut accepted = std::collections::HashSet::new();
+        let result = async {
+            // Preserve the original calls and error propagation, including early
+            // clock errors; the outer hook counts their observation gap.
+            let scan_at = clock.now()?;
+            for market in &self.rounds {
+                self.availability
+                    .entry(market.id)
+                    .or_default()
+                    .record(market, scan_at.utc);
+            }
+            for symbol in self.cfg.symbols.clone() {
+                let quote = match self.read_observed_quote(&symbol, clock).await {
+                    Ok(quote) => quote,
+                    Err(_) => {
+                        failed = true;
+                        continue;
+                    }
+                };
+                {
+                    let core = &mut self.core;
+                    let now = clock.now()?;
+                    if let Err(reason) = core.observe_phase1(
+                        &symbol,
+                        quote.price,
+                        quote.source,
+                        &quote.actual_pair,
+                        &quote.clock,
+                        now,
+                    ) {
+                        debug!(symbol = %symbol, ?reason, "phase1 observation refused");
+                    } else {
+                        accepted.insert(symbol.clone());
+                    }
+                }
+                quotes.insert(symbol, quote);
+            }
+
+            books = match self.known.observe_with_clock(ctx, &ids, clock).await {
+                Ok(books) => books,
                 Err(_) => {
                     failed = true;
-                    continue;
+                    HashMap::new()
                 }
             };
-            {
-                let core = &mut self.core;
-                let now = clock.now()?;
-                if let Err(reason) = core.observe_phase1(
-                    &symbol,
-                    quote.price,
-                    quote.source,
-                    &quote.actual_pair,
-                    &quote.clock,
-                    now,
-                ) {
-                    debug!(symbol = %symbol, ?reason, "phase1 observation refused");
-                }
+            self.trade_phase1(ctx.broker.as_ref(), &quotes, &books, clock)
+                .await?;
+            if failed {
+                anyhow::bail!("DATA_INCOMPLETE");
             }
-            quotes.insert(symbol, quote);
+            Ok(())
         }
+        .await;
+        // One post-trade hook for every path, never between candidate and fill.
+        self.observe_after_trade(ctx, &eligibility, &quotes, &books, proxy.last(), &accepted);
+        result
+    }
+}
 
-        let books = match self
-            .known
-            .observe_with_clock(ctx, &ids, clock.as_ref())
-            .await
-        {
-            Ok(books) => books,
-            Err(_) => {
-                failed = true;
-                HashMap::new()
-            }
+impl RoundTaker {
+    /// The tokens this run held before the tick began.
+    fn eligibility(&self, ctx: &Ctx) -> Vec<String> {
+        let snapshot = ctx.broker.post_entry_snapshot();
+        snapshot.tokens()
+    }
+
+    /// Report this tick's positions, when the run observes.
+    ///
+    /// A failure to observe is a failure to observe: it never changes the
+    /// tick's own result.
+    fn observe_after_trade(
+        &mut self,
+        ctx: &Ctx,
+        eligibility: &[String],
+        quotes: &HashMap<String, ObservedSpot>,
+        books: &HashMap<u64, ObservedBook>,
+        now: Option<crate::service::observation::CheckTime>,
+        accepted: &std::collections::HashSet<String>,
+    ) {
+        let Some(observer) = self.observer.as_mut() else {
+            return;
         };
-        self.trade_phase1(ctx.broker.as_ref(), &quotes, &books, clock.as_ref())
-            .await?;
-        if failed {
-            anyhow::bail!("DATA_INCOMPLETE");
-        }
-        Ok(())
+        let snapshot = ctx.broker.post_entry_snapshot();
+        let markets: BTreeMap<u64, TradableMarket> = snapshot
+            .traded
+            .iter()
+            .map(|(market_id, original)| {
+                let mut market = original.clone();
+                market.contested |= self.availability.get(market_id).is_some_and(|a| a.conflict)
+                    || self.known.get(*market_id).is_none_or(|known| {
+                        known.yes_token != original.yes_token
+                            || known.no_token != original.no_token
+                            || known.starts_at != original.starts_at
+                            || known.ends_at != original.ends_at
+                            || known.start_price != original.start_price
+                            || known.contested
+                            || !known.open
+                    });
+                (*market_id, market)
+            })
+            .collect();
+        let availability: BTreeMap<u64, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = self
+            .availability
+            .iter()
+            .map(|(market_id, available)| {
+                (*market_id, (available.identity_at, available.strike_at))
+            })
+            .collect();
+        observer.after_tick(
+            &self.core,
+            &snapshot,
+            eligibility,
+            now,
+            quotes,
+            books,
+            &markets,
+            &availability,
+            accepted,
+        );
     }
 }
 
@@ -748,7 +922,10 @@ mod tests {
             known: Known::default(),
             rounds: Vec::new(),
             last_scan: None,
+            observer: None,
             availability: HashMap::new(),
+            observed_quote: None,
+            observed_symbols: Vec::new(),
             #[cfg(test)]
             inputs: None,
             #[cfg(test)]

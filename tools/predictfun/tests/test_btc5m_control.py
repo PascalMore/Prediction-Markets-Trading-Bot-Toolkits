@@ -955,7 +955,7 @@ class RustProtocolTest(unittest.TestCase):
     def _assert_parent_loss(self, mode):
         import select
         import time
-        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib", "--no-run",
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--target-dir", os.environ["CARGO_TARGET_DIR"], "--lib", "--no-run",
                                  "--message-format=json"], cwd=control.BOT, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         artifacts = [json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")]
@@ -988,7 +988,7 @@ class RustProtocolTest(unittest.TestCase):
             self.assertFalse(events[0]["accounting"]["loss_latched"])
 
     def test_signed_rust_final_is_unknown_not_a_paper_balance(self):
-        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib",
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--target-dir", os.environ["CARGO_TARGET_DIR"], "--lib",
                                  "bot::runtime::paper::tests::signed_ctx_uses_original_factory_and_identity_bound_budget_gate",
                                  "--", "--exact", "--nocapture"], cwd=control.BOT, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
@@ -1002,7 +1002,7 @@ class RustProtocolTest(unittest.TestCase):
                 control.validate_event(line[len(control.EVENT_PREFIX):], "signed-test", "unsigned-paper")
 
     def test_extended_rust_streams_validate_before_first_write(self):
-        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib",
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--target-dir", os.environ["CARGO_TARGET_DIR"], "--lib",
                                  "bot::runtime::paper::tests::extended_protocol_consumer_fixture",
                                  "--", "--exact", "--nocapture"],
                                 cwd=control.BOT, capture_output=True, timeout=120)
@@ -1124,7 +1124,7 @@ class RustProtocolTest(unittest.TestCase):
                         self.assertEqual(len(writes), index)
 
     def test_real_rust_events_reconcile_before_first_write(self):
-        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib",
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--target-dir", os.environ["CARGO_TARGET_DIR"], "--lib",
                                  "bot::runtime::paper::tests::protocol_consumer_fixture", "--",
                                  "--exact", "--nocapture"], cwd=control.BOT, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
@@ -1237,7 +1237,7 @@ class Phase1ProtocolTest(LauncherFixture):
 
     @classmethod
     def setUpClass(cls):
-        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--lib",
+        result = subprocess.run(["cargo", "test", "--offline", "--locked", "--target-dir", os.environ["CARGO_TARGET_DIR"], "--lib",
             "bot::arbitrage::phase1::tests::phase1_protocol_consumer_fixture",
             "--", "--exact", "--nocapture"], cwd=control.BOT, capture_output=True, timeout=120)
         if result.returncode or b"1 passed" not in result.stdout:
@@ -1506,6 +1506,10 @@ class IdentityTest(unittest.TestCase):
                      "src/bot/arbitrage/phase1.rs", "src/bot/arbitrage/phase1/tests.rs",
                      "src/bot/runtime/paper/tests.rs", "src/bot/arbitrage/replay.rs",
                      "src/bot/arbitrage/replay/types.rs", "src/bot/arbitrage/replay/tests.rs",
+                     "src/bot/arbitrage/observer.rs", "src/bot/arbitrage/observer/tests.rs",
+                     "src/bot/runtime/observer.rs", "tools/predictfun/btc5m_observer.py",
+                     "tools/predictfun/tests/test_btc5m_observer.py",
+                     "tools/predictfun/tests/test_btc5m_paper72.py",
                      "src/bin/btc_arb_replay.rs",
                      "target/debug/polymarket-toolkits")
             for name in names:

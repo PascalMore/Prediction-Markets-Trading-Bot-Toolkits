@@ -463,6 +463,44 @@ pub(super) struct SymbolState {
     revision: Arc<AtomicU64>,
 }
 
+/// Pure model output; no book, fees, candidate or order state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Phase1ModelValue {
+    pub samples: u32,
+    pub sigma_raw: f64,
+    pub sigma: f64,
+    pub p_up: f64,
+}
+
+/// The read-only state of one symbol's current epoch.
+///
+/// The observer needs to know whether the quote it is looking at is the one
+/// the core accepted, and whether that epoch is warm. This is a copy of facts
+/// the core already holds: it observes nothing, refreshes nothing and
+/// changes nothing.
+#[derive(Debug, Clone)]
+pub struct Phase1ObservationState {
+    /// The source the current epoch belongs to.
+    pub key: Option<SourceKey>,
+    /// The receipt of the last accepted observation.
+    pub last_receive: Option<(DateTime<Utc>, u64)>,
+    pub last_source: Option<DateTime<Utc>>,
+    pub last_check: Option<CheckTime>,
+    pub floor: f64,
+    /// The current epoch, when the symbol has one.
+    pub epoch: Option<u64>,
+    /// Why the current epoch started.
+    pub reset_reason: ResetReason,
+    /// The returns the current epoch holds.
+    pub samples: u32,
+    /// The volatility before the floor.
+    pub sigma_raw: f64,
+    /// The volatility after the floor.
+    pub sigma: f64,
+    /// The revision of the current inputs.
+    pub revision: u64,
+}
+
 /// The phase1 state of the shared decision core.
 ///
 /// It lives beside the legacy volatility state: the core keeps one contract,
@@ -500,6 +538,44 @@ impl super::DecisionCore {
     /// The volatility of a symbol's current epoch.
     pub fn phase1_sigma(&self, symbol: &str, floor: f64) -> Option<f64> {
         self.symbols.get(symbol).map(|state| state.vol.vol(floor))
+    }
+
+    /// Value the active phase1 estimate without touching trading state.
+    pub(crate) fn phase1_valuation(
+        &self, symbol: &str, spot: f64, strike: f64, secs_left: f64, floor: f64,
+    ) -> Result<Phase1ModelValue, Reason> {
+        let samples = self.samples(symbol);
+        if samples < MIN_VOL_SAMPLES {
+            return Err(Reason::Warmup);
+        }
+        let sigma = self.phase1_sigma(symbol, floor).unwrap_or(0.0);
+        if !sigma.is_finite() || sigma <= 0.0 {
+            return Err(Reason::Warmup);
+        }
+        let p_up = digital_up(spot, strike, sigma, secs_left);
+        if !p_up.is_finite() || !(0.0..=1.0).contains(&p_up) {
+            return Err(Reason::InputInvalid);
+        }
+        Ok(Phase1ModelValue { samples,
+            sigma_raw: self.phase1_sigma(symbol, 0.0).unwrap_or(0.0), sigma, p_up })
+    }
+
+    /// The current epoch's state of `symbol`, read without touching it.
+    pub fn phase1_observation_state(&self, symbol: &str) -> Phase1ObservationState {
+        let state = self.symbols.get(symbol);
+        Phase1ObservationState {
+            key: state.and_then(|state| state.key.clone()),
+            last_receive: state.and_then(|state| state.last_receive),
+            last_source: state.and_then(|state| state.last_source),
+            last_check: self.last_phase1_check,
+            floor: self.floor(0.0),
+            epoch: state.map(|state| state.epoch),
+            reset_reason: state.map_or(ResetReason::None, |state| state.reset_reason),
+            samples: state.map_or(0, |state| state.vol.samples()),
+            sigma_raw: state.map_or(0.0, |state| state.vol.vol(0.0)),
+            sigma: state.map_or(0.0, |state| state.vol.vol(self.floor(0.0))),
+            revision: state.map_or(0, |state| state.revision.load(Ordering::SeqCst)),
+        }
     }
 
     /// The epoch of a symbol.
@@ -910,32 +986,22 @@ impl super::DecisionCore {
                 candidate: None,
             };
         }
-        if diagnostic.samples < MIN_VOL_SAMPLES {
-            diagnostic.reason = Reason::Warmup;
-            return Phase1Evaluation {
-                diagnostic,
-                candidate: None,
-            };
-        }
-        let sigma = self
-            .phase1_sigma(&symbol, self.floor(inputs.min_edge))
-            .unwrap_or(0.0);
-        if !sigma.is_finite() || sigma <= 0.0 {
-            diagnostic.reason = Reason::Warmup;
-            return Phase1Evaluation {
-                diagnostic,
-                candidate: None,
-            };
-        }
+        let model = match self.phase1_valuation(
+            &symbol, inputs.spot_price, strike, secs_left, self.floor(inputs.min_edge),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                // Preserve the old diagnostic, including sigma on invalid p.
+                if reason == Reason::InputInvalid {
+                    diagnostic.sigma = self.phase1_sigma(&symbol, self.floor(inputs.min_edge));
+                }
+                diagnostic.reason = reason;
+                return Phase1Evaluation { diagnostic, candidate: None };
+            }
+        };
+        let p_up = model.p_up;
+        let sigma = model.sigma;
         diagnostic.sigma = Some(sigma);
-        let p_up = digital_up(inputs.spot_price, strike, sigma, secs_left);
-        if !p_up.is_finite() || !(0.0..=1.0).contains(&p_up) {
-            diagnostic.reason = Reason::InputInvalid;
-            return Phase1Evaluation {
-                diagnostic,
-                candidate: None,
-            };
-        }
         diagnostic.p_up = Some(p_up);
 
         let up = self.side(inputs, Side::Buy, Some(p_up));

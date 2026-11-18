@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 pub mod live;
+pub mod observer;
 pub mod paper;
 
 pub use paper::{PaperCash, PaperSnapshot, Settlement, EVENT_PREFIX};
