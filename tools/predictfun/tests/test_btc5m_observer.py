@@ -5,6 +5,7 @@ channels, and that a broken observation never changes the trading evidence.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import socket
@@ -21,6 +22,30 @@ import btc5m_observer as observer  # noqa: E402
 
 
 RUN_ID = "observer-test"
+
+
+def wire_millis(moment):
+    """One instant on the wire's own millisecond basis.
+
+    A fill carries nanoseconds and an observation carries milliseconds, so
+    the two are only comparable on the millisecond each one falls in. The
+    bucket is floored, never rounded, and never widened into a tolerance.
+    """
+    return moment.replace(microsecond=(moment.microsecond // 1000) * 1000)
+
+
+def same_second_other_millisecond(moment):
+    """An instant in the same second but in another millisecond bucket.
+
+    It is the negative control for the millisecond comparison: a second
+    level comparison accepts it, a millisecond level comparison must not.
+    """
+    base = wire_millis(moment)
+    for offset in (1, -1):
+        candidate = base + datetime.timedelta(milliseconds=offset)
+        if candidate.second == base.second:
+            return candidate
+    raise AssertionError("the second has no other millisecond")
 
 
 def clock(received="2026-11-18T00:00:01.000Z", request="2026-11-18T00:00:00.000Z"):
@@ -306,7 +331,7 @@ class ReaderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = observer.ObservationStore(RUN_ID, Path(directory))
             store.open()
-            store.write(record())
+            store.write(record(), 1)
             store.close()
             store.ready_received = True
             store.end_received = True
@@ -320,11 +345,78 @@ class ReaderTest(unittest.TestCase):
     def test_the_reader_rejects_a_broken_line(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / observer.OBSERVATIONS_FILE
-            path.write_text(json.dumps(record()) + "\n" + "{not json}\n")
+            path.write_text(json.dumps(observer.sample_envelope(record(), 1, RUN_ID)) + "\n"
+                            + "{not json}\n")
             result = observer.read_observations(Path(directory))
             self.assertEqual(result["status"], "INCOMPLETE")
             self.assertEqual(len(result["records"]), 0)
             self.assertIn("INVALID_FRAME", result["reasons"])
+
+    def test_a_legacy_flat_only_line_has_no_causal_watermark(self):
+        """A legacy line cannot prove its own as-of relation.
+
+        The old format carried the record alone. The reader must not
+        reconstruct a watermark for it: the line stays unresolved.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / observer.OBSERVATIONS_FILE
+            path.write_text(json.dumps(record(), sort_keys=True) + "\n")
+            result = observer.read_observations(Path(directory))
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertEqual(result["records"], [])
+            self.assertIn("RELATION_UNRESOLVED", result["reasons"])
+            self.assertNotIn("INVALID_FRAME", result["reasons"])
+
+    def test_the_envelope_boundary_is_strict(self):
+        """The envelope's five keys, version and identity are all checked.
+
+        A missing key, an extra key, an unknown version, another run or a
+        watermark that is not a real non-negative integer are all refused
+        as invalid frames, and never read as a record.
+        """
+        cases = (
+            {"after_event_seq": None},
+            {"extra": 1},
+            {"wire_version": "btc5m-post-entry-wire/2"},
+            {"run_id": "another-run"},
+            {"after_event_seq": -1},
+            {"after_event_seq": "1"},
+            {"after_event_seq": True},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                envelope = observer.sample_envelope(record(), 1, RUN_ID)
+                for name, value in changes.items():
+                    if value is None:
+                        envelope.pop(name, None)
+                    else:
+                        envelope[name] = value
+                path = Path(directory) / observer.OBSERVATIONS_FILE
+                path.write_text(json.dumps(envelope, sort_keys=True) + "\n")
+                result = observer.read_observations(Path(directory))
+                self.assertEqual(result["status"], "INCOMPLETE")
+                self.assertEqual(result["records"], [])
+                self.assertIn("INVALID_FRAME", result["reasons"])
+
+    def test_the_written_line_keeps_the_watermark_it_was_related_to(self):
+        """The persisted line is the whole SAMPLE envelope.
+
+        The watermark the relation was checked against must survive on
+        disk: a reader that has to reconstruct it has no causal evidence.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = observer.ObservationStore(RUN_ID, Path(directory))
+            store.open()
+            store.write(record(), 7)
+            store.close()
+            line = json.loads((Path(directory) / observer.OBSERVATIONS_FILE).read_text())
+            self.assertEqual(set(line), {"wire_version", "kind", "run_id",
+                                         "after_event_seq", "record"})
+            self.assertEqual(line["wire_version"], observer.WIRE_VERSION)
+            self.assertEqual(line["kind"], "SAMPLE")
+            self.assertEqual(line["run_id"], RUN_ID)
+            self.assertEqual(line["after_event_seq"], 7)
+            self.assertEqual(line["record"]["observation_seq"], 1)
 
     def test_the_reader_never_writes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -568,7 +660,7 @@ class RealRustConsumerTest(LauncherFixture):
             raise AssertionError("exact libtest artifact identity required")
         cls.executable = executables[0]
 
-    def launch(self, root, enabled=True):
+    def launch(self, root, enabled=True, direction="yes", fixture=None):
         import btc5m_control as control
         validation_errors = []
         original_validate = control.validate_event
@@ -578,9 +670,11 @@ class RealRustConsumerTest(LauncherFixture):
             except Exception as error:
                 validation_errors.append(str(error))
                 raise
+        fixture = fixture or ("post_entry_protocol_consumer_fixture" if direction == "yes"
+                              else "post_entry_protocol_consumer_no_fixture")
         def popen(_argv, **kwargs):
             child = subprocess.Popen([self.executable,
-                "bot::arbitrage::observer::tests::post_entry_protocol_consumer_fixture",
+                f"bot::arbitrage::observer::tests::{fixture}",
                 "--exact", "--nocapture", "--test-threads=1"], **kwargs)
             self.children.append(child)
             return child
@@ -614,6 +708,380 @@ class RealRustConsumerTest(LauncherFixture):
         broken = observer.read_observations(on)
         self.assertIn("TRADING_EVIDENCE_INVALID", broken["reasons"])
         self.assertEqual(broken["records"], [])
+
+    def test_submillisecond_active_samples_survive_the_real_channel(self):
+        off = self.launch(self.root / "precision-off", enabled=False)
+        on = self.launch(self.root / "precision-on")
+        self.assertEqual((off / "events.jsonl").read_bytes(),
+                         (on / "events.jsonl").read_bytes())
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "COMPLETE", result["reasons"])
+        coverage = result["coverage"]
+        self.assertEqual(coverage["rejected_samples"], 0)
+        self.assertEqual(coverage["received_samples"], coverage["written_samples"])
+        self.assertEqual(coverage["sequence_gaps"], 0)
+        records = result["records"]
+        active = [item for item in records if item["sample_state"] == "ACTIVE"]
+        self.assertGreaterEqual(len(active), 2)
+        self.assertTrue(any(item["model_reason"] == "OK" for item in active))
+        self.assertTrue(any(item["exit_reason"] == "OK" for item in active))
+        self.assertEqual([item["observation_seq"] for item in records],
+                         list(range(1, len(records) + 1)))
+
+    def test_the_same_millisecond_first_sample_after_a_fill_is_consumed(self):
+        """A fill and the first sample it belongs to may share one millisecond.
+
+        The fill carries nanoseconds; the observation carries milliseconds.
+        The reader must compare them on one basis, so the sample is accepted
+        when the fill really precedes it, and still refused when it does not.
+        """
+        for direction in ("yes", "no"):
+            with self.subTest(direction=direction):
+                off = self.launch(self.root / f"ms-{direction}-off", enabled=False,
+                                  direction=direction)
+                on = self.launch(self.root / f"ms-{direction}-on", direction=direction)
+                # The observation channel changes nothing about the trading.
+                self.assertEqual((off / "events.jsonl").read_bytes(),
+                                 (on / "events.jsonl").read_bytes())
+                result = observer.read_observations(on)
+                self.assertEqual(result["status"], "COMPLETE", result["reasons"])
+                coverage = result["coverage"]
+                self.assertEqual(coverage["rejected_samples"], 0)
+                self.assertEqual(coverage["received_samples"], coverage["written_samples"])
+                self.assertEqual(coverage["sequence_gaps"], 0)
+                records = result["records"]
+                self.assertGreaterEqual(len(records), 2)
+                self.assertEqual([item["observation_seq"] for item in records],
+                                 list(range(1, len(records) + 1)))
+                active = [item for item in records if item["sample_state"] == "ACTIVE"]
+                self.assertGreaterEqual(len(active), 2)
+                # The exit is always valued while the position is held; the
+                # model is valued only when the core itself accepted the
+                # quote, which the Yes side does and the No side does not.
+                self.assertTrue(all(item["exit_reason"] == "OK" for item in active))
+                self.assertTrue(all(item["model_reason"] in observer.MODEL_REASONS
+                                   for item in active))
+                if direction == "yes":
+                    self.assertTrue(any(item["model_reason"] == "OK" for item in active))
+                # The terminal record is still there, and the first record is
+                # the first usable one, not a later one.
+                self.assertEqual(records[-1]["sample_state"], "ROUND_ENDED")
+                self.assertEqual(records[0]["observation_seq"], 1)
+                # The first sample is not before its fill, on the reader's own
+                # millisecond basis, and its quantity is the filled one.
+                fill = next(item for item in records if item["observation_seq"] == 1)
+                self.assertIsNotNone(fill["position_net_shares"])
+
+    def test_both_sides_share_their_fill_millisecond_and_are_accepted(self):
+        """Both sides carry the same-millisecond case, and both are accepted.
+
+        The No side enters a tick later, so its first observation already
+        shared its fill's millisecond. The Yes side needed a fixture of its
+        own to reach the same state. The reader must accept both, and must
+        prove the same millisecond rather than assume it.
+        """
+        cases = (("no", "post_entry_protocol_consumer_no_fixture"),
+                 ("yes", "post_entry_protocol_consumer_yes_same_millisecond_fixture"))
+        for direction, fixture in cases:
+            with self.subTest(direction=direction):
+                off = self.launch(self.root / f"both-{direction}-off", enabled=False,
+                                  fixture=fixture)
+                on = self.launch(self.root / f"both-{direction}-on", fixture=fixture)
+                self.assertEqual((off / "events.jsonl").read_bytes(),
+                                 (on / "events.jsonl").read_bytes())
+                result = observer.read_observations(on)
+                self.assertEqual(result["status"], "COMPLETE", result["reasons"])
+                self.assertEqual(result["coverage"]["rejected_samples"], 0)
+                records = result["records"]
+                self.assertGreaterEqual(len(records), 2)
+                active = [item for item in records if item["sample_state"] == "ACTIVE"]
+                self.assertGreaterEqual(len(active), 2)
+                # The fill and the first observation of that fill really do
+                # share one millisecond: the wire's own basis, not a guess.
+                fill = self._first_fill(on)
+                first = records[0]
+                self.assertEqual(first["market_id"], fill["market_id"])
+                self.assertEqual(first["token"], fill["token"])
+                observed = datetime.datetime.fromisoformat(
+                    first["observed_at"].replace("Z", "+00:00"))
+                filled = datetime.datetime.fromisoformat(
+                    fill["event_time"].replace("Z", "+00:00"))
+                # The millisecond bucket, not the second: the fill carries
+                # nanoseconds and the observation milliseconds, and the two
+                # must land in the very same millisecond.
+                self.assertEqual(wire_millis(observed), wire_millis(filled))
+                # The negative control: the same second in another
+                # millisecond is not the same millisecond, so a second level
+                # comparison would wrongly accept this pair.
+                other = same_second_other_millisecond(filled)
+                self.assertEqual(other.replace(microsecond=0),
+                                 filled.replace(microsecond=0))
+                self.assertNotEqual(wire_millis(other), wire_millis(filled))
+                # The terminal record is still there, and the first sample is
+                # the first usable one.
+                self.assertEqual(records[-1]["sample_state"], "ROUND_ENDED")
+                self.assertEqual(records[0]["observation_seq"], 1)
+                self.assertIsNotNone(records[0]["position_net_shares"])
+
+    @staticmethod
+    def _first_fill(directory):
+        """The run's own fill event."""
+        for line in (directory / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "fill":
+                return event
+        raise AssertionError("the run has no fill")
+
+    def test_a_sample_before_its_fill_is_still_refused(self):
+        """Accepting a same-millisecond fill does not accept a pre-fill one.
+
+        The reader is the layer that relates an observation to the run's own
+        trading evidence, so the counterexample is built there: a real run
+        whose first observation claims a moment before its fill. The whole
+        record moves back one millisecond, so its own clock stays legal and
+        the refusal can only be the relation to the fill.
+        """
+        on = self.launch(self.root / "prefill-on", direction="no")
+        fill = None
+        for line in (on / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "fill":
+                fill = event
+                break
+        self.assertIsNotNone(fill)
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+        first = json.loads(lines[0])
+        # One real millisecond, back. The record's own instant is the base,
+        # and the fill's own millisecond confirms that the record really did
+        # share it: the shift below is one delta, not two assumptions.
+        observed = datetime.datetime.fromisoformat(
+            first["record"]["observed_at"].replace("Z", "+00:00"))
+        filled = datetime.datetime.fromisoformat(
+            fill["event_time"].replace("Z", "+00:00"))
+        self.assertEqual(wire_millis(observed), wire_millis(filled))
+        # The negative control for the millisecond comparison: the same
+        # second in another millisecond would satisfy a second level
+        # comparison and must not satisfy this one.
+        other = same_second_other_millisecond(filled)
+        self.assertEqual(other.replace(microsecond=0),
+                         filled.replace(microsecond=0))
+        self.assertNotEqual(wire_millis(other), wire_millis(filled))
+        delta = datetime.timedelta(milliseconds=1)
+        before = observed - delta
+        self._rewind(first["record"], before, delta)
+        # The record itself is still a valid record: its clock and its
+        # formulas are untouched, so the refusal can only be the relation.
+        observer.validate_record(first["record"], RUN_ID)
+        lines[0] = json.dumps(first, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertIn("RELATION_UNRESOLVED", result["reasons"])
+        # The pre-fill sample is gone; the later, legal ones remain.
+        self.assertNotIn(first["record"]["observed_at"],
+                         [item["observed_at"] for item in result["records"]])
+        self.assertEqual(len(result["records"]), len(lines) - 1)
+
+    @staticmethod
+    def _rewind(data, moment, delta):
+        """Move one record and its own clocks back by one real delta.
+
+        Every clock in the record moves by the same delta, so the record's
+        own age, its request span and its formulas stay exactly as they
+        were. Nothing is assumed inconsistent: only the instant moves.
+        """
+        def stamp(value):
+            return (value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z")
+        data["observed_at"] = stamp(moment)
+        data["observed_elapsed_ms"] -= int(delta.total_seconds() * 1000)
+        for name in ("spot_clock", "book_clock"):
+            clock = data[name]
+            if clock is None:
+                continue
+            for field in ("request_at", "received_at"):
+                value = datetime.datetime.fromisoformat(clock[field].replace("Z", "+00:00"))
+                clock[field] = stamp(value - delta)
+            clock["request_elapsed_ms"] -= int(delta.total_seconds() * 1000)
+            clock["received_elapsed_ms"] -= int(delta.total_seconds() * 1000)
+        ends_at = datetime.datetime.fromisoformat(data["ends_at"].replace("Z", "+00:00"))
+        data["secs_left"] = (ends_at - moment).total_seconds()
+
+    def test_a_watermark_before_its_fill_is_refused_as_a_relation(self):
+        """The watermark, not the clock, is what refuses a pre-fill sample.
+
+        A sample whose clock, fields and formulas are all legal, and whose
+        millisecond is the fill's own, is still refused when the watermark
+        it carries does not yet contain the fill. The refusal is a relation
+        failure, not a malformed frame.
+        """
+        on = self.launch(self.root / "watermark-on", direction="no")
+        fill = None
+        for line in (on / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "fill":
+                fill = event
+                break
+        self.assertIsNotNone(fill)
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+        first = json.loads(lines[0])
+        # The record is untouched and legal; only the watermark moves back.
+        observer.validate_record(first["record"], RUN_ID)
+        self.assertGreaterEqual(first["after_event_seq"], fill["event_seq"])
+        first["after_event_seq"] = fill["event_seq"] - 1
+        lines[0] = json.dumps(first, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertIn("RELATION_UNRESOLVED", result["reasons"])
+        self.assertNotIn(first["record"]["observed_at"],
+                         [item["observed_at"] for item in result["records"]])
+
+    def test_the_settlement_boundary_follows_the_watermark(self):
+        """Settlement is decided by the watermark, never by a time guess.
+
+        A watermark before the settlement still accepts an ACTIVE sample; a
+        watermark that covers the settlement accepts a SETTLED one; an
+        ACTIVE sample whose watermark already covers the settlement is
+        refused, because the position was already settled by then.
+        """
+        on = self.launch(self.root / "settlement-on", direction="no")
+        settlement = None
+        for line in (on / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "settlement":
+                settlement = event
+                break
+        self.assertIsNotNone(settlement)
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+
+        # A watermark before the settlement still accepts an ACTIVE sample.
+        active = json.loads(lines[0])
+        self.assertEqual(active["record"]["sample_state"], "ACTIVE")
+        active["after_event_seq"] = settlement["event_seq"] - 1
+        self.assertGreaterEqual(active["after_event_seq"], active["record"]["observation_seq"])
+        lines[0] = json.dumps(active, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "COMPLETE", result["reasons"])
+
+    def test_a_settled_sample_needs_the_settlement_inside_its_watermark(self):
+        """A SETTLED sample before the settlement is refused.
+
+        The settlement is the only thing that makes a SETTLED sample true,
+        so its watermark must already cover it.
+        """
+        on = self.launch(self.root / "settled-on", direction="no")
+        settlement = None
+        for line in (on / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "settlement":
+                settlement = event
+                break
+        self.assertIsNotNone(settlement)
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+        first = json.loads(lines[0])
+        # The sample claims to be settled, but its watermark does not yet
+        # contain the settlement that would make it true.
+        first["record"]["sample_state"] = "SETTLED"
+        for name in ("sigma_raw sigma p_up p_down model_hold_value model_hold_surplus "
+                     "exit_bid_levels exit_covered_shares exit_depth_complete exit_vwap "
+                     "exit_gross_income exit_fee exit_net_income exit_pnl_vs_cost").split():
+            first["record"][name] = None
+        first["record"]["model_reason"] = "SETTLED"
+        first["record"]["exit_reason"] = "SETTLED"
+        first["record"]["fee_basis"] = "UNKNOWN"
+        first["record"]["fee_rate_bps"] = None
+        first["record"]["position_net_shares"] = None
+        first["record"]["position_cost"] = None
+        first["after_event_seq"] = settlement["event_seq"] - 1
+        observer.validate_record(first["record"], RUN_ID)
+        lines[0] = json.dumps(first, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertIn("RELATION_UNRESOLVED", result["reasons"])
+
+    def test_a_settled_sample_inside_its_watermark_is_accepted(self):
+        """A SETTLED sample whose watermark covers the settlement is kept.
+
+        This is the reader's own full chain: the persisted envelope is read
+        line by line, the line's own watermark is the causal evidence, and
+        the settlement inside that watermark is what makes the SETTLED
+        sample true. The record must survive the read, not merely pass a
+        formula check.
+        """
+        on = self.launch(self.root / "settled-inside-on", direction="no")
+        settlement = next(event for event in self._events(on)
+                           if event["event_kind"] == "settlement")
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+        last = json.loads(lines[-1])
+        # The terminal record of the real run becomes the SETTLED one: the
+        # position is closed, so it carries no inventory and no value.
+        last["record"]["sample_state"] = "SETTLED"
+        for name in ("sigma_raw sigma p_up p_down model_hold_value model_hold_surplus "
+                     "exit_bid_levels exit_covered_shares exit_depth_complete exit_vwap "
+                     "exit_gross_income exit_fee exit_net_income exit_pnl_vs_cost").split():
+            last["record"][name] = None
+        for name, value in (("model_reason", "SETTLED"), ("exit_reason", "SETTLED"),
+                            ("fee_basis", "UNKNOWN"), ("fee_rate_bps", None),
+                            ("position_net_shares", None), ("position_cost", None)):
+            last["record"][name] = value
+        # The watermark now covers the settlement, and nothing else moves.
+        last["after_event_seq"] = settlement["event_seq"]
+        observer.validate_record(last["record"], RUN_ID)
+        lines[-1] = json.dumps(last, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        coverage_path = on / observer.COVERAGE_FILE
+        coverage = json.loads(coverage_path.read_text())
+        coverage["producer"]["series"][0]["terminal_state"] = "SETTLED"
+        coverage_path.write_text(json.dumps(coverage, sort_keys=True) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "COMPLETE", result["reasons"])
+        kept = [item for item in result["records"] if item["sample_state"] == "SETTLED"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["observation_seq"], last["record"]["observation_seq"])
+        self.assertIsNone(kept[0]["position_net_shares"])
+        # The negative half: the very same SETTLED record, one watermark
+        # earlier, is still refused because the settlement is not inside it.
+        last["after_event_seq"] = settlement["event_seq"] - 1
+        lines[-1] = json.dumps(last, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        refused = observer.read_observations(on)
+        self.assertEqual(refused["status"], "INCOMPLETE")
+        self.assertIn("RELATION_UNRESOLVED", refused["reasons"])
+        self.assertEqual([item for item in refused["records"]
+                          if item["sample_state"] == "SETTLED"], [])
+
+    @staticmethod
+    def _events(directory):
+        """The run's own trading events, in order."""
+        return [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+
+    def test_an_active_sample_after_the_settlement_is_refused(self):
+        """An ACTIVE sample whose watermark covers the settlement is refused.
+
+        The position was already settled inside that watermark, so it cannot
+        still be active there.
+        """
+        on = self.launch(self.root / "active-after-on", direction="no")
+        settlement = None
+        for line in (on / "events.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event_kind") == "settlement":
+                settlement = event
+                break
+        self.assertIsNotNone(settlement)
+        lines = (on / observer.OBSERVATIONS_FILE).read_text().splitlines()
+        first = json.loads(lines[0])
+        first["after_event_seq"] = settlement["event_seq"]
+        observer.validate_record(first["record"], RUN_ID)
+        lines[0] = json.dumps(first, sort_keys=True)
+        (on / observer.OBSERVATIONS_FILE).write_text("\n".join(lines) + "\n")
+        result = observer.read_observations(on)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertIn("RELATION_UNRESOLVED", result["reasons"])
+        self.assertNotIn(first["record"]["observed_at"],
+                         [item["observed_at"] for item in result["records"]])
 
     def test_observer_socket_store_receiver_and_close_errors_do_not_change_trading(self):
         off = self.launch(self.root / "off", enabled=False)
@@ -680,11 +1148,11 @@ class RealRustConsumerTest(LauncherFixture):
                     waiting.append(frame["after_event_seq"] > receiver.index.last_seq)
                     later.append(bool(receiver.index.settlements))
                 return original_receive(receiver, frame, frame_bytes)
-            def first_write(store, data):
+            def first_write(store, data, watermark):
                 self.assertIn(b'"event_kind": "fill"', (store.directory / "events.jsonl").read_bytes())
                 observer.validate_record(data, RUN_ID)
                 writes.append(data)
-                return original_write(store, data)
+                return original_write(store, data, watermark)
             def delayed_pair():
                 parent, child = original_pair()
                 class DelayedParent:

@@ -39,9 +39,16 @@ fn input_clock(request_ms: u64, receive_ms: u64) -> ObservationClock {
 }
 
 /// The reading the fixture tick proved.
+///
+/// The wall clock is never exactly on a millisecond boundary in production,
+/// so the fixture is not either: the sub-millisecond remainder is what
+/// separates the observer's own arithmetic from the wire's millisecond
+/// timestamps.
 fn now_at(receive_ms: u64) -> CheckTime {
     CheckTime {
-        utc: start() + chrono::Duration::milliseconds(receive_ms as i64),
+        utc: start()
+            + chrono::Duration::milliseconds(receive_ms as i64)
+            + chrono::Duration::nanoseconds(979_343),
         elapsed_ms: receive_ms,
     }
 }
@@ -173,6 +180,29 @@ fn the_observation_reports_the_core_own_model() {
     assert_eq!(record.samples, 20);
 }
 
+/// Cross-field time arithmetic must use the timestamps the reader actually receives.
+#[test]
+fn remaining_seconds_match_serialized_timestamps_at_submillisecond_boundaries() {
+    let mut fixture = fixture();
+    let end = fixture.market.ends_at.unwrap();
+    for nanos in [
+        -1_000_001, -999_999, -979_343, -1, 0, 1, 979_343, 999_999, 1_000_001,
+    ] {
+        fixture.now.utc = end + chrono::Duration::nanoseconds(nanos);
+        let record = observe(&fixture, "1001", Some((3.0, 1.5)));
+        let wire = serde_json::to_value(&record).unwrap();
+        let observed = DateTime::parse_from_rfc3339(wire["observed_at"].as_str().unwrap()).unwrap();
+        let serialized_end =
+            DateTime::parse_from_rfc3339(wire["ends_at"].as_str().unwrap()).unwrap();
+        let expected = (serialized_end - observed).num_milliseconds() as f64 / 1000.0;
+        assert_eq!(
+            wire["secs_left"].as_f64().unwrap(),
+            expected,
+            "offset={nanos}ns"
+        );
+    }
+}
+
 /// The model value and the exit value are separate statements.
 #[test]
 fn the_model_value_and_the_exit_value_are_separate() {
@@ -209,6 +239,22 @@ fn the_exit_walks_the_held_tokens_own_bids() {
     // The No token's bid is the mirrored Yes ask at 0.55, not the Yes bid.
     assert_eq!(record.exit_vwap, Some(0.55));
     assert!((record.exit_gross_income.unwrap() - 1.65).abs() < 1e-12);
+}
+
+/// Exit PnL remains signed; the time fix does not alter value or fee arithmetic.
+#[test]
+fn both_held_sides_keep_positive_and_negative_exit_pnl() {
+    let fixture = fixture();
+    for token in ["1001", "1002"] {
+        for cost in [0.5, 2.0] {
+            let record = observe(&fixture, token, Some((3.0, cost)));
+            assert_eq!(record.model_reason, ModelReason::Ok);
+            assert_eq!(record.exit_reason, ExitReason::Ok);
+            let net = record.exit_gross_income.unwrap() - record.exit_fee.unwrap();
+            assert_eq!(record.exit_pnl_vs_cost.unwrap(), net - cost);
+            assert_eq!(record.exit_pnl_vs_cost.unwrap() > 0.0, cost == 0.5);
+        }
+    }
 }
 
 /// The fee is the confirmed paper rule, and it is named as such.
@@ -919,6 +965,8 @@ fn tick_external_stop_reports_missing_terminal_without_a_new_clock() {
 struct TickFixtureData {
     requests: std::sync::Mutex<Vec<Vec<u64>>>,
     fail: std::sync::atomic::AtomicBool,
+    /// The side this fixture makes the strategy take.
+    down: bool,
 }
 
 #[async_trait::async_trait]
@@ -956,10 +1004,22 @@ impl crate::service::venue::MarketData for TickFixtureData {
             request_elapsed_ms: request.elapsed_ms,
             received_elapsed_ms: receive.elapsed_ms,
         };
+        // The synthetic prices decide which side clears the edge: a Yes
+        // book makes the Yes side the buy, a No book the No side. The
+        // fixture changes only the external prices, never the strategy.
+        let (bids, asks) = if self.down {
+            if request.elapsed_ms > 105_000 {
+                (vec![(0.30, 100.0)], vec![(0.35, 100.0)])
+            } else {
+                (vec![(0.55, 2.0), (0.54, 100.0)], vec![(0.60, 100.0)])
+            }
+        } else {
+            (vec![(0.40, 2.0), (0.39, 100.0)], vec![(0.45, 100.0)])
+        };
         Ok(HashMap::from([(
             200,
             ObservedBook {
-                book: book(&[(0.40, 2.0), (0.39, 100.0)], &[(0.45, 100.0)]),
+                book: book(&bids, &asks),
                 clock,
             },
         )]))
@@ -981,6 +1041,34 @@ impl Clock for TickFixtureClock {
 
 /// Snapshot after every original tick, not just the final zero-inventory state.
 async fn tick_scenario(observer: Option<PostEntryObserver>, failures: bool) -> serde_json::Value {
+    tick_scenario_direction(observer, failures, false).await
+}
+
+/// The same tick, with the side the synthetic prices make the strategy take.
+///
+/// Only the external prices differ between the directions: the strategy, the
+/// broker, the events and the observer are the original code either way.
+async fn tick_scenario_direction(
+    observer: Option<PostEntryObserver>,
+    failures: bool,
+    down: bool,
+) -> serde_json::Value {
+    tick_scenario_schedule(observer, failures, down, None).await
+}
+
+/// The same tick, with one step's own millisecond moved.
+///
+/// The step that follows the one which filled is pulled back into the fill's
+/// own millisecond. Nothing else moves: the strategy, the broker, the
+/// events and the observer are the original code either way. The point is
+/// the Yes side, whose first observation is otherwise a whole tick later
+/// than its fill.
+async fn tick_scenario_schedule(
+    observer: Option<PostEntryObserver>,
+    failures: bool,
+    down: bool,
+    same_millisecond: Option<u64>,
+) -> serde_json::Value {
     use crate::bot::arbitrage::{Availability, RoundTaker};
     use crate::bot::runtime::{paper, Ctx, Strategy};
     use crate::service::predict_fun::PredictFunClient;
@@ -1030,6 +1118,7 @@ async fn tick_scenario(observer: Option<PostEntryObserver>, failures: bool) -> s
     let data = Arc::new(TickFixtureData {
         requests: Default::default(),
         fail: false.into(),
+        down,
     });
     let ctx = Ctx {
         client: PredictFunClient::new(&cfg).unwrap(),
@@ -1045,7 +1134,7 @@ async fn tick_scenario(observer: Option<PostEntryObserver>, failures: bool) -> s
     let mut available = Availability::default();
     available.record(&market, start());
     let quote = ObservedSpot {
-        price: 100.2,
+        price: if down { 99.8 } else { 100.2 },
         source: SpotSource::Binance,
         actual_pair: "BTCUSDT".into(),
         clock: input_clock(0, 0),
@@ -1079,6 +1168,14 @@ async fn tick_scenario(observer: Option<PostEntryObserver>, failures: bool) -> s
             27 => 275_000,
             28 => 300_000,
             _ => step * 5_000,
+        };
+        // The step that follows the fill is pulled back into the fill's own
+        // millisecond, so the first observation of this side shares one.
+        let ms = if same_millisecond == Some(step) {
+            let previous = (step - 1) * 5_000;
+            previous
+        } else {
+            ms
         };
         *clock.at.lock().unwrap() = now_at(ms);
         crate::bot::runtime::observer::freeze_paper_now(Some(now_at(ms).utc));
@@ -1191,6 +1288,33 @@ async fn post_entry_protocol_consumer_fixture() {
     println!();
     let observer = PostEntryObserver::attach("observer-test", true);
     tick_scenario(observer, false).await;
+}
+
+/// The same real child, on the No side.
+///
+/// The No side enters one tick later than the Yes side, so its first
+/// observation lands in the same millisecond as its fill. That is the case
+/// the strict reader used to refuse.
+#[tokio::test]
+async fn post_entry_protocol_consumer_no_fixture() {
+    println!();
+    let observer = PostEntryObserver::attach("observer-test", true);
+    tick_scenario_direction(observer, false, true).await;
+}
+
+/// The same real child, on the Yes side, with its first observation in the
+/// fill's own millisecond.
+///
+/// The Yes side otherwise enters one tick before the No side, so its first
+/// observation is a whole tick later than its fill. Pulling the tick that
+/// follows the fill back into the fill's own millisecond gives the Yes
+/// side the same case the No side already had, on the side the reader used
+/// to refuse.
+#[tokio::test]
+async fn post_entry_protocol_consumer_yes_same_millisecond_fixture() {
+    println!();
+    let observer = PostEntryObserver::attach("observer-test", true);
+    tick_scenario_schedule(observer, false, false, Some(21)).await;
 }
 
 /// Real END sender with 865 maximum-width legal token identities.

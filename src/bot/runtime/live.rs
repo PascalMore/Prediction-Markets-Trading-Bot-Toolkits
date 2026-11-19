@@ -38,9 +38,22 @@ pub struct LiveState {
     pub net_cash: HashMap<u64, U256>,
     pub net_inventory: HashMap<u64, U256>,
     pub reservations: HashMap<u64, U256>,
+    /// The conservative cash risk observed for an attempt, by attempt id.
+    ///
+    /// It only ever rises: once the venue showed a gross cash or a fee above
+    /// what was reserved, that higher risk is kept even when the snapshot
+    /// itself couldn't be applied. It is a floor on the risk, not a second
+    /// record of what was traded.
+    pub observed_risk_floor: HashMap<u64, U256>,
     pub fees_in_cash: f64,
     /// Fixed starting observation for in-process account/ledger reconciliation.
     pub baseline: Option<crate::service::venue::AccountSnapshot>,
+    /// The controlled live run's own metadata.
+    ///
+    /// It is `None` in every run that isn't an explicit controlled live run:
+    /// an ordinary live run has no candidate, no stop flag and no controlled
+    /// output of its own.
+    pub controlled: Option<crate::bot::runtime::live_control::ControlledLiveState>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -110,12 +123,47 @@ pub(crate) fn advance_watermark(
     }))
 }
 
+/// The result of applying one cumulative reading.
+///
+/// It carries the original [`Delta`] plus the two net amounts the original
+/// delta could not express, and whether the reading was applied at all. The
+/// original [`Delta`] and its consumers keep their contract: this is a
+/// wrapper around the same commit, not a second accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppliedExecution {
+    /// The original gross delta.
+    pub delta: Delta,
+    /// The net cash actually applied, when the reading was complete.
+    pub net_cash_delta: Option<U256>,
+    /// The net inventory actually applied, when the reading was complete.
+    pub net_inventory_delta: Option<U256>,
+    /// Whether this reading changed the ledger.
+    pub applied: bool,
+    /// Whether this reading repeated facts that were already applied.
+    pub duplicate: bool,
+    /// Whether the accounting was complete enough to trust.
+    pub accounting_complete: bool,
+}
+
 /// Validate all cumulative fields first, then commit holdings and watermarks
 /// under the caller's existing State lock. Unknown fields retain old coverage.
 pub(super) fn apply_snapshot(
     state: &mut State,
     snapshot: &ExecutionSnapshot,
 ) -> Result<Delta, String> {
+    apply_snapshot_detailed(state, snapshot).map(|applied| applied.delta)
+}
+
+/// Apply one cumulative reading and report what it actually applied.
+///
+/// The risk floor is raised here, before any refusal: a snapshot that showed
+/// a higher gross cash or fee keeps that higher risk even when the commit
+/// itself was rejected, so an observed risk is never lost because the
+/// accounting couldn't be completed.
+pub(super) fn apply_snapshot_detailed(
+    state: &mut State,
+    snapshot: &ExecutionSnapshot,
+) -> Result<AppliedExecution, String> {
     let id = snapshot.identity.local_attempt_id;
     let handle = state
         .live
@@ -127,9 +175,28 @@ pub(super) fn apply_snapshot(
     if snapshot.identity != record.identity {
         return Err("ORDER_IDENTITY_MISMATCH".into());
     }
+    // The conservative risk this reading shows, whether or not it can be
+    // applied. It only ever rises.
+    let observed = observed_risk_of(snapshot);
+    let floor = state.live.observed_risk_floor.entry(id).or_insert(U256::ZERO);
+    if observed > *floor {
+        *floor = observed;
+    }
     let old = state.live.watermarks.entry(id).or_default();
     let Some(watermark) = advance_watermark(old, snapshot)? else {
-        return Ok(Delta::default());
+        // Nothing new: the facts are already in the ledger.
+        return Ok(AppliedExecution {
+            delta: Delta::default(),
+            net_cash_delta: Some(U256::ZERO),
+            net_inventory_delta: Some(U256::ZERO),
+            applied: false,
+            duplicate: true,
+            accounting_complete: state
+                .live
+                .watermarks
+                .get(&id)
+                .is_some_and(|watermark| watermark.fields.len() == 5),
+        });
     };
     let q = watermark.gross_q;
     if q > record.request_gross_atoms {
@@ -149,6 +216,9 @@ pub(super) fn apply_snapshot(
         .copied()
         .unwrap_or(U256::ZERO);
     let mut delta = Delta::default();
+    let mut net_cash_delta = None;
+    let mut net_inventory_delta = None;
+    let mut applied = false;
     if complete {
         let cash = next["net_cash"].1;
         let inventory = next["net_inventory"].1;
@@ -226,6 +296,9 @@ pub(super) fn apply_snapshot(
         state.live.net_cash.insert(id, next["net_cash"].1);
         state.live.net_inventory.insert(id, next["net_inventory"].1);
         commit_delta(&mut state.live, id, &delta, snapshot.generation);
+        net_cash_delta = Some(cash_delta);
+        net_inventory_delta = Some(inventory_delta);
+        applied = true;
     }
     let closed = complete
         && matches!(snapshot.closure, Closure::Final { final_gross_q, .. } if final_gross_q == q);
@@ -235,6 +308,14 @@ pub(super) fn apply_snapshot(
         record
             .r0
             .max(known_risk)
+            .max(
+                state
+                    .live
+                    .observed_risk_floor
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(U256::ZERO),
+            )
             .saturating_sub(state.live.net_cash.get(&id).copied().unwrap_or(U256::ZERO))
     };
     state.live.reservations.insert(id, residual);
@@ -249,7 +330,91 @@ pub(super) fn apply_snapshot(
             fields: next,
         },
     );
-    Ok(delta)
+    if let Some(run) = state.live.controlled.as_mut() {
+        if !complete { run.stop("FACT_INCOMPLETE", true, snapshot.observed_at); }
+    }
+    drop(record);
+    super::live_control::refresh_live_risk(state);
+    Ok(AppliedExecution {
+        delta,
+        net_cash_delta,
+        net_inventory_delta,
+        applied,
+        duplicate: false,
+        accounting_complete: complete,
+    })
+}
+
+/// Apply and project one venue reading in the same State critical section.
+/// The operation lane must be held by the caller; output is flushed after State.
+pub(super) fn consume_snapshot(
+    broker: &Broker,
+    snapshot: &ExecutionSnapshot,
+) -> anyhow::Result<AppliedExecution> {
+    let metadata = snapshot.identity.signed_hash.as_deref()
+        .and_then(|hash| broker.taker.as_ref()?.controlled_order_metadata(hash));
+    let (applied, events) = {
+        let mut state = broker.state.lock();
+        let id = snapshot.identity.local_attempt_id;
+        let previous = state.live.reservations.get(&id).copied().unwrap_or(U256::ZERO);
+        let mut result = apply_snapshot_detailed(&mut state, snapshot);
+        if state.live.controlled.is_some()
+            && result.as_ref().is_ok_and(|applied| !applied.accounting_complete)
+        { state.halted = true; }
+        if let Err(error) = &result {
+            state.halted = true;
+            if let Some(run) = state.live.controlled.as_mut() {
+                run.stop(if snapshot.gross_q().is_none() { "FACT_INCOMPLETE" } else { "FACT_CONFLICT" },
+                    true, snapshot.observed_at);
+            }
+            if let Some(handle) = state.live.attempts.get(&id) {
+                handle.lock().last_reason = Some(error.clone());
+            }
+            if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
+                gate.record_reconciliation(identity, error);
+            }
+        }
+        // A rejected reading still discloses its original facts, never a
+        // fabricated applied delta. Identity mismatches are refused by projection.
+        let unapplied = AppliedExecution::default();
+        let projected = super::live_events::prepare_execution(&state, snapshot,
+            result.as_ref().unwrap_or(&unapplied), previous, metadata.as_ref());
+        let mut events = match projected {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(run) = state.live.controlled.as_mut() {
+                    run.stop("FACT_CONFLICT", true, snapshot.observed_at);
+                }
+                result = Err(error);
+                Vec::new()
+            }
+        };
+        let events = super::live_events::prepare_lifecycle(&mut state).map(|lifecycle| {
+            events.extend(lifecycle);
+            events
+        });
+        (result, events)
+    };
+    super::live_events::flush_events(events.map_err(anyhow::Error::msg)?)
+        .map_err(anyhow::Error::msg)?;
+    applied.map_err(anyhow::Error::msg)
+}
+
+/// The conservative cash risk one reading shows.
+///
+/// It is the greater of the net cash the venue reported and the gross cash
+/// plus the collateral fee: a fee the venue charges on top of the gross is
+/// real risk even when the net is unknown.
+pub(crate) fn observed_risk_of(snapshot: &ExecutionSnapshot) -> U256 {
+    let gross = snapshot.accounting.gross_cash.value().copied().unwrap_or(U256::ZERO);
+    let fee = snapshot
+        .accounting
+        .collateral_fee
+        .value()
+        .copied()
+        .unwrap_or(U256::ZERO);
+    let net = snapshot.accounting.net_cash.value().copied().unwrap_or(U256::ZERO);
+    gross.saturating_add(fee).max(net)
 }
 
 /// Release only on a returned error proving the request never left. Dropped
@@ -267,7 +432,9 @@ pub(super) fn release_not_submitted(
             .live
             .reservations
             .remove(&record.identity.local_attempt_id);
-        state.live.tombstones.remove(key);
+        // A controlled candidate is single-use even when definitely unsent;
+        // retaining its tombstone/hash is evidence, not outstanding cash risk.
+        if state.live.controlled.is_none() { state.live.tombstones.remove(key); }
         if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
             gate.release(identity, record.identity.local_attempt_id);
         }
@@ -279,6 +446,8 @@ pub(super) fn release_not_submitted(
 /// Seed only from a complete account and reconciled history. Never overwrite
 /// an in-process order's unknown risk with an operator's budget declaration.
 pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
+    let lane = broker.live_operation_lane();
+    let _operation = match lane.as_ref() { Some(lane) => Some(lane.lock().await), None => None };
     let venue = broker
         .taker
         .as_ref()
@@ -306,7 +475,13 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
             return check_runtime_account(broker, false).await;
         }
         let snapshot = venue.account_snapshot().await?;
+        let checked = super::live_control::account_receipt(&broker.state.lock())?;
         crate::service::predict_fun::account::check_snapshot_complete(&snapshot)?;
+        if checked.is_some() && (!snapshot.positions.is_empty()
+            || snapshot.collateral_atoms.is_none_or(|cash| cash < super::live_accounting::budget_c0_atoms()))
+        {
+            anyhow::bail!("RECONCILIATION_REQUIRED:CONTROLLED_STARTUP_BUDGET_OR_POSITIONS");
+        }
         if &snapshot.identity != identity {
             anyhow::bail!("ACCOUNT_MISMATCH");
         }
@@ -350,7 +525,13 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
         if !snapshot.positions_explained {
             anyhow::bail!("RECONCILIATION_REQUIRED:UNEXPLAINED_POSITIONS");
         }
-        state.live.baseline = Some(snapshot);
+        super::live_control::record_account_read(&mut state, &snapshot, checked)?;
+        state.live.baseline = Some(snapshot.clone());
+        let event = checked.map(|checked| super::live_events::prepare_reconciliation(
+            &state, &snapshot, checked.utc, "STARTUP", true, "NONE")).transpose()
+            .map_err(anyhow::Error::msg)?.flatten();
+        drop(state);
+        if let Some(event) = event { event.flush().map_err(anyhow::Error::msg)?; }
         Ok(())
     }
     .await;
@@ -358,6 +539,8 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
         Ok(()) => gate.record_read_success(identity, "startup"),
         Err(_) => gate.record_read_failure(identity, "startup", "STARTUP_UNPROVEN"),
     }
+    if result.is_err() { super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
+        .map_err(anyhow::Error::msg)?; }
     result
 }
 
@@ -449,7 +632,9 @@ pub(super) async fn check_runtime_account(
             .ok_or_else(|| anyhow::anyhow!("MISSING_VENUE"))?
             .account_snapshot()
             .await?;
-        let state = broker.state.lock();
+        let mut state = broker.state.lock();
+        let checked = super::live_control::account_receipt(&state)?;
+        let mut observed = snapshot.clone();
         // Another task may have reserved while the read was in flight. Never
         // compare a pre-submit observation against post-submit bookkeeping.
         if version != (state.live.next_attempt_id, state.live.generation.clone()) {
@@ -480,21 +665,56 @@ pub(super) async fn check_runtime_account(
                 anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
             }
         }
-        check_account_delta(state.live.baseline.as_ref().unwrap(), &snapshot, changes)
+        let reconciled = check_account_delta(state.live.baseline.as_ref().unwrap(), &snapshot, changes)
+            .and_then(|()| {
+                // Adapter history excludes this run's bound orders. Only the
+                // exact baseline + committed atom deltas can explain their
+                // positions here; do not project them as foreign after proof.
+                snapshot.positions_explained = true;
+                observed.positions_explained = true;
+                super::live_control::record_account_read(&mut state, &snapshot, checked)
+            });
+        if reconciled.is_err() {
+            if let Some(run) = state.live.controlled.as_mut() {
+                run.account_read = None;
+                run.stop("RECONCILIATION_REQUIRED", true, checked.map_or_else(chrono::Utc::now, |time| time.utc));
+            }
+        }
+        let mut events = Vec::new();
+        if let Some(checked) = checked {
+            if let Some(event) = super::live_events::prepare_reconciliation(&state, &observed,
+                checked.utc, "RUNTIME", reconciled.is_ok(),
+                if reconciled.is_ok() { "NONE" } else { "RECONCILIATION_REQUIRED" })
+                .map_err(anyhow::Error::msg)?
+            { events.push(event); }
+            events.extend(super::live_events::prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?);
+        }
+        drop(state);
+        super::live_events::flush_events(events).map_err(anyhow::Error::msg)?;
+        reconciled
     }
     .await;
     if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
         match &result {
             Ok(()) => gate.record_read_success(identity, "runtime_account"),
             Err(_) => {
-                gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN")
+                gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN");
+                if let Some(run) = broker.state.lock().live.controlled.as_mut() {
+                    run.account_read = None;
+                    run.stop("RECONCILIATION_REQUIRED", true, chrono::Utc::now());
+                }
             }
         }
     }
+    if result.is_err() { super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
+        .map_err(anyhow::Error::msg)?; }
     result
 }
 
 pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
+    let lane = broker.live_operation_lane();
+    let _operation = match lane.as_ref() { Some(lane) => Some(lane.lock().await), None => None };
+    if broker.state.lock().live.controlled.as_ref().is_some_and(|run| run.emitter.is_finished()) { return Ok(()); }
     let venue = broker
         .taker
         .as_ref()
@@ -509,6 +729,9 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
         .collect();
     for handle in handles {
         let record = handle.lock().clone();
+        if broker.state.lock().live.controlled.is_some() && record.phase == AttemptPhase::Closed
+            && record.submission == Submission::NotSubmitted
+        { continue; }
         let Some(hash) = record.identity.signed_hash else {
             continue;
         };
@@ -518,17 +741,24 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
                 if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
                     gate.record_read_failure(identity, "execution", "READ_FAILED");
                 }
+                super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE").map_err(anyhow::Error::msg)?;
                 return Err(error);
             }
         };
-        let mut state = broker.state.lock();
-        if let Err(reason) = apply_snapshot(&mut state, &snapshot) {
+        let controlled = broker.state.lock().live.controlled.is_some();
+        let applied = if controlled {
+            consume_snapshot(broker, &snapshot).map(|_| ()).map_err(|error| error.to_string())
+        } else {
+            apply_snapshot(&mut broker.state.lock(), &snapshot).map(|_| ())
+        };
+        if let Err(reason) = applied {
             handle.lock().last_reason = Some(reason.clone());
             if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
                 gate.record_reconciliation(identity, &reason);
             }
             return Err(anyhow::anyhow!("RECONCILIATION_REQUIRED:{reason}"));
         }
+        let mut state = broker.state.lock();
         let closed = handle.lock().phase == AttemptPhase::Closed;
         for resting in state
             .resting

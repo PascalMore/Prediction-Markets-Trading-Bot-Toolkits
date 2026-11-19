@@ -282,9 +282,11 @@ pub(crate) fn build_observation(
     };
 
     let ends_at = input.market.ends_at;
+    // Match the millisecond timestamps on the wire, not a truncated duration
+    // between higher-precision instants (which differs by 1ms before expiry).
     let secs_left = ends_at
         .zip(now.map(|now| now.utc))
-        .map(|(end, at)| (end - at).num_milliseconds() as f64 / 1000.0);
+        .map(|(end, at)| (end.timestamp_millis() - at.timestamp_millis()) as f64 / 1000.0);
     let strike = input
         .market
         .start_price

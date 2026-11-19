@@ -22,11 +22,14 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use super::{
-    account, check_limit, f64_to_wei, market_amounts, order_body, ApiCreatedOrder,
+    account, check_limit, controlled, f64_to_wei, market_amounts, order_body, ApiCreatedOrder,
     PredictFunClient, WeiBook, MARKET_ORDER_TTL_SECS,
 };
 use crate::models::{PlannedOrder, VenueId};
-use crate::service::venue::{AccountSnapshot, AttemptPhase, OrderTicket, OrderVenue};
+use crate::service::venue::{
+    AccountSnapshot, AttemptPhase, ControlledOrderMetadata, ControlledSendGuard, OrderTicket,
+    OrderVenue,
+};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
@@ -39,14 +42,14 @@ pub(super) fn checked_product_atoms(price: U256, quantity: U256) -> Result<U256>
         .map_err(|_| anyhow!("AMOUNT_OVERFLOW"))
 }
 
-fn ceil_div(value: U512, divisor: U512) -> Result<U512> {
+pub(super) fn ceil_div(value: U512, divisor: U512) -> Result<U512> {
     let (whole, remainder) = value.div_rem(divisor);
     whole
         .checked_add(U512::from(!remainder.is_zero() as u8))
         .ok_or_else(|| anyhow!("RESERVATION_OVERFLOW"))
 }
 
-fn cash_with_fee(cash: U512, bps: u32) -> Result<U256> {
+pub(super) fn cash_with_fee(cash: U512, bps: u32) -> Result<U256> {
     let fee = ceil_div(
         cash.checked_mul(U512::from(bps))
             .ok_or_else(|| anyhow!("RESERVATION_OVERFLOW"))?,
@@ -74,6 +77,35 @@ impl OrderVenue for PredictFunTrader {
             .ok_or_else(|| anyhow!("RESERVATION_OVERFLOW"))?;
         let cash = ceil_div(product, U512::from(WEI))?;
         cash_with_fee(cash, market.fee_rate_bps)
+    }
+
+    /// The worst-case cash a controlled live BUY must reserve.
+    ///
+    /// A BUY's fee comes out of the received shares, so the bound is the
+    /// signed cash itself. The ordinary bound adds a cash fee on top, which
+    /// would reserve about twice the cash and would refuse every legal
+    /// near-two-USDT order.
+    fn controlled_reservation_atoms(&self, planned: &PlannedOrder) -> Result<U256> {
+        if planned.side == Side::Sell {
+            return Err(VenueError::new(
+                VenueErrorCode::InvalidInput,
+                "controlled_reservation",
+                "SIGNED_BOUND_UNPROVEN",
+            )
+            .into());
+        }
+        let market = self.client.market_for_token(&planned.token_id)?;
+        let quantity = f64_to_wei(planned.shares)?;
+        controlled::controlled_buy_reservation(&market, quantity, planned.limit_price)
+    }
+
+    fn controlled_route(&self, token_id: &str) -> Result<String> {
+        Ok(controlled::route_of(&self.client.market_for_token(token_id)?))
+    }
+
+    /// What the controlled domain recorded about a signed order.
+    fn controlled_order_metadata(&self, signed_hash: &str) -> Option<ControlledOrderMetadata> {
+        self.controlled_metadata.read().get(signed_hash)
     }
 
     async fn place(&self, planned: &PlannedOrder, _: u64, live: bool) -> Result<OrderTicket> {
@@ -242,6 +274,180 @@ impl OrderVenue for PredictFunTrader {
         }
         .await;
         if live && result.is_err() {
+            self.release_prepared(&handle);
+        }
+        result
+    }
+
+    /// Place a guarded order under the controlled live domain.
+    ///
+    /// The preparation, the signing and the single POST are the adapter's
+    /// own. What is new is that the order's bound is proved, that the guard
+    /// confirms the facts and the durable evidence, and that the last
+    /// permission is consumed before the transport sees the order.
+    ///
+    /// There is exactly one POST, and it is never retried: not on a 401, not
+    /// on a timeout, and never with a new salt.
+    async fn place_controlled_tracked(
+        &self,
+        planned: &PlannedOrder,
+        _: u64,
+        live: bool,
+        handle: AttemptHandle,
+        guard: &dyn ControlledSendGuard,
+    ) -> Result<OrderTicket> {
+        if !live {
+            bail!("EXECUTION_NOT_ENABLED:CONTROLLED_LIVE_REQUIRED");
+        }
+        let result = async {
+            self.check_allows_new_order()?;
+            // Capture the broker's original identity and quantity before any
+            // adapter preparation can mutate the shared handle.
+            let frozen = controlled::FrozenAttempt::capture(&handle, planned, &self.identity())?;
+            guard.check_preparation()?;
+            self.begin_attempt(&handle)?;
+            let snapshot = self.read_account_snapshot().await?;
+            guard.check_preparation()?;
+            account::check_snapshot_complete(&snapshot)?;
+
+            let market = self.client.market_for_token(&planned.token_id)?;
+            let quantity = f64_to_wei(planned.shares)?;
+            let mirrored = PredictFunClient::is_mirrored(&market, &planned.token_id);
+            let raw_book = self.client.book(market.id).await?;
+            guard.check_preparation()?;
+            guard.check_book(&super::to_snapshot(&raw_book.asks, &raw_book.bids))?;
+            let book = WeiBook::from_api(&raw_book, mirrored)?;
+            let amounts = market_amounts(&book, planned.side, quantity)?;
+            check_limit(&amounts, planned.side, planned.limit_price)?;
+            let expiration = chrono::Utc::now().timestamp() + MARKET_ORDER_TTL_SECS;
+            let order = self.build_order(&market, &planned.token_id, planned.side, &amounts, expiration)?;
+            frozen.check_order(&handle, &order, &market, self.trading_address())?;
+
+            // Normalize price*quantity by WEI with U512 and conservative ceil.
+            // The signed ratio is checked separately without rounding slack.
+            let candidate_limit_atoms = controlled::controlled_buy_reservation(
+                &market, quantity, planned.limit_price,
+            )?;
+
+            let read = self.chain_read().await?;
+            guard.check_preparation()?;
+            let (collateral, gas) = read.balances().await?;
+            guard.check_preparation()?;
+            let required = amounts.maker_amount;
+            if gas.is_zero() || collateral < required {
+                return Err(VenueError::new(
+                    VenueErrorCode::ReadUnavailable,
+                    "funds",
+                    "INSUFFICIENT_FUNDS",
+                )
+                .into());
+            }
+            read.authorize(&market, order.tokenId, planned.side, required)
+                .await?;
+            guard.check_preparation()?;
+
+            let (digest, signature) = self.sign_order(&order, &market).await?;
+            let order_hash = format!("0x{}", hex::encode(digest));
+            frozen.check_order(&handle, &order, &market, self.trading_address())?;
+            // Only the newly learned hash is added. Identity and frozen gross
+            // quantity remain the broker's facts, never adapter replacements.
+            handle.lock().identity.signed_hash = Some(order_hash.clone());
+            guard.check_preparation()?;
+            let proven = self.check_controlled_signed_bound(
+                &handle,
+                &order,
+                &order_hash,
+                &market,
+                candidate_limit_atoms,
+            )?;
+            self.bound_orders.write().insert(
+                order_hash.clone(),
+                BoundOrder {
+                    handle: handle.clone(),
+                    market: market.clone(),
+                    requested: amounts.quantity,
+                    maker_amount: amounts.maker_amount,
+                    taker_amount: amounts.taker_amount,
+                    expiration,
+                },
+            );
+
+            let bound = controlled::to_venue_bound(
+                &proven,
+                &self.identity(),
+                market.id,
+                &planned.token_id,
+                &controlled::route_of(&market),
+                expiration,
+            );
+            // Complete every preparation await before the durable order and
+            // FINAL_SEND. The controlled write reuses this exact token and
+            // never re-enters authed_text's authentication await.
+            let token = self.token().await?;
+            guard.check_preparation()?;
+            let read = self.chain_read().await?;
+            guard.check_preparation()?;
+            read.signature(digest, &signature).await?;
+            guard.check_preparation()?;
+            controlled::check_guarded_facts(guard, &bound)?;
+            controlled::await_guarded_ack(guard, &bound)?;
+
+            let attempt_id = handle.lock().identity.local_attempt_id;
+            let body = controlled::guarded_body(&order, &order_hash, &signature, &amounts, expiration);
+            // POST is never retried, including timeout, malformed body and 401.
+            let created = match self
+                .controlled_write::<ApiCreatedOrder>(&token, &body, &handle, guard)
+                .await
+            {
+                Ok(envelope) => envelope.data,
+                Err(error) => {
+                    let mut record = handle.lock();
+                    if record.phase != AttemptPhase::Prepared {
+                        record.submission = Submission::Unknown;
+                        record.last_reason = Some("POST_NOT_REPLAYED".into());
+                    }
+                    return Err(error);
+                }
+            };
+            {
+                let mut store = self.controlled_metadata.write();
+                store.record(
+                    &order_hash,
+                    controlled::created_order_metadata(&created, 0),
+                );
+            }
+            let mut ticket = OrderTicket {
+                token_id: planned.token_id.clone(),
+                maker_amount: amounts.maker_amount.to_string(),
+                taker_amount: amounts.taker_amount.to_string(),
+                order_id: Some(created.order_id.clone()),
+                filled_shares: None,
+                signed_hash: Some(order_hash.clone()),
+                local_attempt_id: Some(attempt_id),
+                execution: None,
+            };
+            {
+                let mut record = handle.lock();
+                record.submission = Submission::Accepted;
+                record.phase = AttemptPhase::Submitted;
+                record.identity.venue_order_id = Some(created.order_id);
+            }
+            match self
+                .reconcile_order(&order_hash, planned.side, amounts.quantity)
+                .await
+            {
+                Ok(snapshot) => {
+                    ticket.filled_shares = snapshot.gross_q().map(wei_to_f64);
+                    ticket.execution = Some(snapshot);
+                }
+                Err(error) => {
+                    warn!(error = ?error,order_hash,"couldn't read the order's execution facts")
+                }
+            }
+            Ok(ticket)
+        }
+        .await;
+        if result.is_err() {
             self.release_prepared(&handle);
         }
         result
@@ -491,6 +697,27 @@ impl PredictFunTrader {
             }
         }
         Ok(())
+    }
+
+    /// Check the signed bound of a guarded order.
+    ///
+    /// The guarded domain reserves the signed cash, because a BUY's fee comes
+    /// out of the received shares. The ordinary path keeps its own, looser
+    /// cash-with-fee check: the two bounds are different facts about
+    /// different fee directions, and neither replaces the other.
+    fn check_controlled_signed_bound(
+        &self,
+        handle: &AttemptHandle,
+        order: &Order,
+        signed_hash: &str,
+        market: &ApiMarket,
+        candidate_limit_atoms: U256,
+    ) -> Result<controlled::ProvenBuyBound> {
+        let proven = controlled::prove_buy_bound(order, signed_hash, market, candidate_limit_atoms)?;
+        if proven.max_cash_atoms > handle.lock().r0 {
+            bail!("SIGNED_RISK_EXCEEDS_RESERVATION");
+        }
+        Ok(proven)
     }
 
     fn begin_attempt(&self, handle: &AttemptHandle) -> Result<()> {

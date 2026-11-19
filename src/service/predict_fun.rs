@@ -32,6 +32,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -45,7 +46,9 @@ use tracing::{debug, info, warn};
 
 pub mod account;
 pub mod books;
+pub mod controlled;
 pub mod fills;
+pub mod request;
 
 use account::AccountGate;
 
@@ -349,6 +352,12 @@ struct ApiAuthToken {
 #[serde(rename_all = "camelCase")]
 struct ApiCreatedOrder {
     order_id: String,
+    /// The venue's own removal lock, when it names one.
+    ///
+    /// The field is optional and may be null: the venue doesn't always state
+    /// it, and a missing lock is not a lock that has expired.
+    #[serde(default)]
+    removal_locked_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -612,62 +621,6 @@ impl PredictFunClient {
             #[cfg(test)]
             synthetic: None,
         }))
-    }
-
-    async fn request_text(
-        &self,
-        method: Method,
-        path: &str,
-        bearer: Option<&str>,
-        body: Option<&Value>,
-    ) -> Result<String> {
-        #[cfg(test)]
-        if let Some(transport) = &self.synthetic {
-            let result = transport.rest(&method, path, bearer, body);
-            if method == Method::POST && path == "/orders" && transport.pending_post() {
-                std::future::pending::<()>().await;
-            }
-            return result;
-        }
-        let url = format!("{}{}", self.deployment.api_base, path);
-        let mut req = self.http.request(method.clone(), &url);
-        if let Some(key) = &self.api_key {
-            req = req.header("x-api-key", key);
-        }
-        if let Some(token) = bearer {
-            req = req.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            req = req.json(body);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("{method} {path}"))?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Err(ApiError { status, body: text })
-                .with_context(|| format!("{method} {path}"));
-        }
-        Ok(text)
-    }
-
-    async fn request<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        bearer: Option<&str>,
-        body: Option<&Value>,
-    ) -> Result<Envelope<T>> {
-        let text = self
-            .request_text(method.clone(), path, bearer, body)
-            .await?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
-    }
-
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<Envelope<T>> {
-        self.request(Method::GET, path, None, None).await
     }
 
     async fn book(&self, market_id: u64) -> Result<ApiBook> {
@@ -1281,6 +1234,11 @@ pub struct PredictFunTrader {
     generations: RwLock<HashMap<String, u64>>,
     run_context: RwLock<Option<account::RunContext>>,
     bound_orders: RwLock<HashMap<String, fills::BoundOrder>>,
+    /// What the controlled domain recorded about the guarded orders.
+    ///
+    /// The ordinary path never writes here, and never reads it: only a
+    /// guarded hash has an entry.
+    pub(crate) controlled_metadata: RwLock<controlled::ControlledMetadataStore>,
 }
 
 impl PredictFunTrader {
@@ -1306,6 +1264,7 @@ impl PredictFunTrader {
             generations: RwLock::new(HashMap::new()),
             run_context: RwLock::new(None),
             bound_orders: RwLock::new(HashMap::new()),
+            controlled_metadata: RwLock::new(controlled::ControlledMetadataStore::new()),
         };
         if cfg.live_trading_allowed() {
             if let Some(context) =
@@ -1437,74 +1396,6 @@ impl PredictFunTrader {
 
     /// An authenticated request, signing in again once if the JWT has expired.
     ///
-    /// `replay` decides what happens after a 401. A read may be sent once more
-    /// with a fresh token: a token isn't part of the order. A write is never
-    /// sent again, not even with the same hash: the venue may already have
-    /// taken it.
-    async fn authed_text(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&Value>,
-        replay: ReplayPolicy,
-    ) -> Result<String> {
-        let token = self.token().await?;
-        match self
-            .client
-            .request_text(method.clone(), path, Some(&token), body)
-            .await
-        {
-            Err(e)
-                if e.downcast_ref::<ApiError>()
-                    .is_some_and(|a| a.status == StatusCode::UNAUTHORIZED) =>
-            {
-                *self.jwt.write().await = None;
-                if replay == ReplayPolicy::NoReplay {
-                    // The request may have reached the venue. The caller keeps
-                    // the order's identity and looks it up instead.
-                    return Err(VenueError::new(
-                        VenueErrorCode::SubmissionUnknown,
-                        "authed_text",
-                        "POST_NOT_REPLAYED",
-                    )
-                    .into());
-                }
-                debug!("JWT rejected; signing in again");
-                *self.jwt.write().await = None;
-                let token = self.token().await?;
-                self.client
-                    .request_text(method, path, Some(&token), body)
-                    .await
-            }
-            other => other,
-        }
-    }
-
-    async fn authed<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&Value>,
-    ) -> Result<Envelope<T>> {
-        let text = self
-            .authed_text(method.clone(), path, body, ReplayPolicy::ReadOnceRefresh)
-            .await?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
-    }
-
-    /// An authenticated write. It is sent once, and never again.
-    async fn authed_write<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&Value>,
-    ) -> Result<Envelope<T>> {
-        let text = self
-            .authed_text(method.clone(), path, body, ReplayPolicy::NoReplay)
-            .await?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
-    }
-
     /// Prove the connection without placing anything. `sign_in` also signs the
     /// auth message, which accepts Predict's Terms of Service.
     pub async fn check_sign_in(&self) -> Result<String> {

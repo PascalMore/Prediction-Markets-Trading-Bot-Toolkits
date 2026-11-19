@@ -226,3 +226,39 @@ Verify/Review, real account checks, real signing, orders, on-chain approvals,
 redemptions and payout confirmation have not been performed or authorized.
 The legacy switch-on examples above are not permission to activate this
 candidate, nor evidence of profitability or live-trading readiness.
+
+## BTC5m 07-007 explicit live candidate: offline only
+
+The existing btc5m_control launcher now selects the new domain only with the
+complete explicit live-contract/operations-mode/risk-window/authorization/deadline
+argument set. It uses the same phase1_net_shares core and original Predict adapter,
+not a paper-cash simulation or a second runner. Legacy signed-null evidence remains
+unavailable; unsigned v2, paper72 and its unsigned-only observer keep their old paths.
+
+The M-01 fixed candidate binary is ROOT/data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits
+(SHA256 8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa).
+Historical candidate-v1/cargo-target/debug/polymarket-toolkits (39f48ca7…) and its
+R1 REVISE evidence remain unchanged; the new candidate is not authorized for activation.
+No arbitrary binary override, automatic build or upgrade of an existing run exists.
+The fixed public activation/storage deployment is not provisioned or authorized.
+Missing or mismatched public binding fails before trading secrets or a child.
+
+An account-wide OS lock and one persistent Mongo ARMED refusal precede durable
+startup files and the original one-shot secret loader. The original supervisor
+validates each new live frame, durably writes and reads it back, then acknowledges
+only the matching prepared order. Failure retains the audit prefix and does not
+fabricate cash, a final event or successful native exit. The disk reader reports
+execution, cash and audit completeness separately.
+
+COLD_START_REFUSE remains after normal exit or crash; changing run/window or
+releasing the OS lock does not remove ARMED. There is no reset/resume command.
+A positive official claim means WAIT_CASH/MANUAL_PAUSE, not redeemed cash or renewed
+entry permission. Cash recovery uses existing SDK/manual operations only under a
+separate explicit authorization, never concurrent with the bot on this account.
+
+This candidate still requires independent Validate and separate production approval
+for storage binding, exact candidate digest, credentials, account/Gas checks,
+takeover/alert arrangements and every real transaction. The historical activation
+examples elsewhere in this document do not authorize this candidate. No production
+activation file, Mongo operation, signing/order/cancel, fund movement or external
+notification was performed by this implementation.

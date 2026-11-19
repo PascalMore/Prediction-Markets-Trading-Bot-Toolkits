@@ -29,8 +29,13 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 pub mod live;
+pub mod live_accounting;
+pub mod live_control;
+pub mod live_events;
 pub mod observer;
 pub mod paper;
+pub mod phase1_control;
+pub mod taker;
 
 pub use paper::{PaperCash, PaperSnapshot, Settlement, EVENT_PREFIX};
 
@@ -360,7 +365,7 @@ pub struct Broker {
     live: bool,
     taker: Option<Arc<dyn OrderVenue>>,
     limit: Option<Arc<dyn LimitVenue>>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     /// The account gate. `None` for venues without one.
     gate: Option<Arc<crate::service::predict_fun::account::AccountGate>>,
     /// The identity the gate is keyed on.
@@ -385,7 +390,7 @@ impl Broker {
             live,
             taker,
             limit,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             gate: None,
             identity: None,
             controlled: None,
@@ -514,6 +519,10 @@ impl Broker {
         limit: f64,
         yes_book: &BookSnapshot,
     ) -> Result<TakeResult> {
+        // Controlled phase1 live must never bypass its candidate guard.
+        if self.live && side == Side::Buy && self.is_phase1() {
+            return Ok(TakeResult::Blocked(Blocked::DataIncomplete));
+        }
         if self.state.lock().paper.is_some() {
             // A phase1 BUY has to carry the candidate it was built from. The
             // bare entry point cannot: it is refused before anything is
@@ -1046,6 +1055,11 @@ impl Broker {
             self.controlled_observe(&mut state, market, yes_book);
             return;
         }
+        if state.live.controlled.is_some() {
+            drop(state);
+            self.observe_controlled_live(market, yes_book);
+            return;
+        }
         if let Some(mid) = yes_book.mid() {
             state.marks.insert(market.yes_token.clone(), mid);
             state.marks.insert(market.no_token.clone(), 1.0 - mid);
@@ -1171,6 +1185,9 @@ impl Broker {
 
     /// Close out holdings in markets whose result is known.
     pub async fn settle_resolved(&self, data: &dyn MarketData) -> Result<()> {
+        if self.live_operation_lane().is_some() {
+            return self.settle_controlled_live(data).await;
+        }
         let controlled = self.state.lock().paper.is_some();
         let held: HashSet<u64> = self.holdings().iter().map(|h| h.market_id).collect();
         for id in held {
@@ -1345,6 +1362,7 @@ impl Ctx {
         strategy: &str,
         trader_factory: impl FnOnce(Arc<PredictFunClient>, &AppConfig) -> Result<PredictFunTrader>,
     ) -> Result<Self> {
+        crate::config::controlled_live::check_runtime_config(&cfg, strategy)?;
         if cfg.venue != VenueId::PredictFun {
             bail!(
                 "{strategy} runs on Predict.fun only so far: use --venue predict-fun. The \
@@ -1416,9 +1434,10 @@ impl Ctx {
             broker = broker.with_account_gate(Arc::clone(&trader.gate), trader.identity());
         }
         broker.controlled = cfg.controlled.clone();
+        broker = live_control::install_from_config(broker, &cfg)?;
         let broker = Arc::new(broker);
         if broker.controlled.is_some() {
-            paper::watch_control_channel(Arc::clone(&broker));
+            live_control::watch_broker(Arc::clone(&broker));
         }
         Ok(Self {
             cfg,
@@ -1557,7 +1576,10 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
         "strategy starting"
     );
     if ctx.broker.is_live() {
-        ctx.broker.seed_from_venue().await?;
+        if let Err(error) = ctx.broker.seed_from_venue().await {
+            if ctx.broker.live_operation_lane().is_some() { ctx.broker.finish_controlled(ctx.data.as_ref()).await; }
+            return Err(error);
+        }
     }
 
     // A controlled run watches its own deadline: it stops adding risk when the
@@ -1610,6 +1632,11 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 }
                 if let Err(e) = ctx.broker.sync_live().await {
                     warn!(error = ?e, "order state check failed");
+                }
+                if ctx.broker.live_operation_lane().is_some()
+                    && ctx.broker.state.lock().live.controlled.as_ref().is_some_and(|run| !run.may_add_risk()) {
+                    ctx.broker.finish_controlled(ctx.data.as_ref()).await;
+                    return Ok(());
                 }
                 if ctx.broker.is_halted() {
                     if let Err(e) = ctx.broker.cancel_all().await {

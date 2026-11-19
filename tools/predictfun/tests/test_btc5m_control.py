@@ -93,6 +93,390 @@ else:
 '''
 
 
+class ControlledLiveSupervisorTests(unittest.TestCase):
+    """Original supervisor, real pipes and intact native financial producer frames."""
+
+    def setUp(self):
+        import btc5m_live_events as live
+        from test_btc5m_live_events import metadata, native_stream
+        self.live, self.metadata, self.native_stream = live, metadata, native_stream
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.script = self.root / "child.py"
+        self.script.write_text('''import json, sys
+frames = open(sys.argv[1], "rb").readlines()
+for frame in frames:
+    sys.stdout.buffer.write(frame)
+    sys.stdout.buffer.flush()
+    event = json.loads(frame[len("BTC5M_EVENT "):])
+    payload = event["payload"]
+    if (event["event_kind"] == "order" and payload["attempt_phase"] == "PREPARED"
+            and payload["signed_hash"] is not None and payload["reason"] == "NONE"):
+        expected = f"A {event['event_seq']} {payload['signed_hash']}\\n".encode()
+        if sys.stdin.buffer.readline() != expected:
+            sys.exit(42)
+sys.exit(int(sys.argv[2]))
+''')
+        self.network = patch("socket.socket.connect", side_effect=AssertionError("NETWORK_FORBIDDEN"))
+        self.network_spy = self.network.start()
+        self.addCleanup(self.network.stop)
+        self.addCleanup(lambda: self.assertEqual(self.network_spy.call_count, 0))
+
+    def consume(self, frames, fault=None, native_exit=None):
+        live = self.live
+        started, public, context = self.metadata(frames[0])
+        directory = self.root / "run"
+        store = live.LiveEventStore(directory, started, public, context)
+        self.addCleanup(store.close)
+        wire = self.root / "native.txt"
+        wire.write_bytes(b"".join(frames))
+        process = subprocess.Popen([sys.executable, "-B", str(self.script), str(wire), str(native_exit or 0)],
+                                   env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with patch.object(control, "CLEANUP_SECONDS", .5):
+            if fault:
+                with fault(store, process):
+                    facts, final = control.supervise(process, store, now, control.boottime())
+            else:
+                facts, final = control.supervise(process, store, now, control.boottime())
+        if not store.failed:
+            control.finish_live_evidence(store, facts, final)
+        return facts, final, live.read_live_run(directory), store
+
+    def test_native_nonzero_fee_stream_reaches_disk_and_final(self):
+        frames = self.native_stream(813, 827)
+        facts, final, read, _store = self.consume(frames)
+        self.assertEqual(facts["events"], len(frames))
+        self.assertEqual(facts["launcher_exit"], 0)
+        self.assertEqual(final, self.live.validate_live_event(frames[-1]))
+        self.assertEqual(read["events"], [self.live.validate_live_event(frame) for frame in frames])
+        self.assertEqual(read["ended"]["final_event_seq"], len(frames))
+        self.assertTrue(any(int(event["payload"]["facts"]["share_fee"]["atoms"] or "0") > 0
+                            for event in read["events"] if event["event_kind"] == "execution"))
+        self.assertEqual(read["status"], "INCOMPLETE")
+        self.assertFalse(read["ended"]["cash_complete"])
+
+    def test_two_round_native_prefix_never_invents_a_final(self):
+        frames = self.native_stream(1664, 1690)
+        facts, final, read, store = self.consume(frames)
+        self.assertEqual(facts["events"], 27)
+        self.assertEqual(facts["launcher_exit"], 1)
+        self.assertIsNone(final)
+        self.assertEqual(len(store.relations.attempts), 2)
+        self.assertEqual(read["status"], "INCOMPLETE")
+        self.assertIsNone(read["ended"]["final_accounting"])
+
+    def test_native_failure_is_not_upgraded_by_a_final(self):
+        facts, final, read, _store = self.consume(self.native_stream(813, 827), native_exit=9)
+        self.assertIsNotNone(final)
+        self.assertEqual(read["ended"]["exit_facts"]["child_returncode"], 9)
+        self.assertIn("PROCESS_FAILED", read["reasons"])
+
+    def launch_fixture(self):
+        """Strict fake public file and lowest-level Mongo transport only."""
+        from contextlib import ExitStack
+        import btc5m_live_guard as guard
+        from test_btc5m_live_guard import FakeCollection, public_inputs
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        frames = self.native_stream(813, 827)
+        native_started, _public, _context = self.metadata(frames[0])
+        data = public_config(**{"bot.enable_trading": True, "bot.mock_trading": False})
+        data.pop("controlled_paper")
+        config = self.root / "config.json"
+        config.write_bytes(self.live.canonical(data))
+        activation, _ = public_inputs()
+        activation["risk_window_id"] = native_started["risk_window_id"]
+        identity = native_started["candidate_identity"]
+        public_identity = {"sha256": hashlib.sha256(self.live.canonical(data)).hexdigest(),
+                           "initial_cash": 100, "max_order_usd": 2, "max_market_usd": 2,
+                           "max_total_usd": 10, "max_loss_usd": 20}
+        activation["candidate_digest"] = self.live.candidate_digest(
+            {"candidate_identity": identity, "public_config_identity": public_identity})
+        activation_path = self.root / "activation.json"
+        activation_path.write_bytes(self.live.canonical(activation))
+        stack.enter_context(patch.object(guard, "ACTIVATION_PATH", activation_path))
+        stack.enter_context(patch.object(guard, "LOCK_DIRECTORY", self.root / "locks"))
+        stack.enter_context(patch.object(control, "public_identity", return_value=identity))
+        stack.enter_context(patch.dict(os.environ, {guard.CREDENTIAL_ENV:
+                             "mongodb://offline.invalid:27017/tradingagents"}, clear=True))
+        collection = FakeCollection()
+        database, client = MagicMock(), MagicMock()
+        database.list_collection_names.return_value = ["07_trading_btc5m_live_guard"]
+        database.get_collection.return_value = collection
+        client.get_database.return_value = database
+        driver = stack.enter_context(patch("pymongo.MongoClient", return_value=client))
+        order = []
+        evidence = self.root / "evidence"
+        def secret():
+            self.assertEqual([call[0] for call in collection.calls], ["insert", "read"])
+            directory = evidence / native_started["run_id"]
+            for name in ("started.json", "public-config.json", "live-context.json", "events.jsonl"):
+                self.assertTrue((directory / name).is_file())
+            order.append("secret")
+            return b"offline-not-a-key"
+        loader = stack.enter_context(patch.object(local_signer, "_read_owned", side_effect=secret))
+        builder = stack.enter_context(patch.object(local_signer, "build_child_env",
+                                                   return_value={"PATH": "/usr/bin:/bin"}))
+        wire = self.root / "wire.txt"
+        wire.write_bytes(b"".join(frames))
+        def popen(command, **kwargs):
+            self.assertEqual(order, ["secret"])
+            self.assertEqual(command[0], str(control.LIVE_BINARY))
+            self.assertIn("--controlled-live-manifest", command)
+            self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin"})
+            order.append("child")
+            return subprocess.Popen([sys.executable, "-B", str(self.script), str(wire), "0"], **kwargs)
+        child = MagicMock(side_effect=popen)
+        args = ["--mode", "signed-future-live", "--config", str(config), "--run-id", native_started["run_id"],
+                "--predict-budget-confirmation", f"56:{local_signer.TRADING_ADDRESS.lower()}:predict-account",
+                "--predict-rpc-url", "http://offline.invalid", "--live-contract", "phase1_net_shares",
+                "--operations-mode", activation["operations_mode"], "--risk-window-id", activation["risk_window_id"],
+                "--authorization-ref", activation["authorization_ref"], "--deadline-at", activation["deadline_at"]]
+        return args, evidence, child, loader, collection, activation_path, driver, database, builder
+
+    def test_original_run_orders_guard_evidence_secret_child_and_refuses_cold_restart(self):
+        import btc5m_live_guard as guard
+        args, root, child, loader, collection, _path, driver, database, builder = self.launch_fixture()
+        facts = control.run(args, environment={}, evidence_root=root, popen=child)
+        self.assertEqual(facts["launcher_exit"], 0)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(loader.call_count, 1)
+        self.assertEqual(builder.call_count, 1)
+        self.assertFalse(driver.call_args.kwargs["retryWrites"])
+        self.assertEqual(database.get_collection.call_args.kwargs["write_concern"].document,
+                         {"w": "majority", "j": True})
+        read = self.live.read_live_run(next(root.iterdir()))
+        self.assertIsNotNone(read["ended"])
+        self.assertEqual(read["ended"]["exit_facts"]["child_returncode"], 0)
+        args[args.index("--run-id") + 1] = "new-run"
+        with self.assertRaises(control.Refused) as refused:
+            control.run(args, environment={}, evidence_root=root, popen=child)
+        self.assertEqual(refused.exception.reason, "RECONCILIATION_REQUIRED")
+        self.assertEqual(loader.call_count, 1)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(len(collection.documents), 1)
+        self.assertEqual(next(iter(collection.documents.values()))["state"], "ARMED")
+
+    def test_invalid_activation_has_zero_storage_trading_secret_and_child(self):
+        args, root, child, loader, _collection, path, driver, _database, _builder = self.launch_fixture()
+        activation = json.loads(path.read_bytes())
+        activation["candidate_digest"] = "f" * 64
+        path.write_bytes(self.live.canonical(activation))
+        with self.assertRaises(control.Refused):
+            control.run(args, environment={}, evidence_root=root, popen=child)
+        driver.assert_not_called()
+        loader.assert_not_called()
+        child.assert_not_called()
+        self.assertFalse(root.exists())
+
+    def test_partial_opt_in_and_old_mode_new_flags_refuse_before_any_read(self):
+        args, root, child, loader, _collection, _path, driver, _database, _builder = self.launch_fixture()
+        variants = [args + ["--duration-hours", "6"], args + ["--post-entry-observer"],
+                    args[:args.index("--deadline-at")],
+                    ["--mode", "unsigned-paper", "--config", "absent", "--run-id", "r", "--live-contract", "phase1_net_shares"]]
+        with patch.object(control, "read_public_config", side_effect=AssertionError("read before args")):
+            for variant in variants:
+                with self.subTest(variant=variant), self.assertRaises(control.Refused):
+                    control.run(variant, environment={}, evidence_root=root, popen=child)
+        driver.assert_not_called()
+        loader.assert_not_called()
+        child.assert_not_called()
+
+    def test_keyring_failure_after_armed_keeps_barrier_and_starts_no_child(self):
+        args, root, child, loader, collection, _path, _driver, _database, _builder = self.launch_fixture()
+        loader.side_effect = local_signer.Failure("KEYRING_LOCKED", "backend", "LOCKED")
+        facts = control.run(args, environment={}, evidence_root=root, popen=child)
+        self.assertEqual(facts["stop_reason"], "KEYRING_UNAVAILABLE")
+        self.assertEqual(facts["launcher_exit"], 1)
+        loader.assert_called_once()
+        child.assert_not_called()
+        self.assertEqual(len(collection.documents), 1)
+        read = self.live.read_live_run(next(root.iterdir()))
+        self.assertIsNone(read["ended"]["final_accounting"])
+        self.assertEqual(read["ended"]["exit_facts"]["stop_reason"], "KEYRING_UNAVAILABLE")
+
+    def test_two_real_launch_processes_have_at_most_one_secret_and_child(self):
+        import multiprocessing
+        args, root, child, loader, _collection, _path, _driver, _database, _builder = self.launch_fixture()
+        context = multiprocessing.get_context("fork")
+        ready, release = context.Event(), context.Event()
+        original_secret = loader.side_effect
+        def held_secret():
+            value = original_secret()
+            ready.set()
+            if not release.wait(5):
+                raise AssertionError("fixture release timeout")
+            return value
+        loader.side_effect = held_secret
+        def launch(argv, connection):
+            try:
+                facts = control.run(argv, environment={}, evidence_root=root, popen=child)
+                connection.send(("ended", loader.call_count, child.call_count, facts["child_returncode"]))
+            except control.Refused as error:
+                connection.send((error.reason, loader.call_count, child.call_count, None))
+            finally:
+                connection.close()
+        first_read, first_write = context.Pipe(duplex=False)
+        second_read, second_write = context.Pipe(duplex=False)
+        first = context.Process(target=launch, args=(args, first_write))
+        changed = list(args)
+        changed[changed.index("--run-id") + 1] = "second-run"
+        second = context.Process(target=launch, args=(changed, second_write))
+        first.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            second.start()
+            self.assertTrue(second_read.poll(5))
+            self.assertEqual(second_read.recv(), ("ALREADY_RUNNING", 0, 0, None))
+            release.set()
+            self.assertTrue(first_read.poll(5))
+            self.assertEqual(first_read.recv(), ("ended", 1, 1, 0))
+        finally:
+            release.set()
+            first.join(5)
+            if second.pid is not None:
+                second.join(5)
+            for worker in (first, second):
+                self.assertFalse(worker.is_alive())
+                if worker.pid is not None:
+                    self.assertEqual(worker.exitcode, 0)
+            for connection in (first_read, first_write, second_read, second_write):
+                connection.close()
+
+    def test_actual_live_public_identity_covers_upstream_and_loaded_files(self):
+        """Read-only candidate identity, also proving digest cross-consumer agreement."""
+        live = self.live
+        identity = control.public_identity({}, live=True)
+        manifest = control.BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/run3906-final-candidate.tsv"
+        self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                         "14efba3e960fb5011fefac26d9a539298db545f1e73d15e388ff65e6936d71fd")
+        evidence = manifest.parent
+        rust_paths = {"src/bot/runtime/paper.rs", "src/bot/runtime/paper/tests.rs",
+                      "src/bot/runtime/live_accounting.rs", "src/bot/runtime/live_control/tests.rs"}
+        reference = evidence / "run3909-m01-rust-reference.json"
+        self.assertEqual(hashlib.sha256(reference.read_bytes()).hexdigest(),
+                         "5f7a7bd87419db645efabfc0b830f1f895a33b3c13f9635ad3e6e2d01546367a")
+        expected_rust = json.loads(reference.read_bytes())
+        self.assertEqual(set(expected_rust), rust_paths)
+        upstream = {}
+        for row in manifest.read_text().splitlines()[1:]:
+            path, _lines, digest = row.split("\t")
+            upstream[path] = digest
+            self.assertEqual(identity["files"][path], expected_rust.get(path, digest), path)
+        self.assertEqual(len(upstream), 29)
+        self.assertTrue(rust_paths <= upstream.keys())
+        baseline = evidence / "run3907-final3-candidate.json"
+        self.assertEqual(hashlib.sha256(baseline.read_bytes()).hexdigest(),
+                         "17f77c2fff85facf0dc3e018ebe0a58f9c296b7fa0f614595d674394f9d3490d")
+        old_files = json.loads(baseline.read_bytes())["candidate_identity"]["files"]
+        allowed = rust_paths | {"tools/predictfun/btc5m_control.py",
+            "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/README.md", "docs/LIVE-TRADING.md"}
+        self.assertEqual(set(identity["files"]), set(old_files))
+        self.assertEqual(len(old_files), 57)
+        protected = set(old_files) - allowed
+        self.assertEqual(len(protected), 49)
+        for path in protected:
+            self.assertEqual(identity["files"][path], old_files[path], path)
+        changed = {path for path in old_files if identity["files"][path] != old_files[path]}
+        self.assertEqual(changed, allowed - {"src/bot/runtime/paper.rs", "src/bot/runtime/paper/tests.rs"})
+        self.assertEqual(control.LIVE_BINARY, evidence / "candidate-v2/polymarket-toolkits")
+        print("M01_PROTECTED_PARTITIONS " + json.dumps({"upstream_total": len(upstream),
+              "upstream_protected": len(set(upstream) - rust_paths), "protected": sorted(protected),
+              "changed": sorted(changed), "rust_reference": expected_rust}, sort_keys=True))
+        for path in control.LIVE_PATHS:
+            self.assertIn(path, identity["files"])
+        self.assertEqual(identity["binary_sha256"], control.LIVE_BINARY_SHA256)
+        data = public_config(**{"bot.enable_trading": True, "bot.mock_trading": False})
+        data.pop("controlled_paper")
+        public = {"sha256": hashlib.sha256(live.canonical(data)).hexdigest(), "initial_cash": 100,
+                  "max_order_usd": 2, "max_market_usd": 2, "max_total_usd": 10, "max_loss_usd": 20}
+        digest_input = {"candidate_identity": identity, "public_config_identity": public}
+        digest = live.candidate_digest(digest_input)
+        self.assertEqual(digest, hashlib.sha256(live.canonical(digest_input)).hexdigest())
+        line_counts = {path: len((control.BOT / path).read_bytes().splitlines()) for path in identity["files"]}
+        for path in ("tools/predictfun/btc5m_control.py", "tools/predictfun/tests/test_btc5m_control.py"):
+            self.assertLessEqual(line_counts[path], 2400)
+        print("FINAL_LIVE_CANDIDATE " + json.dumps({**digest_input, "candidate_digest": digest,
+              "file_count": len(identity["files"]),
+              "public_config_kind": "offline signed projection of unchanged paper public input; not deployment",
+              "lines": line_counts}, sort_keys=True, indent=2))
+
+    def test_missing_activation_has_zero_storage_secret_child(self):
+        args, root, child, loader, _collection, _path, driver, _database, _builder = self.launch_fixture()
+        import btc5m_live_guard as guard
+        with patch.object(guard, "ACTIVATION_PATH", self.root / "absent.json"):
+            with self.assertRaises(control.Refused):
+                control.run(args, environment={}, evidence_root=root, popen=child)
+        driver.assert_not_called()
+        loader.assert_not_called()
+        child.assert_not_called()
+
+    def test_guard_readback_failure_and_lock_conflict_precede_trading_secrets(self):
+        import btc5m_live_guard as guard
+        args, root, child, loader, collection, _path, driver, _database, _builder = self.launch_fixture()
+        activation = json.loads(_path.read_bytes())
+        lock = guard.AccountLock(activation["account_identity"], "signed-future-live").acquire()
+        try:
+            with self.assertRaises(control.Refused) as refused:
+                control.run(args, environment={}, evidence_root=root, popen=child)
+            self.assertEqual(refused.exception.reason, "ALREADY_RUNNING")
+            driver.assert_not_called()
+        finally:
+            lock.close()
+        collection.fault = "read_timeout"
+        with self.assertRaises(control.Refused):
+            control.run(args, environment={}, evidence_root=root, popen=child)
+        self.assertEqual(len(collection.documents), 1)
+        loader.assert_not_called()
+        child.assert_not_called()
+        self.assertFalse(root.exists())
+
+    def test_fsync_failure_prevents_first_commit(self):
+        facts, final, read, store = self.consume(self.native_stream(813, 827),
+            lambda store, process: patch.object(self.live.os, "fsync", side_effect=OSError()))
+        self.assertEqual(facts["events"], 0)
+        self.assertEqual(facts["stop_reason"], "AUDIT_UNAVAILABLE")
+        self.assertEqual(store.relations.seq, 0)
+        self.assertTrue(store.failed)
+        self.assertIsNone(final)
+
+    def test_ack_broken_pipe_keeps_durable_order_but_no_final(self):
+        facts, final, read, store = self.consume(self.native_stream(813, 827),
+            lambda store, process: patch.object(process.stdin, "write", side_effect=BrokenPipeError()))
+        self.assertEqual(facts["stop_reason"], "AUDIT_UNAVAILABLE")
+        self.assertEqual(store.relations.seq, 5)
+        self.assertTrue(store.failed)
+        self.assertIsNone(final)
+        self.assertEqual(read["events"][-1]["event_kind"], "order")
+        self.assertIsNone(read["ended"])
+
+    def test_wrong_wire_identity_never_reaches_first_write(self):
+        frames = self.native_stream(813, 827)
+        first = self.live.validate_live_event(frames[0])
+        # Keep metadata's identity, change only the child's actual first frame.
+        original = self.metadata
+        self.metadata = lambda frame: original(frames[0])
+        first["run_id"] = "unrelated-run"
+        broken = self.live.EVENT_PREFIX + self.live.canonical(first) + b"\n"
+        facts, final, read, store = self.consume([broken] + frames[1:])
+        self.assertEqual(facts["events"], 0)
+        self.assertEqual((store.directory / "events.jsonl").read_bytes(), b"")
+        self.assertIsNone(final)
+
+    def test_first_write_failure_closes_control_and_withholds_ack(self):
+        facts, final, read, store = self.consume(self.native_stream(813, 827),
+            lambda store, process: patch.object(store.stream, "write", side_effect=OSError("offline IO")))
+        self.assertEqual(facts["events"], 0)
+        self.assertEqual(facts["launcher_exit"], 1)
+        self.assertTrue(store.failed)
+        self.assertFalse((store.directory / "ended.json").exists())
+        self.assertEqual((store.directory / "events.jsonl").read_bytes(), b"")
+        self.assertEqual(read["status"], "INCOMPLETE")
+
+
 class LauncherFixture(unittest.TestCase):
     """The shared launcher fixture: no network, no keyring, no real child."""
 

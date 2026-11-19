@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Instant;
 
+pub mod controlled_live;
+
+pub use controlled_live::ControlledLiveOptions;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Which venue the copy-trading bot trades. Defaults to Polymarket.
@@ -45,6 +49,14 @@ pub struct AppConfig {
     /// command line, never read from the public configuration file.
     #[serde(skip)]
     pub controlled: Option<ControlledRun>,
+
+    /// The explicit live contract of a controlled live run.
+    ///
+    /// It is absent in every other run, including the unsigned paper run and
+    /// the ordinary signed live run: a live contract is reached by name, never
+    /// by a default.
+    #[serde(skip)]
+    pub controlled_live: Option<ControlledLiveOptions>,
 
     /// Hard caps and tunables for the strategy bots other than copy trading.
     #[serde(default)]
@@ -626,6 +638,8 @@ impl ControlledMode {
 /// The controlled run's identity and deadline, fixed by the launcher.
 #[derive(Debug, Clone)]
 pub struct ControlledRun {
+    /// Explicit 07-007 context; legacy constructors never select this domain.
+    pub live: Option<ControlledLiveOptions>,
     pub mode: ControlledMode,
     pub run_id: String,
     pub started_at: DateTime<Utc>,
@@ -703,6 +717,7 @@ impl ControlledRun {
             bail!("CONTROLLED_MODE: the deadline must be the start plus the fixed budget");
         }
         Ok(Some(Self {
+            live: None,
             mode,
             run_id: run_id.to_string(),
             started_at,
@@ -716,6 +731,7 @@ impl ControlledRun {
     pub fn new(mode: ControlledMode, run_id: String, started_at: DateTime<Utc>) -> Result<Self> {
         let deadline_at = started_at + chrono::Duration::seconds(CONTROLLED_MAX_SECS);
         Ok(Self {
+            live: None,
             mode,
             run_id,
             started_at,

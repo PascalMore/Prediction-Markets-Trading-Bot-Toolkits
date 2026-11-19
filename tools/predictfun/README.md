@@ -201,3 +201,29 @@ tools/predictfun/.venv/bin/python -B -m unittest discover -s tools/predictfun/te
 ```
 
 开发者自测不替代独立 Validate；真实私钥、网站控制/签名/认证/交易、冷启动和同 UID 隔离均未验证。本轮不要导出或录入真实 key。
+
+## 07-007 显式受控 live 候选（尚未部署）
+
+原 `btc5m_control.py` 仅在 signed-future-live 同时显式提供
+`--live-contract phase1_net_shares`、`--operations-mode supervised|unattended`、
+`--risk-window-id`、`--authorization-ref`、`--deadline-at` 时进入新域。
+仍需原固定账户预算确认与 RPC 参数；新域拒绝 `--duration-hours` 和 observer。
+旧 unsigned v2、unsigned72h、observer 和未 opt-in 的 signed legacy 不自动升级；
+历史 signed-null 账务仍不可用，不迁移为新 live 实绩。
+
+M-01 修复后新域固定使用 ROOT/data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits，
+SHA256=8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa。
+历史 candidate-v1/cargo-target/debug/polymarket-toolkits（39f48ca7…）及 R1 REVISE 证据只读保留；新候选未获激活授权。
+不接任意 binary/target 参数，不替换旧 paper72 binary，也不自动构建。
+固定公共 activation 文件当前没有获批部署；缺失、候选摘要/账户/窗口/期限不符一律拒绝。
+本轮没有生成生产 activation、连接生产 Mongo 或运行真实 child。
+
+启动顺序为公共校验 → 固定账户 flock → 既有集合单次 majority+j ARMED 及 primary-majority 精确读回 →
+exclusive started/public-config/live-context/events 耐久证据 → 原 keyring/API 来源 → 单 child。
+关键 order 只在 schema/关系校验、首次 write、flush/fsync/同文件读回完成后 ACK。
+I/O/ACK 失败关闭控制通道并保留真实前缀，不补造 final；reader 将 native exit、订单/现金/审计完整性分别裁定。
+ARMED 正常结束也不自动删除；换 run/window 或 OS 锁释放仍 COLD_START_REFUSE，无 reset/resume。
+
+正 claim 不等于现金：MANUAL_PAUSE/WAIT_CASH 停新增，不自动 redeem、approve、复投或将 claim 加现金。
+人工核账/资金操作、存储部署、最终候选激活、告警接收与真实交易均须以后逐项授权。
+当前仅离线实现候选，仍待独立 Validate；工程自测不证明实盘就绪或盈利。

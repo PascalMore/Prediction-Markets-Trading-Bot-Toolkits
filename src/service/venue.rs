@@ -277,6 +277,106 @@ pub struct AttemptRecord {
 /// can't lose the order's identity.
 pub type AttemptHandle = Arc<Mutex<AttemptRecord>>;
 
+/// The proven execution bound of a signed BUY in the controlled live domain.
+///
+/// Every field is a fact the venue's own order carries, or a bound derived
+/// from it. There is no signature, no salt and no raw request here: this is
+/// what a reviewer may check, not what the venue receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedExecutionBound {
+    pub account: AccountIdentity,
+    pub market_id: u64,
+    pub token_id: String,
+    /// The exchange the order is routed to.
+    pub route: String,
+    /// The signed fee rate, in basis points.
+    pub fee_rate_bps: u32,
+    /// The gross shares the order asks for.
+    pub request_gross_atoms: U256,
+    /// The cash the order pays.
+    pub gross_cash_atoms: U256,
+    /// The most cash the order can take. For a proven share-fee BUY this is
+    /// the signed cash itself: the fee comes out of the received shares.
+    pub max_cash_atoms: U256,
+    /// The fewest net shares the order can deliver.
+    pub min_net_shares_atoms: U256,
+    /// The order's expiry, in unix seconds.
+    pub expiration: i64,
+    /// The hash of the signed order.
+    pub signed_hash: String,
+}
+
+/// The narrow seam a controlled live run installs around a real submission.
+///
+/// Every method refuses by default: a venue that ignores this hook must not
+/// be able to place a guarded order, and a guarded order must not be placeable
+/// through the ordinary path.
+pub trait ControlledSendGuard: Send + Sync {
+    /// Stop preparation immediately after any potentially suspending step.
+    fn check_preparation(&self) -> Result<()> {
+        Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send", "EXECUTION_NOT_ENABLED").into())
+    }
+
+    /// Compare the refreshed Yes-quoted book with the candidate's frozen book.
+    fn check_book(&self, _book: &BookSnapshot) -> Result<()> {
+        Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send", "EXECUTION_NOT_ENABLED").into())
+    }
+
+    /// Check the prepared facts against the frozen candidate.
+    fn check_facts(&self, _bound: &SignedExecutionBound) -> Result<()> {
+        Err(VenueError::new(
+            VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send",
+            "EXECUTION_NOT_ENABLED",
+        )
+        .into())
+    }
+
+    /// Wait until the critical order's evidence is durable.
+    fn await_durable_ack(&self, _bound: &SignedExecutionBound) -> Result<()> {
+        Err(VenueError::new(
+            VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send",
+            "EXECUTION_NOT_ENABLED",
+        )
+        .into())
+    }
+
+    /// Run the first nonblocking transport poll under the owning State lock.
+    /// The callback acquires only the attempt handle and AccountGate, in that order.
+    /// Default refusal prevents a facts-only guard from authorizing a POST.
+    fn with_send_permit(&self, _handle: &AttemptHandle,
+        _first_poll: &mut dyn FnMut(&mut AttemptRecord, &mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<()> {
+        Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send", "EXECUTION_NOT_ENABLED").into())
+    }
+
+    /// The last synchronous permission to hand the order to the transport.
+    fn permit_send(&self) -> Result<()> {
+        Err(VenueError::new(
+            VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send",
+            "EXECUTION_NOT_ENABLED",
+        )
+        .into())
+    }
+}
+
+/// What the controlled domain recorded about a signed order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledOrderMetadata {
+    /// The venue's own removal lock, when it named one.
+    pub removal_locked_until: Option<DateTime<Utc>>,
+    /// The execution generation this metadata belongs to.
+    pub execution_generation: u64,
+    /// Whether the chain proof for this generation was obtained.
+    pub chain_settled: bool,
+    /// When the chain proof was checked.
+    pub settlement_checked_at: Option<DateTime<Utc>>,
+}
+
 /// A structured failure. `code` is stable; `reason` is a stable token, never a
 /// raw error, so nothing sensitive can leak through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +453,31 @@ pub trait OrderVenue: Send + Sync {
         .into())
     }
 
+    /// The worst-case cash a controlled live BUY must reserve.
+    ///
+    /// Only a venue that has proven the BUY's fee domain may answer this: the
+    /// default refuses, so an ordinary reservation never borrows the live
+    /// domain's tighter bound.
+    fn controlled_reservation_atoms(&self, _planned: &PlannedOrder) -> Result<U256> {
+        Err(VenueError::new(
+            VenueErrorCode::ExecutionNotEnabled,
+            "controlled_reservation",
+            "EXECUTION_NOT_ENABLED",
+        )
+        .into())
+    }
+
+    /// Freeze the venue's actual signing route before any preparation await.
+    fn controlled_route(&self, _token_id: &str) -> Result<String> {
+        Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
+            "controlled_route", "SIGNED_BOUND_UNPROVEN").into())
+    }
+
+    /// What the controlled domain recorded about a signed order.
+    fn controlled_order_metadata(&self, _signed_hash: &str) -> Option<ControlledOrderMetadata> {
+        None
+    }
+
     /// Build and sign `planned`. Transmits it only when `live` is true, so a
     /// dry run exercises everything up to the wire.
     async fn place(
@@ -361,6 +486,27 @@ pub trait OrderVenue: Send + Sync {
         expiration_secs: u64,
         live: bool,
     ) -> Result<OrderTicket>;
+
+    /// Place `planned` under a controlled live guard.
+    ///
+    /// The guard is not optional here: a venue that implements the controlled
+    /// domain routes the same preparation, signing and single POST through
+    /// it, and a venue that doesn't refuses the call outright.
+    async fn place_controlled_tracked(
+        &self,
+        _planned: &PlannedOrder,
+        _expiration_secs: u64,
+        _live: bool,
+        _handle: AttemptHandle,
+        _guard: &dyn ControlledSendGuard,
+    ) -> Result<OrderTicket> {
+        Err(VenueError::new(
+            VenueErrorCode::ExecutionNotEnabled,
+            "controlled_place",
+            "EXECUTION_NOT_ENABLED",
+        )
+        .into())
+    }
 
     /// Place `planned` while keeping the attempt's identity alive across the
     /// call. Venues that don't track attempts delegate to [`OrderVenue::place`].

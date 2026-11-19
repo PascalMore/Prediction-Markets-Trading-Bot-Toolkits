@@ -32,6 +32,7 @@ use super::{
 use crate::bot::arbitrage::phase1::{
     self, CandidateContext, DecisionDiagnostic, Phase, Reason, StrategyContract,
 };
+use crate::bot::runtime::phase1_control::Phase1Run;
 
 const EPS: f64 = 1e-9;
 
@@ -164,37 +165,6 @@ impl std::fmt::Debug for PaperCash {
             .field("reservation", &self.reservation)
             .field("loss_latched", &self.loss_latched)
             .field("holdings", &self.traded.len())
-            .finish()
-    }
-}
-
-/// The phase1 state of a controlled run.
-///
-/// It lives inside the broker's own lock, next to the cash: the event
-/// sequence, the one pending candidate and the filled candidates are part
-/// of the same state, not a second ledger.
-#[derive(Clone)]
-pub struct Phase1Run {
-    /// The one clock the whole run reads.
-    pub clock: Arc<dyn Clock>,
-    /// The economics this run decides under.
-    pub contract: StrategyContract,
-    /// The minimum edge per gross share.
-    pub min_edge: f64,
-    /// The least time a round may have left.
-    pub min_secs_left: f64,
-    /// The next event sequence number.
-    pub event_seq: Arc<AtomicU64>,
-    /// A failed output cannot be retried or presented as complete evidence.
-    pub output_failed: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for Phase1Run {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Phase1Run")
-            .field("contract", &self.contract)
-            .field("min_edge", &self.min_edge)
-            .field("min_secs_left", &self.min_secs_left)
             .finish()
     }
 }
@@ -555,15 +525,66 @@ fn valid_round(market: &TradableMarket) -> bool {
         && !market.no_token.is_empty()
 }
 
-fn same_round(original: &TradableMarket, result: &TradableMarket) -> bool {
-    valid_round(result)
-        && original.id == result.id
-        && original.yes_token == result.yes_token
-        && original.no_token == result.no_token
-        && original.starts_at == result.starts_at
-        && original.ends_at == result.ends_at
-        && original.start_price == result.start_price
-        && original.feed_symbol == result.feed_symbol
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RoundIdentity {
+    Match,
+    Incomplete,
+    Contradiction,
+}
+
+/// Compare known identity fields before considering missing metadata.
+pub(super) fn same_round(original: &TradableMarket, result: &TradableMarket) -> RoundIdentity {
+    let known_tokens = !result.yes_token.is_empty() && !result.no_token.is_empty();
+    if original.id != result.id
+        || (!result.yes_token.is_empty() && original.yes_token != result.yes_token)
+        || (!result.no_token.is_empty() && original.no_token != result.no_token)
+        || (known_tokens && result.yes_token == result.no_token)
+        || result.starts_at.is_some_and(|value| Some(value) != original.starts_at)
+        || result.ends_at.is_some_and(|value| Some(value) != original.ends_at)
+        || result.start_price.is_some_and(|value| Some(value) != original.start_price)
+        || result.feed_symbol.as_deref().is_some_and(|value| !value.is_empty() && value != "BTCUSDT")
+        || result.starts_at.zip(result.ends_at).is_some_and(|(start, end)|
+            end - start != chrono::Duration::seconds(300))
+        || [result.start_price, result.end_price].into_iter().flatten()
+            .any(|value| !value.is_finite() || value <= 0.0)
+    { return RoundIdentity::Contradiction; }
+    if !known_tokens || result.starts_at.is_none() || result.ends_at.is_none()
+        || result.start_price.is_none() || result.feed_symbol.as_deref().unwrap_or("").is_empty()
+    { RoundIdentity::Incomplete } else { RoundIdentity::Match }
+}
+
+/// Whether a result read lacks facts needed to confirm or compare settlement.
+pub(super) fn incomplete_result(market: &TradableMarket) -> bool {
+    market.start_price.is_none() || market.end_price.is_none() || market.payout_yes.is_none()
+        || market.round_facts.as_ref().is_none_or(|facts| {
+            [&facts.oracle_status, &facts.trading_status, &facts.yes_status, &facts.no_status]
+                .into_iter().any(|value| value.as_deref().unwrap_or("").is_empty())
+        })
+}
+
+/// Missing rereads preserve applied facts; known revisions always win.
+pub(super) fn revised_result(
+    market: &TradableMarket,
+    applied: (f64, f64, f64),
+    identity: RoundIdentity,
+    outcome: Settlement,
+) -> bool {
+    let (start, end, payout) = applied;
+    let expected_yes = if end > start { "WON" } else { "LOST" };
+    let expected_no = if end > start { "LOST" } else { "WON" };
+    let facts = market.round_facts.as_ref();
+    let yes = facts.and_then(|facts| facts.yes_status.as_deref()).filter(|value| !value.is_empty());
+    let no = facts.and_then(|facts| facts.no_status.as_deref()).filter(|value| !value.is_empty());
+    if identity == RoundIdentity::Contradiction
+        || market.start_price.is_some_and(|value| value != start)
+        || market.end_price.is_some_and(|value| value != end)
+        || market.payout_yes.is_some_and(|value| value != payout)
+        || (end != start && (yes.is_some_and(|value| value != expected_yes)
+            || no.is_some_and(|value| value != expected_no)))
+        || (end == start && yes.zip(no).is_some_and(|(yes, no)| yes == no))
+    { return true; }
+    let missing = identity == RoundIdentity::Incomplete || incomplete_result(market);
+    !missing && outcome != Settlement::Confirmed
 }
 
 impl super::State {
@@ -634,69 +655,6 @@ impl super::Broker {
             .and_then(|paper| paper.sources.get(token).cloned())
     }
 
-    /// Install the phase1 state of this controlled run.
-    ///
-    /// Only an unsigned controlled run gets it: the clock, the economics and
-    /// the event sequence belong to that run and to no other.
-    pub fn with_phase1(
-        self,
-        clock: Arc<dyn Clock>,
-        contract: StrategyContract,
-        min_edge: f64,
-        min_secs_left: f64,
-    ) -> Result<Self> {
-        if self.controlled.is_none() {
-            bail!("CONTROLLED_MODE: only a controlled run speaks the phase1 protocol");
-        }
-        let mut state = self.state.lock();
-        let Some(paper) = state.paper.as_mut() else {
-            bail!("CONTROLLED_MODE: the controlled cash is missing");
-        };
-        paper.phase1 = Some(Phase1Run {
-            clock,
-            contract,
-            min_edge,
-            min_secs_left,
-            event_seq: Arc::new(AtomicU64::new(0)),
-            output_failed: Arc::new(AtomicBool::new(false)),
-        });
-        drop(state);
-        Ok(self)
-    }
-
-    /// Whether this run speaks the phase1 protocol.
-    pub fn is_phase1(&self) -> bool {
-        self.state
-            .lock()
-            .paper
-            .as_ref()
-            .is_some_and(|paper| paper.phase1.is_some())
-    }
-
-    /// Same-lock lifecycle checks used before emitting a selected attempt.
-    pub fn phase1_entries_stopped(&self) -> bool {
-        let state = self.state.lock();
-        self.controlled_stopped()
-            || state.entry_stop_reason.is_some()
-            || state.halted
-            || state
-                .paper
-                .as_ref()
-                .and_then(|paper| paper.phase1.as_ref())
-                .is_some_and(|run| run.output_failed.load(Ordering::SeqCst))
-            || state.paper.as_ref().is_some_and(|paper| paper.loss_latched)
-    }
-
-    /// The clock of this run, when it speaks the phase1 protocol.
-    pub fn phase1_clock(&self) -> Option<Arc<dyn Clock>> {
-        self.state
-            .lock()
-            .paper
-            .as_ref()
-            .and_then(|paper| paper.phase1.as_ref())
-            .map(|phase1| Arc::clone(&phase1.clock))
-    }
-
     /// Stop adding risk, and say why.
     ///
     /// This is the same lock the entries take, so a stop can't race past an
@@ -711,6 +669,15 @@ impl super::Broker {
         {
             state.entry_stop_reason = Some(reason);
         }
+        if let Some(run) = state.live.controlled.as_mut() {
+            let code = match reason {
+                ControlledStop::Deadline => "DEADLINE",
+                ControlledStop::ParentLost => "PARENT_LOST",
+                ControlledStop::ControlChannel => "CONTROL_CHANNEL",
+                ControlledStop::SettlementConflict => "FACT_CONFLICT",
+            };
+            run.stop(code, true, Utc::now());
+        }
         drop(state);
         self.control_changed.notify_one();
     }
@@ -719,7 +686,9 @@ impl super::Broker {
     pub(super) async fn wait_controlled_stop(&self) {
         loop {
             let notified = self.control_changed.notified();
-            if self.entry_stop_reason().is_some() {
+            if self.entry_stop_reason().is_some()
+                || self.state.lock().live.controlled.as_ref().is_some_and(|run| !run.may_add_risk())
+            {
                 return;
             }
             if self.controlled_stopped() {
@@ -794,6 +763,10 @@ impl super::Broker {
 
     /// Close entries before cleanup; never use the tail to execute strategy code.
     pub(super) async fn finish_controlled(&self, data: &dyn crate::service::venue::MarketData) {
+        if self.live_operation_lane().is_some() {
+            self.finish_controlled_live(data).await;
+            return;
+        }
         self.finish_controlled_with(data, CONTROLLED_CLEANUP_BUDGET, self.cancel_all())
             .await;
     }
@@ -990,6 +963,9 @@ impl super::Broker {
         diagnostic: &DecisionDiagnostic,
         candidate: Option<&CandidateContext>,
     ) -> bool {
+        if self.state.lock().live.controlled.is_some() {
+            return self.emit_live_evaluation(market, diagnostic, candidate);
+        }
         let mut state = self.state.lock();
         let Some(run) = state.paper.as_ref().and_then(|paper| paper.phase1.clone()) else {
             return false;
@@ -1679,7 +1655,7 @@ impl super::Broker {
     }
 
     /// Whether the controlled run's deadline has passed.
-    fn controlled_stopped(&self) -> bool {
+    pub(super) fn controlled_stopped(&self) -> bool {
         #[cfg(test)]
         if controlled_clock_expired() {
             return true;
@@ -1775,10 +1751,12 @@ impl super::Broker {
         let Some(original) = paper.traded.get(&market.id) else {
             return;
         };
-        let identity_matches = same_round(original, market);
+        let identity = same_round(original, market);
         let prices = market.start_price.zip(market.end_price);
-        let mut outcome = if !identity_matches {
+        let mut outcome = if identity == RoundIdentity::Contradiction {
             Settlement::Conflict
+        } else if identity == RoundIdentity::Incomplete {
+            Settlement::Pending
         } else if let (Some(facts), Some((start, end))) = (market.round_facts.as_ref(), prices) {
             settle_from_facts(market, facts, start, end)
         } else {
@@ -1794,17 +1772,14 @@ impl super::Broker {
             } else {
                 0.5
             };
-            if payout != Some(expected) {
+            if payout.is_none() {
+                outcome = Settlement::Pending;
+            } else if payout != Some(expected) {
                 outcome = Settlement::Conflict;
             }
         }
         if let Some(applied) = paper.applied_results.get(&market.id) {
-            if outcome != Settlement::Confirmed
-                || prices
-                    .zip(payout)
-                    .map(|((start, end), paid)| (start, end, paid))
-                    != Some(*applied)
-            {
+            if revised_result(market, *applied, identity, outcome) {
                 state
                     .paper
                     .as_mut()

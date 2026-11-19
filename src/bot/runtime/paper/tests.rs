@@ -1977,6 +1977,160 @@ fn a_draw_requires_opposite_official_outcomes() {
     );
 }
 
+struct SettlementData(TradableMarket);
+#[async_trait::async_trait]
+impl crate::service::venue::MarketData for SettlementData {
+    async fn market(&self, id: u64) -> Result<TradableMarket> {
+        assert_eq!(id, self.0.id);
+        Ok(self.0.clone())
+    }
+    async fn markets(&self, _: &crate::service::venue::MarketQuery) -> Result<Vec<TradableMarket>> {
+        panic!("SCAN_FORBIDDEN")
+    }
+    async fn with_schedule(&self, _: &TradableMarket) -> Result<TradableMarket> {
+        panic!("SCHEDULE_FORBIDDEN")
+    }
+    async fn books(&self, _: &[u64]) -> Result<HashMap<u64, BookSnapshot>> {
+        panic!("BOOK_FORBIDDEN")
+    }
+}
+
+#[tokio::test]
+async fn missing_official_identity_is_pending_then_pays_once() {
+    let broker = controlled(100.0);
+    let mut market = marked_market();
+    let book = book(&[(0.4, 100.0)], &[(0.4, 100.0)]);
+    broker.observe(&market, &book);
+    broker.take(&market, "yes-1", Side::Buy, 5.0, 0.4, &book).await.unwrap();
+    market.open = false;
+    market.end_price = Some(101.0);
+    market.payout_yes = Some(1.0);
+    market.round_facts = Some(facts("WON", "LOST"));
+    let mut missing = market.clone();
+    missing.feed_symbol = None;
+    broker.settle_resolved(&SettlementData(missing)).await.unwrap();
+    assert_eq!(broker.state.lock().paper.as_ref().unwrap().settlements[&1], Settlement::Pending);
+    assert_eq!(broker.paper_snapshot().unwrap().cash, 98.0);
+    assert_eq!(broker.paper_snapshot().unwrap().cost, 2.0);
+    assert!(broker.entry_stop_reason().is_none());
+    broker.settle_resolved(&SettlementData(market.clone())).await.unwrap();
+    broker.settle_resolved(&SettlementData(market)).await.unwrap();
+    assert!((broker.paper_snapshot().unwrap().cash - 102.9).abs() < EPS);
+}
+
+fn missing_result(market: &mut TradableMarket, field: &str) {
+    match field {
+        "yes" => market.yes_token.clear(),
+        "no" => market.no_token.clear(),
+        "start" => market.starts_at = None,
+        "end" => market.ends_at = None,
+        "strike" => market.start_price = None,
+        "feed" => market.feed_symbol = None,
+        "empty_feed" => market.feed_symbol = Some(String::new()),
+        "end_price" => market.end_price = None,
+        "payout" => market.payout_yes = None,
+        "facts" => market.round_facts = None,
+        "yes_status" => market.round_facts.as_mut().unwrap().yes_status = None,
+        "no_status" => market.round_facts.as_mut().unwrap().no_status = None,
+        "oracle" => market.round_facts.as_mut().unwrap().oracle_status = None,
+        "trading" => market.round_facts.as_mut().unwrap().trading_status = None,
+        "all" => {
+            market.yes_token.clear(); market.no_token.clear();
+            market.starts_at = None; market.ends_at = None; market.start_price = None;
+            market.feed_symbol = None; market.end_price = None; market.payout_yes = None;
+            market.round_facts = None;
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn official_missing_matrix_preserves_pending_and_applied_books() {
+    for payout in [0.0, 0.5, 1.0] {
+        for field in ["yes", "no", "start", "end", "strike", "feed", "empty_feed", "end_price",
+            "payout", "facts", "yes_status", "no_status", "oracle", "trading", "all"] {
+            let broker = controlled(100.0);
+            let mut market = marked_market();
+            let book = book(&[(0.4, 100.0)], &[(0.4, 100.0)]);
+            broker.observe(&market, &book);
+            broker.take(&market, "yes-1", Side::Buy, 5.0, 0.4, &book).await.unwrap();
+            market.open = false;
+            market.end_price = Some(if payout == 1.0 { 101.0 } else if payout == 0.0 { 99.0 } else { 100.0 });
+            market.payout_yes = Some(payout);
+            market.round_facts = Some(if payout == 0.0 { facts("LOST", "WON") } else { facts("WON", "LOST") });
+            let mut missing = market.clone();
+            missing_result(&mut missing, field);
+            let before = broker.paper_snapshot().unwrap();
+            broker.settle_resolved(&SettlementData(missing.clone())).await.unwrap();
+            // A DRAW's explicit payout may be absent: the exact tie supplies 0.5.
+            let draw_payout = payout == 0.5 && field == "payout";
+            if !draw_payout {
+                assert_eq!(broker.paper_snapshot().unwrap(), before, "{field}/{payout}");
+                assert_eq!(broker.state.lock().paper.as_ref().unwrap().settlements[&1], Settlement::Pending);
+                assert!(!broker.holdings().is_empty());
+            }
+            assert!(broker.entry_stop_reason().is_none(), "{field}/{payout}");
+            broker.settle_resolved(&SettlementData(market.clone())).await.unwrap();
+            let paid = broker.paper_snapshot().unwrap();
+            assert!((paid.cash - (98.0 + 4.9 * payout)).abs() < EPS);
+            assert!(broker.holdings().is_empty());
+            let reread = crate::service::venue::MarketData::market(&SettlementData(missing), 1).await.unwrap();
+            broker.controlled_settle(&reread);
+            broker.controlled_settle(&market);
+            assert_eq!(broker.paper_snapshot().unwrap(), paid, "{field}/{payout}");
+            assert_eq!(broker.state.lock().paper.as_ref().unwrap().settlements[&1], Settlement::Confirmed);
+            assert!(broker.entry_stop_reason().is_none(), "post-paid {field}/{payout}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn official_known_contradictions_win_over_missing_fields() {
+    for applied in [false, true] {
+        for fault in ["yes", "no", "same_tokens", "start", "end", "strike", "nan", "zero", "negative", "infinity", "invalid_end", "feed",
+            "end_price", "payout", "outcome", "dispute", "nonterminal"] {
+            let broker = controlled(100.0);
+            let mut market = marked_market();
+            let book = book(&[(0.4, 100.0)], &[(0.4, 100.0)]);
+            broker.observe(&market, &book);
+            broker.take(&market, "yes-1", Side::Buy, 5.0, 0.4, &book).await.unwrap();
+            market.open = false; market.end_price = Some(101.0); market.payout_yes = Some(1.0);
+            market.round_facts = Some(facts("WON", "LOST"));
+            if applied { broker.settle_resolved(&SettlementData(market.clone())).await.unwrap(); }
+            let before = broker.paper_snapshot().unwrap();
+            match fault {
+                "yes" => { market.yes_token = "alien".into(); market.feed_symbol = None; }
+                "no" => { market.no_token = "alien".into(); market.starts_at = None; }
+                "same_tokens" => { market.no_token = market.yes_token.clone(); market.start_price = None; }
+                "start" => { market.starts_at = market.starts_at.map(|value| value + chrono::Duration::seconds(1)); market.feed_symbol = None; }
+                "end" => { market.ends_at = market.ends_at.map(|value| value + chrono::Duration::seconds(1)); market.yes_token.clear(); }
+                "strike" => { market.start_price = Some(102.0); market.feed_symbol = None; }
+                "nan" => { market.start_price = Some(f64::NAN); market.ends_at = None; }
+                "zero" => { market.start_price = Some(0.0); market.starts_at = None; }
+                "negative" => { market.start_price = Some(-1.0); market.feed_symbol = None; }
+                "infinity" => { market.start_price = Some(f64::INFINITY); market.no_token.clear(); }
+                "invalid_end" => { market.end_price = Some(f64::NAN); market.round_facts = None; }
+                "feed" => { market.feed_symbol = Some("ETHUSDT".into()); market.start_price = None; }
+                "end_price" => { market.end_price = Some(102.0); market.round_facts = None; }
+                "payout" => { market.payout_yes = Some(0.0); market.end_price = None; }
+                "outcome" => { market.round_facts.as_mut().unwrap().yes_status = Some("LOST".into()); market.round_facts.as_mut().unwrap().no_status = None; }
+                "dispute" => market.contested = true,
+                "nonterminal" => market.round_facts.as_mut().unwrap().oracle_status = Some("PENDING".into()),
+                _ => unreachable!(),
+            }
+            // settle_resolved scans holdings only; explicitly exercise the same
+            // application consumer after payment has removed those holdings.
+            let reread = crate::service::venue::MarketData::market(&SettlementData(market), 1).await.unwrap();
+            broker.controlled_settle(&reread);
+            assert_eq!(broker.paper_snapshot().unwrap(), before, "{fault}/{applied}");
+            let conflict = applied || !["end_price", "payout", "outcome", "dispute", "nonterminal"].contains(&fault);
+            assert_eq!(broker.state.lock().paper.as_ref().unwrap().settlements[&1],
+                if conflict { Settlement::Conflict } else { Settlement::Pending }, "{fault}/{applied}");
+            assert_eq!(broker.entry_stop_reason().is_some(), conflict, "{fault}/{applied}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn official_result_identity_and_post_payment_conflict_preserve_cash() {
     let broker = controlled(100.0);

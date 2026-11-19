@@ -61,6 +61,19 @@ struct Cli {
     #[arg(long)]
     controlled_deadline_at: Option<String>,
 
+    /// Explicit 07-007 strategy contract (all five live options belong together).
+    #[arg(long)]
+    controlled_live_contract: Option<String>,
+    #[arg(long)]
+    controlled_operations_mode: Option<String>,
+    #[arg(long)]
+    controlled_risk_window_id: Option<String>,
+    #[arg(long)]
+    controlled_authorization_ref: Option<String>,
+    /// Fixed run evidence path, never an arbitrary context file.
+    #[arg(long)]
+    controlled_live_manifest: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -131,6 +144,44 @@ impl From<BotKindArg> for BotKind {
     }
 }
 
+impl Cli {
+    /// Resolve only public arguments; reject wrong/partial entry points before any file or secret.
+    fn controlled_run(&self) -> Result<Option<polymarket_toolkits::config::ControlledRun>> {
+        use polymarket_toolkits::config::{controlled_live::ControlledLiveOptions, ControlledRun};
+        let live_fields = [
+            self.controlled_live_contract.is_some(), self.controlled_operations_mode.is_some(),
+            self.controlled_risk_window_id.is_some(), self.controlled_authorization_ref.is_some(),
+            self.controlled_live_manifest.is_some(),
+        ];
+        let explicit_live = live_fields.iter().any(|present| *present);
+        let run = if explicit_live {
+            if !live_fields.iter().all(|present| *present)
+                || self.controlled_mode.as_deref() != Some("signed-future-live")
+                || self.venue.is_some()
+                || !matches!(self.command, Some(Command::Run { bot: BotKindArg::BtcArb }))
+            {
+                anyhow::bail!("CONTROLLED_MODE: LIVE_ARGUMENTS");
+            }
+            let options = ControlledLiveOptions::from_arguments(
+                self.controlled_live_contract.as_deref(), self.controlled_operations_mode.as_deref(),
+                self.controlled_risk_window_id.as_deref(), self.controlled_authorization_ref.as_deref(),
+                self.controlled_deadline_at.as_deref(), self.controlled_started_at.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("CONTROLLED_MODE: START"))?,
+            )?.expect("all live arguments are present");
+            Some(ControlledRun::from_live_arguments(
+                self.controlled_mode.as_deref(), self.controlled_run_id.as_deref(),
+                self.controlled_started_at.as_deref(), self.controlled_deadline_at.as_deref(), options,
+            )?)
+        } else {
+            ControlledRun::from_arguments(
+                self.controlled_mode.as_deref(), self.controlled_run_id.as_deref(),
+                self.controlled_started_at.as_deref(), self.controlled_deadline_at.as_deref(),
+            )?
+        };
+        Ok(run)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -158,6 +209,11 @@ async fn main() -> Result<()> {
         Err(_) => anyhow::bail!("INVALID_INPUT/CLI_ARGUMENTS"),
     };
 
+    let mut controlled = cli.controlled_run()?;
+    if let (Some(run), Some(path)) = (controlled.as_mut(), cli.controlled_live_manifest.as_deref()) {
+        polymarket_toolkits::config::controlled_live::read_live_context(run, path)?;
+    }
+
     // The confirmation is parsed before any credential is read, and it holds
     // no secret: it is a declaration about one account.
     let confirmation = match cli.predict_budget_confirmation.as_deref() {
@@ -183,13 +239,6 @@ async fn main() -> Result<()> {
         reconciled_orders: cli.predict_reconciled_order,
         rpc_url,
     };
-
-    let controlled = polymarket_toolkits::config::ControlledRun::from_arguments(
-        cli.controlled_mode.as_deref(),
-        cli.controlled_run_id.as_deref(),
-        cli.controlled_started_at.as_deref(),
-        cli.controlled_deadline_at.as_deref(),
-    )?;
 
     let mut cfg = match &controlled {
         Some(run) => {
@@ -234,6 +283,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("CONTROLLED_MODE: LIVE_OPTION_REFUSED");
             }
             let mut cfg = AppConfig::load_controlled(&cli.config, run.mode)?;
+            cfg.controlled_live = run.live.clone();
             cfg.controlled = Some(run.clone());
             cfg
         }
@@ -271,5 +321,65 @@ async fn main() -> Result<()> {
             _ => predict_fun::check(&cfg, sign_in).await,
         },
         Some(Command::Tui) | None => ui::run(cfg).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_args() -> Vec<&'static str> {
+        vec!["bot", "--controlled-mode", "signed-future-live",
+            "--controlled-run-id", "live-test", "--controlled-started-at", "2026-11-19T04:00:00Z",
+            "--controlled-deadline-at", "2026-11-19T05:00:00Z",
+            "--controlled-live-contract", "phase1_net_shares", "--controlled-operations-mode", "supervised",
+            "--controlled-risk-window-id", "window-1", "--controlled-authorization-ref", "auth-1",
+            "--controlled-live-manifest", "/not-read/live-context.json", "run", "btc-arb"]
+    }
+
+    #[test]
+    fn live_cli_resolves_short_budget_without_reading_credentials_or_manifest() {
+        let run = Cli::try_parse_from(live_args()).unwrap().controlled_run().unwrap().unwrap();
+        assert_eq!(run.live.unwrap().budget_secs, 3600);
+    }
+
+    #[test]
+    fn every_partial_live_cli_group_is_refused_before_file_reads() {
+        for option in ["--controlled-live-contract", "--controlled-operations-mode",
+            "--controlled-risk-window-id", "--controlled-authorization-ref", "--controlled-live-manifest"] {
+            let mut args = live_args();
+            let position = args.iter().position(|value| *value == option).unwrap();
+            args.drain(position..position + 2);
+            assert!(Cli::try_parse_from(args).unwrap().controlled_run().is_err(), "{option}");
+        }
+    }
+
+    #[test]
+    fn live_cli_rejects_unsigned_wrong_strategy_tui_and_check_before_file_reads() {
+        for (old, new) in [("signed-future-live", "unsigned-paper"), ("btc-arb", "sports")] {
+            let mut args = live_args();
+            let position = args.iter().position(|value| *value == old).unwrap();
+            args[position] = new;
+            assert!(Cli::try_parse_from(args).unwrap().controlled_run().is_err());
+        }
+        for command in ["tui", "check-venue"] {
+            let mut args = live_args();
+            args.truncate(args.len() - 2);
+            args.push(command);
+            assert!(Cli::try_parse_from(args).unwrap().controlled_run().is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_cli_keeps_ordinary_and_fixed_unsigned_and_signed_budgets() {
+        assert!(Cli::try_parse_from(["bot", "run", "btc-arb"]).unwrap().controlled_run().unwrap().is_none());
+        for (mode, deadline) in [("unsigned-paper", "2026-11-22T04:00:00Z"),
+            ("signed-future-live", "2026-11-19T10:00:00Z")] {
+            let run = Cli::try_parse_from(["bot", "--controlled-mode", mode,
+                "--controlled-run-id", "legacy", "--controlled-started-at", "2026-11-19T04:00:00Z",
+                "--controlled-deadline-at", deadline, "run", "btc-arb"])
+                .unwrap().controlled_run().unwrap().unwrap();
+            assert!(run.live.is_none());
+        }
     }
 }

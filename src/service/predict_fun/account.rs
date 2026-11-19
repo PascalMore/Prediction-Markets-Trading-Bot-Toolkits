@@ -14,9 +14,12 @@ use crate::service::venue::{
 };
 use alloy_primitives::{address, Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolEvent};
+use parking_lot::Mutex as ParkingMutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+pub mod controlled;
 
 /// In-memory synthetic test boundary; no socket, real signing or credentials.
 #[cfg(test)]
@@ -1097,7 +1100,7 @@ pub fn account_key(identity: &AccountIdentity) -> String {
 
 /// One account's state.
 #[derive(Debug, Default)]
-struct AccountState {
+pub(super) struct AccountState {
     /// Attempts that may have been submitted and aren't resolved yet.
     unconfirmed: HashMap<u64, String>,
     /// Reads that failed, by step. A successful read clears its own step only.
@@ -2053,6 +2056,9 @@ pub(crate) mod tests {
                 rpc_url: Some(parse_rpc_url("https://synthetic.invalid").unwrap()),
                 ..RunContext::default()
             })),
+            controlled_metadata: parking_lot::RwLock::new(
+                crate::service::predict_fun::controlled::ControlledMetadataStore::new(),
+            ),
         };
         let market: ApiMarket = serde_json::from_value(json!({"id":1,"tradingStatus":"OPEN","conditionId":B256::repeat_byte(0xcc),"isNegRisk":false,"isYieldBearing":false,"feeRateBps":0,"outcomes":[{"onChainId":"77"},{"onChainId":"88"}]})).unwrap();
         trader.client.remember_market(&market);

@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,23 @@ MODE_SIGNED_FUTURE_LIVE = "signed-future-live"
 RUN_SECONDS = 21_600
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
-PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-18-btc5m-paper72-readiness/evidence/implement72/cargo-target/debug/polymarket-toolkits"
+PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-observer-runtime-fix/evidence/validate-v11/cargo-target/debug/polymarket-toolkits"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa"
+LIVE_PATHS = (
+    "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
+    "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
+    "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/channel.rs",
+    "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/live_accounting.rs",
+    "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/types.rs",
+    "src/bot/runtime/live_events/tests.rs", "src/service/predict_fun/request.rs",
+    "src/service/predict_fun/controlled.rs", "src/service/predict_fun/fills.rs",
+    "src/service/predict_fun/account.rs", "src/service/predict_fun/account/controlled.rs",
+    "tools/predictfun/btc5m_live_events.py", "tools/predictfun/btc5m_live_guard.py",
+    "tools/predictfun/tests/test_btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_guard.py",
+    "tools/predictfun/local_signer.py", "tools/predictfun/README.md", "docs/LIVE-TRADING.md",
+    "Cargo.toml", "Cargo.lock",
+)
 CLEANUP_SECONDS = 30
 TAIL_SECONDS = 600
 MAX_LINE_BYTES = 64 * 1024
@@ -103,6 +120,14 @@ class _Parser(argparse.ArgumentParser):
         raise Refused("CONTROLLED_MODE", "args", "BAD_ARGUMENTS")
 
 
+class _Duration(argparse.Action):
+    """Preserve the old parsed default while retaining explicit-option provenance."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.duration_supplied = True
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define the fixed public interface: a mode, a config and a run id."""
     parser = _Parser(prog="btc5m_control", allow_abbrev=False)
@@ -113,7 +138,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predict-budget-confirmation")
     parser.add_argument("--predict-rpc-url")
     parser.add_argument("--post-entry-observer", action="store_true")
-    parser.add_argument("--duration-hours", type=int, choices=(6, 72), default=6)
+    parser.set_defaults(duration_supplied=False)
+    parser.add_argument("--duration-hours", type=int, choices=(6, 72), default=6, action=_Duration)
+    parser.add_argument("--live-contract", choices=(STRATEGY_CONTRACT,))
+    parser.add_argument("--operations-mode", choices=("supervised", "unattended"))
+    parser.add_argument("--risk-window-id")
+    parser.add_argument("--authorization-ref")
+    parser.add_argument("--deadline-at")
     return parser
 
 
@@ -402,7 +433,7 @@ class Evidence:
         self.files.append(path)
 
 
-def public_identity(environment: dict[str, str], paper72: bool = False) -> dict[str, Any]:
+def public_identity(environment: dict[str, str], paper72: bool = False, *, live: bool = False) -> dict[str, Any]:
     """Resolve fixed Git identities and actual public candidate bytes."""
     paths = ("src/config.rs", "src/main.rs", "src/bot/runtime.rs", "src/bot/runtime/paper.rs",
              "src/bot/arbitrage.rs", "src/bot/arbitrage/replay/driver.rs", "src/service/venue.rs",
@@ -430,8 +461,12 @@ def public_identity(environment: dict[str, str], paper72: bool = False) -> dict[
             if re.fullmatch("[0-9a-f]{40}", head) is None:
                 raise ValueError("HEAD")
             identity[f"{label}_head"] = head
-        binary = PAPER72_BINARY if paper72 else BOT / "target/debug/polymarket-toolkits"
+        binary = LIVE_BINARY if live else (PAPER72_BINARY if paper72 else BOT / "target/debug/polymarket-toolkits")
         identity["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        if live:
+            if identity["binary_sha256"] != LIVE_BINARY_SHA256 or not os.access(binary, os.X_OK):
+                raise ValueError("BINARY_IDENTITY")
+            paths = tuple(sorted(set(paths) | set(LIVE_PATHS)))
         identity["files"] = {name: hashlib.sha256((BOT / name).read_bytes()).hexdigest()
                              for name in paths}
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -644,7 +679,9 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
     # decision has already reached its terminal event.
     relations = _EventRelations()
     run_seconds = RUN_SECONDS if run_seconds is None else run_seconds
-    paper72 = evidence.mode == MODE_UNSIGNED_PAPER and run_seconds == PAPER72_SECONDS
+    from btc5m_live_events import LiveEventStore
+    live = isinstance(evidence, LiveEventStore)
+    paper72 = not live and evidence.mode == MODE_UNSIGNED_PAPER and run_seconds == PAPER72_SECONDS
     line_limit = PAPER72_FINAL_BYTES if paper72 else MAX_LINE_BYTES
     # The observation channel, when the run opted into it. It is read only
     # after the original stream, and a failure in it never stops the run.
@@ -658,12 +695,12 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                 observer["receiver"].store.reason("TRANSPORT_SETUP_FAILED")
                 observer_socket = None
 
-    def stop(signum=None, _frame=None):
+    def stop(signum=None, _frame=None, *, reason="OUTPUT_INVALID"):
         nonlocal cleanup_at, final
         if signum is None:
             final = None
         facts["launcher_exit"] = 128 + signum if signum else 1
-        facts["stop_reason"] = "SIGNAL" if signum else "OUTPUT_INVALID"
+        facts["stop_reason"] = "SIGNAL" if signum else reason
         proposed = boottime() + CLEANUP_SECONDS
         cleanup_at = min(cleanup_at, proposed) if cleanup_at is not None else proposed
         if process.stdin and not process.stdin.closed:
@@ -712,6 +749,18 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
         except Exception:
             receiver.store.reason("INVALID_FRAME")
 
+    def acknowledge(raw):
+        # No ACK after local stop/deadline, even if persistence itself was slow.
+        elapsed = max(boottime() - started_boot,
+                      (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds())
+        if facts["stop_reason"] is not None or elapsed >= run_seconds:
+            raise ValueError("ACK_REFUSED")
+        if not process.stdin or process.stdin.closed:
+            raise ValueError("CONTROL_CHANNEL")
+        if process.stdin.write(raw) != len(raw):
+            raise ValueError("CONTROL_CHANNEL")
+        process.stdin.flush()
+
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             old_signals[signum] = signal.signal(signum, stop)
@@ -719,7 +768,8 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
             buffers[stream] = bytearray()
-        with open(evidence.directory / "events.jsonl", "x", encoding="utf-8") as events:
+        output = nullcontext(None) if live else open(evidence.directory / "events.jsonl", "x", encoding="utf-8")
+        with output as events:
             while selector.get_map() or process.poll() is None:
                 elapsed = max(boottime() - started_boot,
                               (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds())
@@ -765,6 +815,14 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                             try:
                                 if facts["stop_reason"] == "OUTPUT_INVALID":
                                     raise ValueError("OUTPUT_INVALID")
+                                if live:
+                                    if stream is not process.stdout:
+                                        raise ValueError("OUTPUT_INVALID")
+                                    event = evidence.append(raw, acknowledge)
+                                    facts["events"] += 1
+                                    if event["event_kind"] == "final":
+                                        final = event
+                                    continue
                                 event = validate_event(raw[len(EVENT_PREFIX):], evidence.run_id, evidence.mode)
                                 if len(raw) > MAX_LINE_BYTES and not (paper72 and event["event_kind"] == "final"):
                                     raise ValueError("OUTPUT_INVALID")
@@ -804,8 +862,8 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                                         observer["receiver"].note_trade_event(event)
                                     except Exception:
                                         observer["receiver"].store.reason("RELATION_INVALID")
-                            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
-                                stop()
+                            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError) as error:
+                                stop(reason=getattr(error, "reason", "OUTPUT_INVALID") if live else "OUTPUT_INVALID")
                 # The trading stream has had its turn; the observation may now
                 # be read, at most one frame per turn.
                 drain_observer()
@@ -1562,6 +1620,135 @@ def _check_decision_formulas(decision: dict[str, Any]) -> None:
                 check("execution_edge", executed_ev / shares)
 
 
+def finish_live_evidence(store: Any, facts: dict[str, Any], final: dict[str, Any] | None) -> None:
+    """Record native exits and the producer's independent completeness flags."""
+    import btc5m_live_events as live
+    native = {key: facts[key] for key in
+              ("launcher_exit", "child_returncode", "child_signal", "forced_cleanup", "stop_reason")}
+    payload = final["payload"] if final else {}
+    if final:
+        # The strict wire's stop reason is the producer's final reason; native
+        # return code/signal and forced cleanup remain independent facts.
+        native["stop_reason"] = payload["stop_reason"]
+    if native["stop_reason"] is None:
+        native["stop_reason"] = "PROCESS_FAILED"
+    if native["stop_reason"] not in live.REASONS:
+        native["stop_reason"] = "PROCESS_FAILED"
+    flags = {key: payload.get(key, key == "takeover_required") for key in
+             ("execution_complete", "cash_complete", "audit_complete", "takeover_required")}
+    reason = None
+    if not final:
+        reason = "AUDIT_UNAVAILABLE"
+    elif (native["launcher_exit"] != 0 or native["child_returncode"] != 0
+          or native["forced_cleanup"] or native["child_signal"] is not None):
+        reason = "PROCESS_FAILED"
+    elif not all(flags[key] for key in ("execution_complete", "cash_complete", "audit_complete")):
+        reason = "FACT_INCOMPLETE"
+    store.finish({"schema_version": live.SCHEMA_VERSION, "run_id": store.started["run_id"],
+                  "exit_facts": native, "final_event_seq": final["event_seq"] if final else None,
+                  "final_accounting": final["accounting"] if final else None,
+                  "incomplete_reason": reason, **flags})
+
+
+def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[str, str],
+             started_at: datetime.datetime, started_boot: float,
+             evidence_root: Path | None, popen: Any) -> dict[str, Any]:
+    """Thin explicit 07-007 lifecycle; the original supervisor owns the sole child."""
+    import btc5m_live_events as live
+    import btc5m_live_guard as guard
+    store = None
+    lock = None
+    process = None
+    facts = {"launcher_exit": 1, "child_returncode": None, "child_signal": None,
+             "forced_cleanup": False, "stop_reason": "PROCESS_FAILED"}
+    final = None
+    try:
+        deadline = live.timestamp(args.deadline_at)
+        if not datetime.timedelta(0) < deadline - started_at <= datetime.timedelta(seconds=RUN_SECONDS):
+            raise Refused("CONTROLLED_MODE", "args", "DEADLINE")
+        for value in (args.risk_window_id, args.authorization_ref):
+            if RUN_ID_PATTERN.fullmatch(value) is None:
+                raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
+        local_signer._check_environment(environment)
+        identity = public_identity(environment, live=True)
+        if os.path.lexists(BOT / "tools/predictfun/.keyring-no-credentials"):
+            raise Refused("CONTROLLED_MODE", "paths", "CREDENTIAL_PATH_PRESENT")
+        activation = live.strict_json(live._read_file(guard.ACTIVATION_PATH, MAX_LINE_BYTES))
+        started_text = started_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        deadline_text = args.deadline_at
+        started = {"schema_version": live.SCHEMA_VERSION, "strategy_contract": args.live_contract,
+                   "operations_mode": args.operations_mode, "risk_window_id": args.risk_window_id,
+                   "account_identity": activation["account_identity"], "authorization_ref": args.authorization_ref,
+                   "recovery_policy": "COLD_START_REFUSE", "cash_recovery_policy": "MANUAL_PAUSE",
+                   "asset_units": {"collateral_symbol": "USDT", "collateral_decimals": 18,
+                                   "share_decimals": 18, "gas_symbol": "BNB", "gas_decimals": 18},
+                   "run_id": args.run_id, "started_at": started_text, "deadline_at": deadline_text,
+                   "candidate_identity": identity,
+                   "public_config_identity": {"sha256": hashlib.sha256(live.canonical(data)).hexdigest(),
+                                              "initial_cash": 100, "max_order_usd": 2, "max_market_usd": 2,
+                                              "max_total_usd": 10, "max_loss_usd": 20}}
+        context = {key: started[key] for key in set(live.CONTEXT_KEYS.split()) & set(started)}
+        context.update(schema_version="btc5m-live-context/1", candidate_digest=live.candidate_digest(started),
+                       gas_policy=activation["gas_policy"])
+        live.check_metadata(started, data, context)
+        guard.validate_activation(activation, context, datetime.datetime.now(datetime.timezone.utc))
+        date = started_at.astimezone(datetime.timezone(datetime.timedelta(hours=8))).date().isoformat()
+        root = evidence_root or BOT.parents[4] / f"data/reports/{date}-btc5m-controlled-paper/evidence"
+        directory = root / args.run_id
+        if directory.exists() or directory.is_symlink():
+            raise Refused("DUPLICATE_RUN", "evidence", "DUPLICATE_RUN")
+        lock = guard.AccountLock(started["account_identity"], args.mode).acquire()
+        guard.arm_live_guard(lock, context)
+        root.mkdir(parents=True, exist_ok=True)
+        store = live.LiveEventStore(directory, started, data, context)
+        # All actual trading-secret reads follow the persistent barrier and durable metadata.
+        child_env = local_signer.build_child_env(local_signer._read_owned(), environment)
+        command = child_arguments(LIVE_BINARY, directory / "public-config.json", args.run_id,
+                                  started_text, deadline_text)
+        command[command.index("--controlled-mode") + 1] = args.mode
+        command[1:1] = ["--predict-budget-confirmation", args.predict_budget_confirmation,
+                        "--predict-rpc-url", args.predict_rpc_url,
+                        "--controlled-live-contract", args.live_contract,
+                        "--controlled-operations-mode", args.operations_mode,
+                        "--controlled-risk-window-id", args.risk_window_id,
+                        "--controlled-authorization-ref", args.authorization_ref,
+                        "--controlled-live-manifest", str(directory / "live-context.json")]
+        seconds = (deadline - started_at).total_seconds()
+        if max(boottime() - started_boot,
+               (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds()) >= seconds:
+            facts["stop_reason"] = "DEADLINE"
+        else:
+            process = popen(command, cwd=BOT, env=child_env, shell=False, close_fds=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            pass_fds=())
+            facts, final = supervise(process, store, started_at, started_boot, run_seconds=seconds)
+    except Refused:
+        raise
+    except guard.GuardRefused as error:
+        raise Refused("CONTROLLED_MODE", "guard", error.reason) from None
+    except Failure:
+        facts["stop_reason"] = "KEYRING_UNAVAILABLE"
+    except (live.LiveInvalid, OSError, KeyError, TypeError):
+        if store is None:
+            raise Refused("CONTROLLED_MODE", "context", "RECOVERY_GUARD_UNAVAILABLE") from None
+        facts["launcher_exit"] = 1
+    finally:
+        try:
+            if store is not None:
+                try:
+                    # A corrupt/ambiguous write must not be repaired into a healthy ending.
+                    if not store.failed:
+                        finish_live_evidence(store, facts, final)
+                finally:
+                    store.close()
+        except (OSError, ValueError):
+            facts["launcher_exit"] = 1
+        finally:
+            if lock is not None and (process is None or process.poll() is not None):
+                lock.close()
+    return facts
+
+
 def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = None,
         evidence_root: Path | None = None, popen: Any = subprocess.Popen) -> dict[str, Any]:
     """Validate, freeze and supervise one fixed child; never automatically restart."""
@@ -1572,6 +1759,12 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
     if RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise Refused("CONTROLLED_MODE", "args", "RUN_ID")
     unsigned = args.mode == MODE_UNSIGNED_PAPER
+    live_options = (args.live_contract, args.operations_mode, args.risk_window_id,
+                    args.authorization_ref, args.deadline_at)
+    new_live = any(value is not None for value in live_options)
+    if new_live and (unsigned or not all(value is not None for value in live_options)
+                     or args.duration_supplied or args.post_entry_observer):
+        raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
     paper72 = args.duration_hours == 72
     if paper72 and not unsigned:
         raise Refused("CONTROLLED_MODE", "args", "DURATION_REFUSED")
@@ -1592,6 +1785,8 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
             raise Refused("CONTROLLED_MODE", "args", "LIVE_CONFIRMATION")
     data = read_public_config(Path(args.config))
     check_fixed_values(data, args.mode)
+    if new_live:
+        return run_live(args, data, environment, started_at, started_boot, evidence_root, popen)
     if unsigned:
         api_key = check_environment(environment)
     else:

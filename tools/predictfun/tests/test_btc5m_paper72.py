@@ -265,6 +265,47 @@ def test_duration_refusal_precedes_config_credentials_or_child():
     assert control.check_paths(Path("absent"), True)[1] == control.PAPER72_BINARY
 
 
+def test_paper72_launcher_consumes_the_approved_candidate_binary(tmp_path):
+    """The 72h launcher's child path is the approved candidate, proven by bytes.
+
+    The assertion is on the literal ROOT-relative path and on the binary's
+    SHA256, never on the constant against itself: check_paths, public_identity
+    and child_arguments must all resolve to the same approved bytes.
+    """
+    root = control.BOT.parents[4]
+    expected = root / ("data/reports/2026-11-19-btc5m-observer-runtime-fix/evidence/"
+                       "validate-v11/cargo-target/debug/polymarket-toolkits")
+    assert control.PAPER72_BINARY == expected
+    assert control.PAPER72_BINARY.is_file()
+    digest = hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest()
+    assert digest == "09ac37334c644c354c5565e5da3e3836815c14bb03161c44386966efaf91eca0"
+
+    # check_paths hands the very same path to the launcher.
+    assert control.check_paths(Path("absent"), True)[1] == expected
+    # public_identity proves the bytes it will start.
+    identity = control.public_identity({}, True)
+    assert identity["binary_sha256"] == digest
+    # child_arguments starts exactly those bytes.
+    start = datetime.datetime.now(datetime.timezone.utc)
+    command = control.child_arguments(expected, tmp_path / "absent.json", "run-1",
+                                      start.isoformat(),
+                                      (start + datetime.timedelta(hours=72)).isoformat())
+    assert Path(command[0]) == expected
+    assert Path(command[0]).read_bytes() == control.PAPER72_BINARY.read_bytes()
+
+    # Unchanged behaviour: the default budget stays 6h and a signed 72h run
+    # is refused before any path, config or credential is touched.
+    assert control.build_parser().parse_args(["--mode", "unsigned-paper", "--config", "absent",
+                                              "--run-id", "run-1"]).duration_hours == 6
+    with patch.object(control, "read_public_config", side_effect=AssertionError("CONFIG_FORBIDDEN")):
+        with pytest.raises(control.Refused, match="CONTROLLED_MODE") as refused:
+            control.run(["--mode", "signed-future-live", "--config", "absent",
+                         "--run-id", "run-1", "--duration-hours", "72"], environment={})
+    assert refused.value.reason == "DURATION_REFUSED"
+    print(json.dumps({"scenario": "approved_candidate_wiring",
+                      "binary": str(expected), "binary_sha256": digest}))
+
+
 def test_built_cli_duration_admission_precedes_missing_config_or_credentials(tmp_path):
     start = datetime.datetime.now(datetime.timezone.utc)
     for mode, hours, expected in (("signed-future-live", 72, "fixed budget"),

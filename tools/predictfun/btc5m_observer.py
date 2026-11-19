@@ -203,6 +203,32 @@ COVERAGE_REASONS = {
 }
 
 
+def sample_envelope(record: dict[str, Any], watermark: int, run_id: str) -> dict[str, Any]:
+    """The strict rebuild of the SAMPLE envelope one record was written with.
+
+    The envelope carries the watermark the record was related to. It is the
+    producer's own after_event_seq, carried through unchanged: nothing here
+    invents, rounds or reconstructs it.
+    """
+    return {
+        "wire_version": WIRE_VERSION,
+        "kind": "SAMPLE",
+        "run_id": run_id,
+        "after_event_seq": watermark,
+        "record": record,
+    }
+
+
+def _is_flat_record(data: Any) -> bool:
+    """Whether a line is a legacy flat record rather than a SAMPLE envelope.
+
+    A legacy line carries the record's own keys and nothing else. It has no
+    watermark, so it cannot prove its own as-of relation: the reader refuses
+    it as unresolved evidence instead of reconstructing a watermark for it.
+    """
+    return isinstance(data, dict) and "schema_version" in data and "record" not in data
+
+
 class ObserverRefused(Exception):
     """A fixed refusal of one observation frame: a code, never a value."""
 
@@ -320,6 +346,24 @@ def validate_record(record: Any, run_id: str) -> dict[str, Any]:
 
 def _time(value: str) -> datetime.datetime:
     return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _wire_millis(value: str) -> datetime.datetime:
+    """One instant on the wire's own millisecond basis.
+
+    A fill carries nanoseconds; an observation carries milliseconds. The two
+    cannot be compared on their raw instants: the observation's own value is
+    the millisecond its instant falls in, so comparing it with a nanosecond
+    fill compares a truncated value with a precise one and makes a fill that
+    happened in the same millisecond look later than it was.
+
+    Truncating the precise side to the millisecond it falls in is not a
+    tolerance. It is the same instant, expressed on the basis the wire
+    itself states. Two instants in different milliseconds still order
+    exactly as before.
+    """
+    moment = _time(value)
+    return moment.replace(microsecond=(moment.microsecond // 1000) * 1000)
 
 
 def _equal(actual: Any, expected: Any) -> None:
@@ -560,14 +604,21 @@ class ObservationStore:
         path = self.directory / OBSERVATIONS_FILE
         self.handle = open(path, "x", encoding="utf-8")
 
-    def write(self, record: dict[str, Any]) -> bool:
-        """Append one validated record and flush it."""
+    def write(self, record: dict[str, Any], watermark: int) -> bool:
+        """Append one validated sample envelope and flush it.
+
+        The envelope is the strict rebuild of the SAMPLE the producer sent:
+        the same five keys, the same record and the same watermark the
+        relation was checked against. The watermark is carried, never
+        invented: it is the one the receiver already related the record to.
+        """
         if self.handle is None:
             self.reason("WRITE_FAILED")
             self.unwritten_samples += 1
             return False
+        envelope = sample_envelope(record, watermark, self.run_id)
         try:
-            text = json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":")) + "\n"
+            text = json.dumps(envelope, sort_keys=True, allow_nan=False, separators=(",", ":")) + "\n"
             if len(text.encode()) > MAX_FRAME_BYTES or self.handle.write(text) != len(text):
                 raise OSError("PARTIAL_OBSERVATION_WRITE")
             self.handle.flush()
@@ -705,7 +756,7 @@ class ObserverReceiver:
                 self.store.rejected_samples += 1
                 self.store.reason("RELATION_UNRESOLVED")
                 continue
-            if self.store.write(record):
+            if self.store.write(record, watermark):
                 self.store.records.append(record)
 
     def finish(self) -> None:
@@ -830,30 +881,60 @@ def read_observations(run_directory: Path) -> dict[str, Any]:
             try:
                 if len(line.encode()) + 1 > MAX_FRAME_BYTES:
                     raise ObserverRefused("LIMIT")
-                validated = validate_record(data, run_id)
+                # Each line is the strict SAMPLE envelope the producer sent.
+                # The watermark it carries is the only causal evidence the
+                # reader gets: a legacy flat-only line has none, and cannot
+                # prove its own as-of relation.
+                if not isinstance(data, dict) or set(data) != {"wire_version", "kind",
+                                                               "run_id", "after_event_seq", "record"}:
+                    raise ObserverRefused("LEGACY" if _is_flat_record(data) else "ENVELOPE")
+                if (data["wire_version"] != WIRE_VERSION or data["kind"] != "SAMPLE"
+                        or not isinstance(data["run_id"], str)
+                        or data["run_id"] != run_id):
+                    raise ObserverRefused("ENVELOPE")
+                watermark = data["after_event_seq"]
+                if type(watermark) is not int or watermark < 0:
+                    raise ObserverRefused("WATERMARK")
+                if trading_valid and watermark > index.last_seq:
+                    raise ObserverRefused("BEYOND")
+                validated = validate_record(data["record"], run_id)
                 if records and validated["observation_seq"] <= records[-1]["observation_seq"]:
                     raise ObserverRefused("SEQUENCE")
                 if trading_valid:
                     pair = (validated["market_id"], validated["token"])
                     fill = index.fills.get(pair)
-                    if fill is None or _time(fill["time"]) > _time(validated["observed_at"]):
+                    # The watermark is the causal evidence: the fill must
+                    # already exist inside it. Millisecond times only reject
+                    # a fill that is provably in a later millisecond; they
+                    # never prove the order inside one millisecond.
+                    if fill is None or fill["seq"] > watermark:
                         raise ObserverRefused("FILL")
                     settlement = index.settlements.get(pair)
                     if (validated["sample_state"] == "SETTLED" and (settlement is None
-                            or _time(settlement["time"]) > _time(validated["observed_at"]))):
+                            or settlement["seq"] > watermark)):
                         raise ObserverRefused("SETTLEMENT")
-                    watermark = index.last_seq
-                    # Same-millisecond ROUND_ENDED can precede settlement;
-                    # SETTLED explicitly requires the settlement watermark.
-                    if (settlement and validated["sample_state"] != "SETTLED"
-                            and _time(settlement["time"]) >= _time(validated["observed_at"])):
-                        watermark = settlement["seq"] - 1
+                    # A fill in a later millisecond is a future event. Inside
+                    # one millisecond the order is not provable, and the
+                    # watermark is what proves it.
+                    if (fill["time"] is not None
+                            and _wire_millis(fill["time"]) > _wire_millis(validated["observed_at"])):
+                        raise ObserverRefused("FILL")
                     temporary = ObservationStore(run_id, directory)
                     if not ObserverReceiver(temporary, index).relate(validated, watermark):
                         raise ObserverRefused("RELATION")
                     records.append(validated)
-            except ObserverRefused:
-                reasons.append("INVALID_FRAME")
+            except ObserverRefused as refused:
+                # A legacy flat-only line has no causal watermark. It stays
+                # unresolved evidence: the watermark is never back-filled.
+                # A frame that does not parse is invalid; a frame that parses
+                # but cannot be related is unresolved. The two are never
+                # confused with each other.
+                if refused.reason == "LEGACY":
+                    reasons.append("RELATION_UNRESOLVED")
+                elif refused.reason in ("FILL", "SETTLEMENT", "RELATION"):
+                    reasons.append("RELATION_UNRESOLVED")
+                else:
+                    reasons.append("INVALID_FRAME")
     else:
         reasons.append("TRUNCATED_OUTPUT")
     if coverage:

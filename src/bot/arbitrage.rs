@@ -818,7 +818,19 @@ impl RoundTaker {
                 source = ?quote.source,
                 "phase1 book below model value"
             );
-            match broker.take_candidate(&market, &observed.book, &candidate)? {
+            let result = if broker.is_live() {
+                broker
+                    .take_live_candidate(crate::bot::runtime::taker::LiveCandidateRequest {
+                        market: &market,
+                        yes_book: &observed.book,
+                        candidate: &candidate,
+                    })
+                    .await?
+                    .result
+            } else {
+                broker.take_candidate(&market, &observed.book, &candidate)?
+            };
+            match result {
                 TakeResult::Filled { shares, .. } if shares > 0.0 => {
                     self.core.confirm_fill(market.id, shares);
                 }

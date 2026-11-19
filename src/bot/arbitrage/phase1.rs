@@ -46,6 +46,8 @@ pub enum Phase {
     Evaluate,
     PreSubmit,
     PreApply,
+    /// Live-only recheck after all preparation and durable evidence waits.
+    FinalSend,
 }
 
 /// Why a decision attempt did not pass.
@@ -356,6 +358,12 @@ impl CandidateContext {
             && self.market_revision < u64::MAX
     }
 
+    /// Test-only: move the inputs' revision on, as a refreshed market would.
+    #[cfg(test)]
+    pub(crate) fn invalidate_revision(&self) {
+        self.revision_counter.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub(crate) fn same_candidate(&self, other: &Self) -> bool {
         self.candidate_id == other.candidate_id
             && Arc::ptr_eq(&self.revision_counter, &other.revision_counter)
@@ -392,6 +400,11 @@ impl CandidateContext {
                 .iter()
                 .map(|level| (level.price, level.size))
                 .eq(book.asks.iter().map(|level| (level.price, level.size)))
+    }
+
+    /// The immutable Yes-quoted book, for the adapter's exact preparation check.
+    pub(crate) fn frozen_book(&self) -> &BookSnapshot {
+        &self.frozen_book
     }
 
     /// The value of the side this candidate selected.
