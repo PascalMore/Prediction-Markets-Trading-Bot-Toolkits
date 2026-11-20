@@ -373,16 +373,28 @@ sys.exit(int(sys.argv[2]))
                          "17f77c2fff85facf0dc3e018ebe0a58f9c296b7fa0f614595d674394f9d3490d")
         old_files = json.loads(baseline.read_bytes())["candidate_identity"]["files"]
         allowed = rust_paths | {"tools/predictfun/btc5m_control.py",
-            "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/README.md", "docs/LIVE-TRADING.md"}
+            "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/README.md", "docs/LIVE-TRADING.md",
+            "tools/predictfun/tests/test_btc5m_paper72.py"}
         self.assertEqual(set(identity["files"]), set(old_files))
         self.assertEqual(len(old_files), 57)
         protected = set(old_files) - allowed
-        self.assertEqual(len(protected), 49)
+        self.assertEqual(len(protected), 48)
         for path in protected:
             self.assertEqual(identity["files"][path], old_files[path], path)
         changed = {path for path in old_files if identity["files"][path] != old_files[path]}
         self.assertEqual(changed, allowed - {"src/bot/runtime/paper.rs", "src/bot/runtime/paper/tests.rs"})
         self.assertEqual(control.LIVE_BINARY, evidence / "candidate-v2/polymarket-toolkits")
+        accepted = evidence / "run3909-m01-final-candidate.json"
+        self.assertEqual(hashlib.sha256(accepted.read_bytes()).hexdigest(),
+                         "db0efa3c2979c44094992e324a4fb8151646e1511a9a5da00911eeab056ff9e9")
+        accepted_files = json.loads(accepted.read_bytes())["candidate_identity"]["files"]
+        stage_allowed = {"tools/predictfun/btc5m_control.py",
+                         "tools/predictfun/tests/test_btc5m_control.py",
+                         "tools/predictfun/tests/test_btc5m_paper72.py"}
+        self.assertEqual(set(identity["files"]), set(accepted_files))
+        self.assertEqual(len(set(accepted_files) - stage_allowed), 54)
+        self.assertEqual({path for path in accepted_files
+                          if identity["files"][path] != accepted_files[path]}, stage_allowed)
         print("M01_PROTECTED_PARTITIONS " + json.dumps({"upstream_total": len(upstream),
               "upstream_protected": len(set(upstream) - rust_paths), "protected": sorted(protected),
               "changed": sorted(changed), "rust_reference": expected_rust}, sort_keys=True))

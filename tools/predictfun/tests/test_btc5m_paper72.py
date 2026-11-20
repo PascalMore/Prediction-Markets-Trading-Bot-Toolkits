@@ -273,12 +273,12 @@ def test_paper72_launcher_consumes_the_approved_candidate_binary(tmp_path):
     and child_arguments must all resolve to the same approved bytes.
     """
     root = control.BOT.parents[4]
-    expected = root / ("data/reports/2026-11-19-btc5m-observer-runtime-fix/evidence/"
-                       "validate-v11/cargo-target/debug/polymarket-toolkits")
+    expected = root / ("data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/"
+                       "candidate-v2/polymarket-toolkits")
     assert control.PAPER72_BINARY == expected
     assert control.PAPER72_BINARY.is_file()
     digest = hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest()
-    assert digest == "09ac37334c644c354c5565e5da3e3836815c14bb03161c44386966efaf91eca0"
+    assert digest == "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa"
 
     # check_paths hands the very same path to the launcher.
     assert control.check_paths(Path("absent"), True)[1] == expected
