@@ -12,6 +12,8 @@ import re
 import stat
 from typing import Any, BinaryIO, Callable
 
+from btc5m_control import candidate_input_error
+
 SCHEMA_VERSION = "btc5m-controlled-live.v1"
 EVENT_PREFIX = b"BTC5M_EVENT "
 MAX_LINE_BYTES = 65536
@@ -24,6 +26,7 @@ REASONS = tuple("NONE CONTEXT_MISSING SOURCE_NOT_ALLOWED INPUT_CHANGED SIGNED_BO
                 "DEADLINE PARENT_LOST CONTROL_CHANNEL MANUAL_STOP PROCESS_FAILED CASH_PENDING "
                 "CASH_READBACK_UNAVAILABLE GAS_UNAVAILABLE GAS_BUDGET NOT_APPLICABLE".split())
 PUBLIC_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z", re.ASCII)
+DETAIL = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z", re.ASCII)
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z", re.ASCII)
 DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 TRADING_ADDRESS = "0xfc9eb66e6f22f96608058c0a711ed048eed8c2e2"
@@ -36,6 +39,17 @@ class LiveInvalid(ValueError):
     def __init__(self, reason: str = "OUTPUT_INVALID") -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def detail_code(value: Any) -> str | None:
+    """Keep the producer's own failure code; anything else degrades, never drops.
+
+    An unrecognised token or one that is too long becomes ``UNKNOWN``: the
+    frame is still accepted, it just stops claiming to name the cause.
+    """
+    if value is None:
+        return None
+    return value if type(value) is str and DETAIL.fullmatch(value) is not None else "UNKNOWN"
 
 
 def require(condition: bool, reason: str = "OUTPUT_INVALID") -> None:
@@ -116,6 +130,9 @@ def _scalar(value: Any, kind: str) -> None:
             raise LiveInvalid() from None
     elif kind == "text":
         require(type(value) is str and 0 < len(value) <= 128)
+    elif kind == "detail":
+        # The value degrades to UNKNOWN later; here only its type is fixed.
+        require(type(value) is str)
     elif kind == "time":
         timestamp(value)
     elif kind == "reason":
@@ -197,14 +214,15 @@ PAYLOADS = {
                        "collateral_atoms:atoms? gas_balance_atoms:atoms? positions:[position] "
                        "open_hashes:[hash] foreign_risk:bool reason:reason"),
     "loss_latch": "latched:bool trigger_net_pnl_atoms:signed? reason:reason",
-    "stop": "stop_new_risk:bool reason:reason takeover_required:bool alert_status:LOCAL_RECORDED|DELIVERED|UNAVAILABLE",
+    "stop": ("stop_new_risk:bool reason:reason takeover_required:bool "
+             "alert_status:LOCAL_RECORDED|DELIVERED|UNAVAILABLE stop_detail:detail?"),
     "recovery": "policy:COLD_START_REFUSE state:ARMED|RECONCILIATION_REQUIRED|HANDOFF reason:reason",
     "payout": ("status:UNRESOLVED|CONFIRMED|CONFLICT|CASH_PENDING|CASH_CONFIRMED payout_yes:number? "
                "position_net_atoms:atoms claim_value_atoms:atoms? cash_received_atoms:atoms? "
                "tx_hash:hash? observed_at:time reason:reason"),
     "final": ("run_status:COMPLETED|STOPPED|INCOMPLETE stop_reason:reason execution_complete:bool "
               "cash_complete:bool audit_complete:bool takeover_required:bool "
-              "unresolved:[unresolved] positions:[position]"),
+              "unresolved:[unresolved] positions:[position] stop_detail:detail?"),
 }
 
 
@@ -244,6 +262,8 @@ def validate_live_event(raw: bytes | str | dict) -> dict:
     fields(event["payload"], PAYLOADS[kind])
     check_accounting(event["accounting"])
     payload = event["payload"]
+    if kind in ("stop", "final"):
+        payload["stop_detail"] = detail_code(payload["stop_detail"])
     if kind in ("decision", "reservation", "order", "execution", "payout"):
         require(event["market_id"] is not None)
     if kind in ("reservation", "order", "execution", "payout"):
@@ -321,18 +341,15 @@ class LiveRelations:
             decision = payload["decision"]
             candidate = decision["candidate_id"]
             if candidate is not None:
-                frozen = {key: decision[key] for key in (
-                    "decision_id", "candidate_id", "symbol", "prediction_source", "actual_pair",
-                    "source_epoch", "starts_at", "ends_at", "strike", "fee_rate_bps", "selected_token",
-                    "decision_at", "decision_elapsed_ms", "up", "down")}
                 prior = self.candidates.get(candidate)
                 if decision["phase"] == "EVALUATE":
                     require(prior is None)
-                    self.candidates[candidate] = {"frozen": frozen, "market": event["market_id"],
+                    self.candidates[candidate] = {"frozen": decision, "market": event["market_id"],
                                                   "phase": "EVALUATE", "attempt": None}
                 else:
-                    require(prior is not None and prior["frozen"] == frozen
-                            and prior["market"] == event["market_id"])
+                    require(prior is not None)
+                    require(candidate_input_error(prior["frozen"], decision, event["market_id"],
+                                                  prior["market"]) is None)
                     if decision["phase"] == "PRE_SUBMIT":
                         require(prior["phase"] == "EVALUATE")
                     else:
@@ -523,7 +540,7 @@ START_KEYS = ("schema_version strategy_contract operations_mode risk_window_id a
 CONTEXT_KEYS = ("schema_version run_id risk_window_id authorization_ref operations_mode account_identity started_at "
                 "deadline_at candidate_digest asset_units gas_policy recovery_policy cash_recovery_policy")
 ENDED_KEYS = ("schema_version run_id exit_facts final_event_seq final_accounting incomplete_reason "
-              "execution_complete cash_complete audit_complete takeover_required")
+              "incomplete_detail execution_complete cash_complete audit_complete takeover_required")
 
 
 def check_account_identity(identity: dict) -> None:
@@ -578,7 +595,7 @@ def check_metadata(started: dict, public_config: dict, context: dict) -> None:
     for key in set(context) & set(started) - {"schema_version"}:
         require(context[key] == started[key])
     fields(context["gas_policy"], "payer_address:text minimum_balance_atoms:atoms maximum_consumption_atoms:atoms")
-    require(context["gas_policy"]["payer_address"] == started["account_identity"]["trading_address"])
+    require(context["gas_policy"]["payer_address"] == started["account_identity"]["signer_address"])
     require(all(int(context["gas_policy"][key]) > 0 for key in ("minimum_balance_atoms", "maximum_consumption_atoms")))
 
 
@@ -693,17 +710,21 @@ def check_ended(ended: dict, started: dict, relations: LiveRelations) -> None:
     _scalar(exit_facts["forced_cleanup"], "bool")
     _scalar(exit_facts["stop_reason"], "reason")
     _scalar(ended["incomplete_reason"], "reason?")
+    require(ended["incomplete_detail"] is None or
+            (type(ended["incomplete_detail"]) is str and DETAIL.fullmatch(ended["incomplete_detail"]) is not None))
     _scalar(ended["final_event_seq"], "positive?")
     for key in ("execution_complete", "cash_complete", "audit_complete", "takeover_required"):
         _scalar(ended[key], "bool")
     final = relations.final
     if final is None:
         require(ended["final_event_seq"] is None and ended["final_accounting"] is None
-                and not ended["audit_complete"] and ended["incomplete_reason"] is not None)
+                and not ended["audit_complete"] and ended["incomplete_reason"] is not None
+                and ended["incomplete_detail"] is None)
     else:
         check_accounting(ended["final_accounting"])
         require(ended["final_event_seq"] == final["event_seq"] and ended["final_accounting"] == final["accounting"])
         require(exit_facts["stop_reason"] == final["payload"]["stop_reason"])
+        require(ended["incomplete_detail"] == final["payload"]["stop_detail"])
         for key in ("execution_complete", "cash_complete", "audit_complete", "takeover_required"):
             require(ended[key] == final["payload"][key])
     unhealthy = (final is None or exit_facts["forced_cleanup"] or exit_facts["launcher_exit"] != 0

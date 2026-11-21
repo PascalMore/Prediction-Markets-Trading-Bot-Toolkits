@@ -25,7 +25,7 @@ ACCOUNT = {"venue": "PREDICT_FUN", "chain_id": 56, "account_mode": "predict-acco
 def public_inputs():
     now = dt.datetime.now(dt.timezone.utc)
     stamp = lambda value: value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    gas = {"payer_address": ACCOUNT["trading_address"], "minimum_balance_atoms": "1", "maximum_consumption_atoms": "2"}
+    gas = {"payer_address": ACCOUNT["signer_address"], "minimum_balance_atoms": "1", "maximum_consumption_atoms": "2"}
     context = {"schema_version": "btc5m-live-context/1", "run_id": "offline-run", "risk_window_id": "offline-window",
                "authorization_ref": "offline-auth", "operations_mode": "supervised", "account_identity": copy.deepcopy(ACCOUNT),
                "started_at": stamp(now - dt.timedelta(seconds=1)), "deadline_at": stamp(now + dt.timedelta(minutes=5)),
@@ -268,6 +268,32 @@ class GuardTests(unittest.TestCase):
                     self.assertEqual([call[0] for call in self.collection.calls], ["insert"])
                 self.assertTrue(self.collection.documents)
                 lock.close()
+
+    def test_gas_payer_is_signer_and_bad_or_mismatched_policy_precedes_secrets(self):
+        self.assertNotEqual(ACCOUNT["trading_address"], ACCOUNT["signer_address"])
+        guard.validate_activation(self.activation, self.context, dt.datetime.now(dt.timezone.utc))
+        for mode in ("supervised", "unattended"):
+            for payer in (ACCOUNT["trading_address"], "0x" + "3" * 40, "bad", "", None):
+                with self.subTest(mode=mode, payer=payer):
+                    activation, context = public_inputs()
+                    activation["operations_mode"] = context["operations_mode"] = mode
+                    if payer is None:
+                        del activation["gas_policy"]["payer_address"]
+                    else:
+                        activation["gas_policy"]["payer_address"] = payer
+                    # Equal bad files must still refuse; a valid-but-mismatched pair too.
+                    context["gas_policy"] = copy.deepcopy(activation["gas_policy"])
+                    with self.assertRaises(guard.GuardRefused):
+                        guard.validate_activation(activation, context, dt.datetime.now(dt.timezone.utc))
+        activation, context = public_inputs()
+        context["gas_policy"]["payer_address"] = ACCOUNT["trading_address"]
+        with patch.object(events, "_read_file", return_value=events.canonical(activation)), \
+             patch.object(guard.os.environ, "get", side_effect=AssertionError("secret")) as secret, \
+             patch("pymongo.MongoClient", side_effect=AssertionError("driver")) as driver:
+            with self.assertRaises(guard.GuardRefused):
+                guard.arm_live_guard(self.lock(), context)
+            secret.assert_not_called()
+            driver.assert_not_called()
 
     def test_activation_bad_binding_unknown_version_before_credential_or_driver(self):
         mutations = [("schema_version", "unknown"), ("candidate_digest", "b" * 64),

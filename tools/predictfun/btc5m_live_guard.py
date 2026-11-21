@@ -174,7 +174,7 @@ def validate_activation(activation: dict, expected: dict, now: dt.datetime) -> d
         _require(all(units[key] == 18 for key in ("collateral_decimals", "share_decimals", "gas_decimals")))
         gas = activation["gas_policy"]
         events.fields(gas, "payer_address:text minimum_balance_atoms:atoms maximum_consumption_atoms:atoms")
-        _require(gas["payer_address"] == activation["account_identity"]["trading_address"]
+        _require(gas["payer_address"] == activation["account_identity"]["signer_address"]
                  and int(gas["minimum_balance_atoms"]) > 0 and int(gas["maximum_consumption_atoms"]) > 0)
         check_storage_binding(activation["storage_binding"])
         return copy.deepcopy(activation)

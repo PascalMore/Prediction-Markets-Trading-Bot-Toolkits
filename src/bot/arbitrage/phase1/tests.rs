@@ -406,6 +406,47 @@ async fn phase1_protocol_consumer_fixture() {
 }
 
 #[test]
+fn native_dynamic_valuation_consumer_fixture() {
+    let (mut bot, _, run_clock, quote, _) = forward_fixture();
+    warm(&mut bot.core, "BTCUSDT", 21);
+    let mut market = crate::bot::runtime::test_support::market(1);
+    market.yes_token = "77".into();
+    market.no_token = "88".into();
+    market.feed_symbol = Some("BTCUSDT".into());
+    market.start_price = Some(100.0);
+    market.starts_at = Some(run_clock.now().unwrap().utc - chrono::Duration::seconds(51));
+    market.ends_at = Some(market.starts_at.unwrap() + chrono::Duration::seconds(300));
+    let depth = crate::bot::runtime::test_support::book(&[(0.3, 100.0)], &[(0.4, 100.0)]);
+    let mut input = inputs(&market, &depth);
+    input.spot_price = quote.price;
+    input.spot_clock = Some(clock_at_latest());
+    input.book_clock = Some(clock_at_latest());
+    input.now = run_clock.now().unwrap();
+    input.identity_available_at = market.starts_at;
+    input.strike_available_at = market.starts_at;
+    let evaluation = bot.core.evaluate_phase1(&input);
+    let candidate = evaluation.candidate.expect("warm native candidate");
+    for delay_ms in [0_u64, 100, 1000, 1500] {
+        let now = CheckTime {
+            utc: input.now.utc + chrono::Duration::milliseconds(delay_ms as i64),
+            elapsed_ms: input.now.elapsed_ms + delay_ms,
+        };
+        let (pre, pre_result) = recheck_diagnostic(&candidate, now, Phase::PreSubmit, 0.03, 30.0);
+        let (final_send, final_result) =
+            recheck_diagnostic(&candidate, now, Phase::FinalSend, 0.03, 30.0);
+        assert!(pre_result.is_some() && final_result.is_some());
+        assert_eq!(pre.p_up == evaluation.diagnostic.p_up, delay_ms == 0);
+        println!(
+            "BTC5M_REVALUATION {}",
+            serde_json::json!({
+                "delay_ms": delay_ms, "evaluate": evaluation.diagnostic,
+                "pre_submit": pre, "final_send": final_send,
+            })
+        );
+    }
+}
+
+#[test]
 fn broker_checks_full_inputs_revision_and_terminal_reuse() {
     for fault in ["book", "fee", "strike", "source", "refresh", "reuse"] {
         paper::clear_recorded_events();

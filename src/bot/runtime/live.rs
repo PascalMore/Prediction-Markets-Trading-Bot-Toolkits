@@ -607,6 +607,23 @@ pub(crate) fn check_account_delta(
     Ok(())
 }
 
+/// The failure code an account check already carries.
+///
+/// It is the token the run's own error already names: the venue's own reason,
+/// or the code after the fixed reconciliation prefix. Nothing is classified
+/// here; a message that is not one short code becomes `UNKNOWN`, so no free
+/// text, address or URL can reach the terminal record.
+fn account_failure_code(error: &anyhow::Error) -> String {
+    let message = match error.downcast_ref::<crate::service::venue::VenueError>() {
+        Some(venue) => venue.reason.clone(),
+        None => error.to_string(),
+    };
+    let token = message.trim_start_matches("RECONCILIATION_REQUIRED:");
+    let plain = !token.is_empty() && token.len() <= 64
+        && token.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if plain { token.to_string() } else { "UNKNOWN".to_string() }
+}
+
 pub(super) async fn check_runtime_account(
     broker: &Broker,
     include_pending: bool,
@@ -674,10 +691,11 @@ pub(super) async fn check_runtime_account(
                 observed.positions_explained = true;
                 super::live_control::record_account_read(&mut state, &snapshot, checked)
             });
-        if reconciled.is_err() {
+        if let Err(error) = &reconciled {
             if let Some(run) = state.live.controlled.as_mut() {
                 run.account_read = None;
-                run.stop("RECONCILIATION_REQUIRED", true, checked.map_or_else(chrono::Utc::now, |time| time.utc));
+                run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error),
+                    true, checked.map_or_else(chrono::Utc::now, |time| time.utc));
             }
         }
         let mut events = Vec::new();
@@ -694,14 +712,25 @@ pub(super) async fn check_runtime_account(
         reconciled
     }
     .await;
+    // A read that failed before its own stop still names the code it held: the
+    // first stop of this run carries it.
+    if let Err(error) = &result {
+        if let Some(run) = broker.state.lock().live.controlled.as_mut() {
+            run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error), true,
+                chrono::Utc::now());
+        }
+    }
     if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
         match &result {
             Ok(()) => gate.record_read_success(identity, "runtime_account"),
-            Err(_) => {
+            Err(error) => {
                 gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN");
                 if let Some(run) = broker.state.lock().live.controlled.as_mut() {
                     run.account_read = None;
-                    run.stop("RECONCILIATION_REQUIRED", true, chrono::Utc::now());
+                    // Any path that failed before its own stop still names the
+                    // code it held; the first stop keeps it.
+                    run.stop("RECONCILIATION_REQUIRED",
+                        true, chrono::Utc::now());
                 }
             }
         }

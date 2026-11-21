@@ -306,6 +306,28 @@ pub struct SignedExecutionBound {
     pub signed_hash: String,
 }
 
+/// A guarded order the venue refused before it could leave, only because the
+/// fresh book no longer supports the frozen decision: its price moved past the
+/// candidate's limit, or its depth cannot cover the frozen quantity.
+///
+/// It is a refusal of one candidate, not of the run: the cash the attempt
+/// reserved is released, the refusal is recorded and the risk window stays
+/// open for the next decision. Any doubt about whether the order left — and
+/// any account, identity, quantity, bound, fee or evidence mismatch — is never
+/// this error; those stay hard stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateRefused;
+
+impl std::fmt::Display for CandidateRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closed public reason token: mapping this error never yields a
+        // free-form string.
+        formatter.write_str("INPUT_CHANGED")
+    }
+}
+
+impl std::error::Error for CandidateRefused {}
+
 /// The narrow seam a controlled live run installs around a real submission.
 ///
 /// Every method refuses by default: a venue that ignores this hook must not
@@ -318,7 +340,14 @@ pub trait ControlledSendGuard: Send + Sync {
             "controlled_send", "EXECUTION_NOT_ENABLED").into())
     }
 
-    /// Compare the refreshed Yes-quoted book with the candidate's frozen book.
+    /// Check that the venue's refreshed book is usable, not that it is
+    /// unchanged.
+    ///
+    /// The refreshed book is a new observation of a moving market: requiring
+    /// it to repeat the evaluation's snapshot byte for byte refuses every
+    /// honest five-minute round. What the frozen decision needs is a complete
+    /// book; its price and depth protection is carried by the candidate's
+    /// limit, the amount walk and the signed bound.
     fn check_book(&self, _book: &BookSnapshot) -> Result<()> {
         Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
             "controlled_send", "EXECUTION_NOT_ENABLED").into())

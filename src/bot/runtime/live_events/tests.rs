@@ -41,6 +41,7 @@ fn stop_envelope() -> Value {
             reason: reason::DEADLINE.into(),
             takeover_required: true,
             alert_status: "LOCAL_RECORDED".into(),
+            stop_detail: None,
         }),
     ).unwrap()
 }
@@ -375,6 +376,7 @@ fn framing_counts_the_newline_and_a_rejected_write_is_sticky() {
         reason: reason::DEADLINE.into(),
         takeover_required: true,
         alert_status: "LOCAL_RECORDED".into(),
+        stop_detail: None,
     });
     assert_eq!(emitter.write(Utc::now(), None, None, &accounting(), bad.clone()),
         Err("STOP_NEW_RISK_INVALID".into()));
@@ -498,7 +500,7 @@ fn all_ten_payload_shapes_reject_missing_extra_and_invalid_nested_fields() {
             "reason":"FACT_INCOMPLETE"})),
         ("final", json!({"run_status":"INCOMPLETE","stop_reason":"FACT_INCOMPLETE",
             "execution_complete":false,"cash_complete":false,"audit_complete":false,
-            "takeover_required":true,"unresolved":[],"positions":[]})),
+            "takeover_required":true,"unresolved":[],"positions":[],"stop_detail":null})),
     ] {
         let mut event = stop_envelope();
         event["event_kind"] = json!(kind);

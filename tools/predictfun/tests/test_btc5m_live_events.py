@@ -1,11 +1,11 @@
-"""Offline tests using original, unmixed L1 native stdout streams.
+"""Offline tests consuming fresh original Rust fixture stdout streams.
 
-The fixed line ranges are separate subprocess tests in the captured L1 log.
-No Rust execution, credentials, network or production storage is used here.
-Original-supervisor wiring is held and belongs to the downstream stage.
+No real credentials, network or production storage are used.
 """
 from __future__ import annotations
 
+import functools
+import subprocess
 import copy
 import datetime as dt
 import hashlib
@@ -22,20 +22,56 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import btc5m_live_events as live
 
-NATIVE_LOG = Path("/home/pascal/.hermes/profiles/yquantdeveloper/cache/scratch/t_9edc6973-rC3-lib-final-2.log")
-
-
+@functools.lru_cache(maxsize=None)
 def native_stream(first: int, last: int) -> list[bytes]:
-    """Select one intact producer boundary, not a concatenation of passing tests."""
-    lines = NATIVE_LOG.read_bytes().splitlines(keepends=True)
-    selected = lines[first - 1:last]
-    frames = [line for line in selected if line.startswith(live.EVENT_PREFIX)]
+    """Run the original offline producer; legacy range pairs name intact fixtures."""
+    fixtures = {
+        (745, 755): "live_shutdown_after_pending_post_cancellation_keeps_unknown_risk_and_one_hash",
+        (813, 827): "live_cleanup_budget_cancels_pending_official_read_without_releasing_risk",
+        (780, 783): "official_claims_replace_marks_never_credit_cash_and_zero_payout_releases_only_basis",
+        (1648, 1649): "original_observe_projects_loss_and_stop_without_waiting_for_another_snapshot",
+        (1664, 1690): "two_official_rounds_use_one_core_ledger_and_emitter_with_actual_fee_and_payouts",
+        # run005's silhouette: a failed runtime account read, the stop it owns
+        # and the terminal record the bounded shutdown writes afterwards.
+        (96, 98): "live_shutdown_after_a_runtime_read_mismatch_keeps_the_failure_code",
+    }
+    name = "bot::runtime::live_control::candidate_tests::" + fixtures[first, last]
+    result = subprocess.run(["cargo", "test", "--locked", "--offline", "--target-dir",
+                             os.environ["CARGO_TARGET_DIR"], "--lib", name,
+                             "--", "--exact", "--nocapture"],
+                            cwd=Path(__file__).resolve().parents[3], capture_output=True, timeout=120)
+    if result.returncode or b"1 passed" not in result.stdout:
+        raise AssertionError(result.stderr.decode() + result.stdout.decode())
+    frames = []
+    for line in result.stdout.splitlines(keepends=True):
+        if not line.startswith(live.EVENT_PREFIX):
+            continue
+        if frames and live.validate_live_event(line)["event_seq"] == 1:
+            break  # The payout fixture emits separate runs; never concatenate them.
+        frames.append(line)
     events = [live.validate_live_event(line) for line in frames]
-    if [event["event_seq"] for event in events] != list(range(1, len(events) + 1)):
+    if not events or [event["event_seq"] for event in events] != list(range(1, len(events) + 1)):
         raise AssertionError("native stream boundary changed")
     if len({(event["run_id"], event["risk_window_id"]) for event in events}) != 1:
         raise AssertionError("mixed native stream")
     return frames
+
+
+@functools.lru_cache(maxsize=1)
+def native_revaluations() -> list[dict]:
+    """Read real core rechecks, not a Python probability approximation."""
+    name = "bot::arbitrage::phase1::tests::native_dynamic_valuation_consumer_fixture"
+    result = subprocess.run(
+        ["cargo", "test", "--locked", "--offline", "--lib", name,
+         "--", "--exact", "--nocapture"],
+        cwd=Path(__file__).resolve().parents[3], capture_output=True, timeout=600)
+    if result.returncode or b"1 passed" not in result.stdout:
+        raise AssertionError(result.stderr.decode() + result.stdout.decode())
+    rows = [json.loads(line.removeprefix(b"BTC5M_REVALUATION "))
+            for line in result.stdout.splitlines() if line.startswith(b"BTC5M_REVALUATION ")]
+    if [row["delay_ms"] for row in rows] != [0, 100, 1000, 1500]:
+        raise AssertionError("native recheck coverage changed")
+    return rows
 
 
 def metadata(first_frame: bytes) -> tuple[dict, dict, dict]:
@@ -63,7 +99,7 @@ def metadata(first_frame: bytes) -> tuple[dict, dict, dict]:
     }
     context = {key: copy.deepcopy(started[key]) for key in set(live.CONTEXT_KEYS.split()) & set(started)}
     context.update(schema_version="btc5m-live-context/1", candidate_digest=live.candidate_digest(started),
-                   gas_policy={"payer_address": live.TRADING_ADDRESS, "minimum_balance_atoms": "1",
+                   gas_policy={"payer_address": live.SIGNER_ADDRESS, "minimum_balance_atoms": "1",
                                "maximum_consumption_atoms": "2"})
     return started, public, context
 
@@ -75,7 +111,7 @@ def ended_from_native(final: dict) -> dict:
             "exit_facts": {"launcher_exit": 0, "child_returncode": 0, "child_signal": None,
                            "forced_cleanup": False, "stop_reason": payload["stop_reason"]},
             "final_event_seq": final["event_seq"], "final_accounting": final["accounting"],
-            "incomplete_reason": "FACT_INCOMPLETE",
+            "incomplete_reason": "FACT_INCOMPLETE", "incomplete_detail": payload["stop_detail"],
             **{key: payload[key] for key in ("execution_complete", "cash_complete", "audit_complete", "takeover_required")}}
 
 
@@ -83,12 +119,15 @@ class EventTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Native tests: cancelled pending POST and bounded cleanup, respectively.
+        cls.revaluations = native_revaluations()
         cls.pending = native_stream(745, 755)
         cls.cleanup = native_stream(813, 827)
         cls.decoded = [live.validate_live_event(frame) for frame in cls.cleanup]
         cls.payout_stream = native_stream(780, 783)
         cls.loss_stream = native_stream(1648, 1649)
         cls.two_round = native_stream(1664, 1690)
+        # run005's silhouette: a failed runtime account read and its stop.
+        cls.runtime_stop = native_stream(96, 98)
         # Schema cases are independent objects, never a combined relation stream.
         cls.schema_cases = cls.decoded + [live.validate_live_event(frame)
                                          for stream in (cls.payout_stream, cls.loss_stream)
@@ -136,6 +175,115 @@ class EventTests(unittest.TestCase):
                 self.assertFalse(read["ended"]["cash_complete"])
                 order = next(event for event in read["events"] if event["event_kind"] == "order")
                 self.assertEqual(acks, [f"A {order['event_seq']} {order['payload']['signed_hash']}\n".encode()])
+
+    def test_native_nonzero_revaluations_keep_order_ack_and_reader_chain(self):
+        for row in self.revaluations:
+            with self.subTest(delay_ms=row["delay_ms"]):
+                events = copy.deepcopy(self.decoded)
+                phases = {"EVALUATE": "evaluate", "PRE_SUBMIT": "pre_submit", "FINAL_SEND": "final_send"}
+                for event in events:
+                    if event["event_kind"] != "decision":
+                        continue
+                    original = event["payload"]["decision"]
+                    replacement = row[phases[original["phase"]]]
+                    # Only diagnostics are substituted in the intact native financial stream.
+                    # Its reservation, signed order, ACK, execution and final stay byte-identical.
+                    for key in ("decision_id", "candidate_id", "selected_token", "fee_rate_bps"):
+                        self.assertEqual(replacement[key], original[key])
+                    for side in ("up", "down"):
+                        for key in ("token", "limit_price", "gross_shares", "cost"):
+                            self.assertEqual(replacement[side][key], original[side][key])
+                    event["payload"]["decision"] = copy.deepcopy(replacement)
+                frames = [self.frame(event) if event["event_kind"] == "decision" else original
+                          for event, original in zip(events, self.cleanup)]
+                before = row["evaluate"]
+                self.assertEqual(before["p_up"] == row["pre_submit"]["p_up"], row["delay_ms"] == 0)
+                store, acks = self.store(frames), []
+                for frame in frames:
+                    store.append(frame, acks.append)
+                store.finish(ended_from_native(events[-1]))
+                read = live.read_live_run(store.directory)
+                self.assertEqual(read["events"], events)
+                self.assertEqual(read["ended"]["final_event_seq"], len(frames))
+                self.assertEqual(read["status"], "INCOMPLETE")
+                order = next(event for event in events if event["event_kind"] == "order")
+                self.assertEqual(acks, [f"A {order['event_seq']} {order['payload']['signed_hash']}\n".encode()])
+
+    def test_static_candidate_facts_reject_before_write_at_each_recheck(self):
+        facts = {"decision_id": "999", "candidate_id": "999", "selected_token": "88",
+                 "symbol": "ETHUSDT", "prediction_source": "Coinbase", "actual_pair": "BTC-USD",
+                 "source_state": "FALLBACK", "source_epoch": 999, "reset_reason": "SOURCE_SWITCH",
+                 "settlement_provider": "UNKNOWN", "starts_at": "2026-11-01T00:00:00Z",
+                 "ends_at": "2026-11-01T00:05:00Z", "identity_available_at": None,
+                 "strike_available_at": None, "strike": 101.0, "spot": 101.0,
+                 "decision_at": "2026-11-01T00:00:00Z", "decision_elapsed_ms": 999,
+                 "samples": 999, "sigma": 0.01, "fee_rate_bps": 201,
+                 "best_yes_bid": 0.29, "best_yes_ask": 0.41}
+        changes = [((key,), value) for key, value in facts.items()]
+        changes += [((clock, "received_elapsed_ms"), 999)
+                    for clock in ("spot_clock", "book_clock")]
+        for side in ("up", "down"):
+            changes += [((side, key), value) for key, value in
+                        (("token", "999"), ("limit_price", 0.5), ("gross_shares", 4.0),
+                         ("depth_levels", []), ("depth_complete", False))]
+            changes.append(((side,), None))
+        for index, event in enumerate(self.decoded):
+            if event["event_kind"] != "decision" or event["payload"]["decision"]["phase"] == "EVALUATE":
+                continue
+            for path, value in changes + [(("market_id",), "999")]:
+                with self.subTest(phase=event["payload"]["decision"]["phase"], path=path):
+                    store = self.store()
+                    for frame in self.cleanup[:index]:
+                        store.append(frame)
+                    broken = copy.deepcopy(event)
+                    target = broken if path == ("market_id",) else broken["payload"]["decision"]
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    prior = store.relations
+                    with patch.object(store.stream, "write", wraps=store.stream.write) as write:
+                        with self.assertRaises(live.LiveInvalid):
+                            store.append(self.frame(broken))
+                        self.assertEqual(write.call_count, 0)
+                    self.assertIs(store.relations, prior)
+
+    def test_final_send_still_requires_ack_unstopped_unlatched_prefix(self):
+        index = next(index for index, event in enumerate(self.decoded)
+                     if event["event_kind"] == "decision"
+                     and event["payload"]["decision"]["phase"] == "FINAL_SEND")
+        for fault in ("ack", "stop", "loss", "phase", "sequence"):
+            with self.subTest(fault=fault):
+                relation = live.LiveRelations(self.decoded[0]["run_id"], self.decoded[0]["risk_window_id"])
+                for event in self.decoded[:index]:
+                    relation = relation.stage(event)
+                candidate = next(iter(relation.candidates.values()))
+                if fault == "ack":
+                    relation.attempts[candidate["attempt"]]["acked"] = False
+                elif fault == "stop":
+                    relation.stopped = True
+                elif fault == "loss":
+                    relation.latched = True
+                elif fault == "phase":
+                    candidate["phase"] = "EVALUATE"
+                else:
+                    relation.seq -= 1
+                with self.assertRaises(live.LiveInvalid):
+                    relation.stage(self.decoded[index])
+
+    def test_gas_metadata_requires_the_distinct_fixed_signer(self):
+        started, public, context = metadata(self.cleanup[0])
+        self.assertNotEqual(started["account_identity"]["trading_address"],
+                            started["account_identity"]["signer_address"])
+        live.check_metadata(started, public, context)
+        for payer in (live.TRADING_ADDRESS, "0x" + "3" * 40, "bad", "", None):
+            with self.subTest(payer=payer):
+                broken = copy.deepcopy(context)
+                if payer is None:
+                    del broken["gas_policy"]["payer_address"]
+                else:
+                    broken["gas_policy"]["payer_address"] = payer
+                with self.assertRaises(live.LiveInvalid):
+                    live.check_metadata(started, public, broken)
 
     def test_all_nested_missing_and_unknown_keys_before_first_write(self):
         def objects(value, path=()):
@@ -435,6 +583,22 @@ class EventTests(unittest.TestCase):
         event["payload"]["open_hashes"] = ["0x" + "a" * 64] * 1001
         with self.assertRaises(live.LiveInvalid):
             live.validate_live_event(self.frame(event))
+
+    def test_a_runtime_failure_code_survives_and_a_malformed_one_degrades(self):
+        # The producer's own code reaches the audit unchanged, on both records.
+        events = [live.validate_live_event(frame) for frame in self.runtime_stop]
+        stop = next(event for event in events if event["event_kind"] == "stop")
+        self.assertEqual(stop["payload"]["stop_detail"], "ACCOUNT_LEDGER_MISMATCH")
+        self.assertEqual(events[-1]["payload"]["stop_detail"], "ACCOUNT_LEDGER_MISMATCH")
+        # A value that is not one plain code degrades to UNKNOWN; the frame is
+        # still accepted, never dropped, and the absent value stays null.
+        for value in ("not a code", "read failed at https://synthetic.invalid", "x" * 65):
+            frame = copy.deepcopy(events[-1])
+            frame["payload"]["stop_detail"] = value
+            self.assertEqual(live.validate_live_event(frame)["payload"]["stop_detail"], "UNKNOWN")
+        frame = copy.deepcopy(events[-1])
+        frame["payload"]["stop_detail"] = None
+        self.assertIsNone(live.validate_live_event(frame)["payload"]["stop_detail"])
 
     def test_accounting_reserved_floor_and_actual_cost_delta_are_not_forged(self):
         for sequence, key, value in ((4, "reserved", "0"), (9, "cost", "0"),

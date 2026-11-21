@@ -266,7 +266,7 @@ impl LiveActivation {
     ///
     /// Every field is checked before anything else happens: an unknown
     /// version, a changed identity, a broken digest or a gas policy that names
-    /// a payer other than the trading account all refuse the run.
+    /// a payer other than the signer account all refuse the run.
     pub fn parse(raw: &str) -> Result<Self> {
         let activation: LiveActivation = serde_json::from_str(raw)
             .map_err(|_| anyhow::anyhow!("CONTROLLED_MODE: the activation file is not readable"))?;
@@ -292,8 +292,8 @@ impl LiveActivation {
         if !valid_address(&activation.gas_policy.payer_address) {
             bail!("CONTROLLED_MODE: the gas payer must be 0x plus forty hex characters");
         }
-        if activation.gas_policy.payer_address != activation.account_identity.trading_address {
-            bail!("CONTROLLED_MODE: the gas payer must be the trading account");
+        if activation.gas_policy.payer_address != activation.account_identity.signer_address {
+            bail!("CONTROLLED_MODE: the gas payer must be the signer account");
         }
         if activation.storage_binding.endpoint_id.scheme != "mongodb" {
             bail!("CONTROLLED_MODE: the storage scheme must be mongodb");
@@ -513,7 +513,7 @@ pub(crate) fn check_runtime_config(cfg: &super::AppConfig, strategy: &str) -> Re
     if account.trading_address.to_ascii_lowercase() != "0xfc9eb66e6f22f96608058c0a711ed048eed8c2e2"
         || options.contract != LIVE_CONTRACT
         || options.budget_secs <= 0 || options.budget_secs > LIVE_MAX_SECS
-        || options.gas_policy.payer_address != account.trading_address
+        || options.gas_policy.payer_address != account.signer_address
         || options.gas_policy.minimum_balance_atoms.is_zero()
         || options.gas_policy.maximum_consumption_atoms.is_zero()
     {
@@ -590,7 +590,7 @@ mod tests {
                     }}
                 }},
                 "gas_policy": {{
-                    "payer_address": "0x1111111111111111111111111111111111111111",
+                    "payer_address": "0x2222222222222222222222222222222222222222",
                     "minimum_balance_atoms": "10000000000000000",
                     "maximum_consumption_atoms": "20000000000000000"
                 }},
@@ -623,12 +623,24 @@ mod tests {
     }
 
     #[test]
-    fn a_gas_payer_other_than_the_trading_account_is_refused() {
-        let raw = activation_json("").replace(
-            "\"payer_address\": \"0x1111111111111111111111111111111111111111\"",
-            "\"payer_address\": \"0x3333333333333333333333333333333333333333\"",
-        );
-        assert!(LiveActivation::parse(&raw).is_err());
+    fn only_the_signer_gas_payer_is_accepted() {
+        let raw = activation_json("");
+        let activation = LiveActivation::parse(&raw).unwrap();
+        assert_ne!(activation.account_identity.trading_address, activation.account_identity.signer_address);
+        assert_eq!(activation.gas_policy.payer_address, activation.account_identity.signer_address);
+        for payer in [activation.account_identity.trading_address.as_str(),
+            "0x3333333333333333333333333333333333333333", "bad", ""] {
+            let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            value["gas_policy"]["payer_address"] = payer.into();
+            assert!(LiveActivation::parse(&value.to_string()).is_err(), "{payer}");
+        }
+        let mut missing: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        missing["gas_policy"].as_object_mut().unwrap().remove("payer_address");
+        assert!(LiveActivation::parse(&missing.to_string()).is_err());
+        let (run, activation, context) = live_fixture();
+        let mut mismatch: serde_json::Value = serde_json::from_str(&context).unwrap();
+        mismatch["gas_policy"]["payer_address"] = activation.account_identity.trading_address.clone().into();
+        assert!(LiveContext::parse(&mismatch.to_string(), &run, &activation).is_err());
     }
 
     #[test]

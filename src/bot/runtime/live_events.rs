@@ -300,6 +300,7 @@ pub(super) fn prepare_lifecycle(
         events.push(run.emitter.prepare(now.utc, None, None, &accounting,
             LivePayload::Stop(StopPayload { stop_new_risk: true, reason: stop.reason,
                 takeover_required: stop.takeover_required, alert_status: "LOCAL_RECORDED".into(),
+                stop_detail: stop.detail,
             }))?);
         run.stop_event_emitted = true;
     }
@@ -398,6 +399,7 @@ pub(super) fn prepare_final(
     let audit_complete = !run.emitter.output_failed();
     let stop = run.control.lock().stop.clone();
     let stop_reason = stop.as_ref().map(|stop| stop.reason.clone()).unwrap_or_else(|| reason::MANUAL_STOP.into());
+    let stop_detail = stop.as_ref().and_then(|stop| stop.detail.clone());
     let takeover = !execution_complete || !cash_complete || !audit_complete
         || stop.as_ref().is_some_and(|stop| stop.takeover_required);
     let mut events = prepare_lifecycle(state)?;
@@ -409,7 +411,7 @@ pub(super) fn prepare_final(
         LivePayload::Final(FinalPayload { run_status: if execution_complete && audit_complete {
             "STOPPED" } else { "INCOMPLETE" }.into(), stop_reason,
             execution_complete, cash_complete, audit_complete, takeover_required: takeover,
-            unresolved, positions }))?);
+            unresolved, positions, stop_detail }))?);
     run.pending_candidate = None;
     run.control.lock().state = if takeover { LiveRunState::Handoff } else { LiveRunState::Ended };
     Ok(events)

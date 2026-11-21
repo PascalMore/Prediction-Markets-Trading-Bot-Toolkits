@@ -11,6 +11,12 @@ use crate::service::venue::{
 
 const SCALE: u128 = 1_000_000_000_000_000_000;
 
+#[path = "tests/live003_regression.rs"]
+mod live003_regression;
+
+#[path = "tests/live004_regression.rs"]
+mod live004_regression;
+
 /// Test-only: the preparation checkpoints and the faults injected into them.
 ///
 /// The hooks live with the tests that use them: they are not part of the
@@ -119,7 +125,7 @@ fn ctx_fixture(identity: &AccountIdentity) -> crate::config::AppConfig {
         trading_address: identity.trading_address.clone(), signer_address: identity.signer_address.clone(),
     });
     options.gas_policy = crate::config::controlled_live::GasPolicy {
-        payer_address: identity.trading_address.clone(), minimum_balance_atoms: U256::from(1),
+        payer_address: identity.signer_address.clone(), minimum_balance_atoms: U256::from(1),
         maximum_consumption_atoms: U256::from(10),
     };
     cfg.controlled = Some(crate::config::ControlledRun::from_live_arguments(Some("signed-future-live"), Some("ctx-test"),
@@ -156,7 +162,8 @@ fn original_ctx_installs_one_live_phase1_channel_and_emitter_without_paper_cash(
 fn original_ctx_refuses_invalid_public_context_before_original_trader_factory() {
     let (trader, _) = crate::service::predict_fun::controlled::synthetic_controlled_trader(200, "fixed_account");
     let identity = trader.identity();
-    for fault in ["venue", "paper", "limits", "model", "context", "account", "strategy"] {
+    for fault in ["venue", "paper", "limits", "model", "context", "account", "strategy",
+        "payer-trading", "payer-foreign", "payer-missing", "payer-malformed", "payer-mismatch"] {
         let mut cfg = ctx_fixture(&identity);
         match fault {
             "venue" => cfg.venue = VenueId::Polymarket,
@@ -170,6 +177,11 @@ fn original_ctx_refuses_invalid_public_context_before_original_trader_factory() 
                 options.account_identity.as_mut().unwrap().trading_address = "0x1111111111111111111111111111111111111111".into();
                 cfg.controlled.as_mut().unwrap().live = Some(options.clone());
                 cfg.controlled_live = Some(options);
+            }
+            payer if payer.starts_with("payer-") => {
+                let options = cfg.controlled_live.as_mut().unwrap();
+                options.gas_policy.payer_address = match payer { "payer-trading" => identity.trading_address.clone(), "payer-foreign" | "payer-mismatch" => format!("0x{}", "3".repeat(40)), "payer-malformed" => "bad".into(), _ => String::new() };
+                if payer != "payer-mismatch" { cfg.controlled.as_mut().unwrap().live = Some(options.clone()); }
             }
             _ => (),
         }
@@ -318,7 +330,7 @@ async fn bare_buy_in_controlled_phase1_live_never_reaches_original_adapter() {
         deadline_at: Utc::now() + chrono::Duration::hours(1),
         budget_secs: 3600,
         gas_policy: crate::config::controlled_live::GasPolicy {
-            payer_address: identity.trading_address.clone(),
+            payer_address: identity.signer_address.clone(),
             minimum_balance_atoms: U256::from(1),
             maximum_consumption_atoms: U256::from(1),
         },
@@ -357,7 +369,7 @@ fn risk_fixture() -> (Broker, Arc<crate::service::observation::FixtureClock>) {
         operations_mode: OperationsMode::Supervised, risk_window_id: "risk-window".into(),
         authorization_ref: "offline-only".into(), deadline_at: now + chrono::Duration::hours(1),
         budget_secs: 3600, gas_policy: crate::config::controlled_live::GasPolicy {
-            payer_address: identity.trading_address.clone(), minimum_balance_atoms: U256::from(1),
+            payer_address: identity.signer_address.clone(), minimum_balance_atoms: U256::from(1),
             maximum_consumption_atoms: U256::from(100),
         },
     };
@@ -416,6 +428,28 @@ fn atomic_live_entry_accepts_legal_cash_and_checks_one_atom_cap_neighbors() {
     assert_eq!(broker.check_live_entry(&mut state, 1, two + U256::from(1)), Some(Blocked::OrderCap));
     assert!(state.paper.is_none());
     assert!(state.live.attempts.is_empty());
+    // Original entry gate: only the signer may spend the unchanged native gas budget.
+    let signer = state.live.controlled.as_ref().unwrap().identity.signer_address.clone();
+    let trading = state.live.controlled.as_ref().unwrap().identity.trading_address.clone();
+    assert_ne!(signer, trading);
+    for (payer, gas, minimum, maximum, accepted) in [
+        (signer.as_str(), Some(1000), 1000, 100, true),
+        (signer.as_str(), Some(999), 1000, 100, false),
+        (signer.as_str(), Some(901), 1, 100, true),
+        (signer.as_str(), Some(900), 1, 100, false),
+        (signer.as_str(), None, 1, 100, false),
+        (signer.as_str(), Some(1001), 1, 100, false),
+        (trading.as_str(), Some(1000), 1, 100, false),
+        ("0x3333333333333333333333333333333333333333", Some(1000), 1, 100, false),
+        ("", Some(1000), 1, 100, false), ("bad", Some(1000), 1, 100, false),
+    ] {
+        let run = state.live.controlled.as_mut().unwrap();
+        run.options.gas_policy.payer_address = payer.into();
+        run.options.gas_policy.minimum_balance_atoms = U256::from(minimum as u64);
+        run.options.gas_policy.maximum_consumption_atoms = U256::from(maximum as u64);
+        run.account_read.as_mut().unwrap().snapshot.gas_atoms = gas.map(|value| U256::from(value as u64));
+        assert_eq!(broker.check_live_entry(&mut state, 1, two).is_none(), accepted, "{payer} {gas:?}");
+    }
 }
 
 #[test]
@@ -643,7 +677,7 @@ async fn sending_fixture_with_trace(fault: &'static str) -> (
         state.live.baseline = Some(baseline.clone());
         let run = state.live.controlled.as_mut().unwrap();
         run.identity = identity.clone();
-        run.options.gas_policy.payer_address = identity.trading_address;
+        run.options.gas_policy.payer_address = identity.signer_address;
         let receipt = account_receipt(&state).unwrap();
         record_account_read(&mut state, &baseline, receipt).unwrap();
     }
@@ -834,7 +868,7 @@ async fn two_official_rounds_use_one_core_ledger_and_emitter_with_actual_fee_and
         state.live.baseline = Some(baseline.clone());
         let run = state.live.controlled.as_mut().unwrap();
         run.identity = identity.clone();
-        run.options.gas_policy.payer_address = identity.trading_address.clone();
+        run.options.gas_policy.payer_address = identity.signer_address.clone();
         let receipt = account_receipt(&state).unwrap();
         record_account_read(&mut state, &baseline, receipt).unwrap();
     }
@@ -1240,32 +1274,104 @@ async fn original_channel_bad_ack_partial_eof_and_parent_eof_stop_the_waiting_br
 }
 
 #[tokio::test]
-async fn refreshed_better_price_other_side_and_depth_cannot_replace_frozen_book() {
-    for fault in ["better_book", "changed_bid", "changed_depth"] {
+async fn a_changed_book_inside_the_limit_never_replaces_the_frozen_decision() {
+    // live004: a better price, a moved bid and a thinner level are market
+    // movement, not a new decision. The order may proceed, but its identity,
+    // quantity and cash bound stay the candidate's.
+    for fault in ["better_book", "changed_bid", "changed_depth", "book_bid_moved"] {
         let (broker, _, market, book, candidate, transport) = sending_fixture(fault).await;
-        let error = broker.take_live_candidate(taker::LiveCandidateRequest {
-            market: &market, yes_book: &book, candidate: &candidate }).await.err().unwrap();
-        assert!(error.to_string().contains("INPUT_CHANGED"), "{fault}: {error}");
-        assert_eq!(transport.posts.load(Ordering::SeqCst), 0, "{fault}");
-        assert_eq!(transport.signs.load(Ordering::SeqCst), 0, "{fault}");
-        assert!(!broker.state.lock().live.controlled.as_ref().unwrap().may_add_risk());
+        let ack = ack_next(broker.clone(), false);
+        let outcome = broker.take_live_candidate(taker::LiveCandidateRequest {
+            market: &market, yes_book: &book, candidate: &candidate }).await;
+        ack.join().unwrap();
+        let outcome = outcome.unwrap_or_else(|error| panic!("{fault}: {error}"));
+        let id = outcome.attempt_id.unwrap_or_else(|| panic!("{fault}: no attempt"));
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "{fault}");
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 1, "{fault}");
+        let quantity = crate::service::predict_fun::controlled::quantity_atoms(
+            candidate.gross_shares()).unwrap();
+        let cash = crate::service::predict_fun::controlled::cash_at_limit_atoms(
+            quantity, candidate.limit_price()).unwrap();
+        let state = broker.state.lock();
+        let record = state.live.attempts[&id].lock().clone();
+        assert_eq!(record.identity.market_id, market.id, "{fault}");
+        assert_eq!(record.identity.token_id, candidate.token(), "{fault}");
+        assert_eq!(record.request_gross_atoms, quantity, "{fault}");
+        // The reservation is the candidate's own worst case, never the fresh
+        // book's price.
+        assert!(record.r0 <= cash, "{fault}: {} > {cash}", record.r0);
+        assert!(record.identity.signed_hash.is_some(), "{fault}");
+        drop(state);
     }
 }
 
 #[tokio::test]
 async fn preparation_refusal_closes_only_the_unsent_cash_not_the_candidate_evidence() {
-    let (broker, _, market, book, candidate, transport) = sending_fixture("better_book").await;
-    assert!(broker.take_live_candidate(taker::LiveCandidateRequest {
-        market: &market, yes_book: &book, candidate: &candidate }).await.is_err());
+    // live004: the fresh book moved past the candidate's limit after its cash
+    // was reserved. Nothing was signed or sent, so the attempt's cash and the
+    // candidate go away while the window and the attempt's evidence stay.
+    let (broker, _, market, book, candidate, transport) = sending_fixture("book_past_limit").await;
+    let outcome = broker.take_live_candidate(taker::LiveCandidateRequest {
+        market: &market, yes_book: &book, candidate: &candidate }).await
+        .expect("a moved book refuses the candidate, not the window");
+    assert!(matches!(outcome.result, TakeResult::Blocked(Blocked::ThinBook)), "{:?}", outcome.result);
+    assert_eq!(outcome.attempt_id, Some(1));
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
+    let seq_after_refusal = broker.state.lock().live.controlled.as_ref().unwrap().emitter.last_seq();
+    {
+        let state = broker.state.lock();
+        let record = state.live.attempts[&1].lock();
+        assert_eq!(record.phase, AttemptPhase::Closed);
+        assert_eq!(record.submission, Submission::NotSubmitted);
+        assert!(record.identity.signed_hash.is_none());
+        drop(record);
+        assert!(!state.live.reservations.contains_key(&1));
+        assert_eq!(state.live.tombstones[&live::taker_key(market.id, candidate.token(), Side::Buy)], 1);
+        assert!(state.live.controlled.as_ref().unwrap().pending_candidate.is_none());
+        assert!(state.live.controlled.as_ref().unwrap().may_add_risk());
+        assert!(state.live.controlled.as_ref().unwrap().control.lock().stop.is_none());
+        assert!(state.entry_stop_reason.is_none());
+    }
+    // The same decision cannot be taken twice without a new evaluation: the
+    // refused candidate is gone, and the run adds no attempt, cash or event.
+    let replay = broker.take_live_candidate(taker::LiveCandidateRequest {
+        market: &market, yes_book: &book, candidate: &candidate }).await;
+    assert!(replay.err().unwrap().to_string().contains("CONTEXT_MISSING"));
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
+    let state = broker.state.lock();
+    assert_eq!(state.live.attempts.len(), 1);
+    assert!(state.live.reservations.is_empty());
+    assert_eq!(state.live.controlled.as_ref().unwrap().emitter.last_seq(), seq_after_refusal);
+}
+
+#[tokio::test]
+async fn thin_book_refusal_closes_only_the_unsent_cash_not_the_candidate_evidence() {
+    // R1: the fresh book is inside the candidate's limit but too thin for the
+    // frozen quantity. Nothing was signed or sent, so the attempt's cash is
+    // released and the window stays open — the same candidate-level refusal as
+    // a book that moved past the limit.
+    let (broker, _, market, book, candidate, transport) = sending_fixture("book_inside_limit_thin").await;
+    let outcome = broker.take_live_candidate(taker::LiveCandidateRequest {
+        market: &market, yes_book: &book, candidate: &candidate }).await
+        .expect("a thin book inside the limit refuses the candidate, not the window");
+    assert!(matches!(outcome.result, TakeResult::Blocked(Blocked::ThinBook)), "{:?}", outcome.result);
+    assert_eq!(outcome.attempt_id, Some(1));
     assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
     assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
     let state = broker.state.lock();
     let record = state.live.attempts[&1].lock();
     assert_eq!(record.phase, AttemptPhase::Closed);
     assert_eq!(record.submission, Submission::NotSubmitted);
-    assert!(!state.live.reservations.contains_key(&1));
-    assert_eq!(state.live.tombstones[&live::taker_key(market.id, candidate.token(), Side::Buy)], 1);
-    assert!(state.live.controlled.as_ref().unwrap().pending_candidate.is_none());
+    assert!(record.identity.signed_hash.is_none());
+    drop(record);
+    assert!(state.live.reservations.is_empty());
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.pending_candidate.is_none());
+    assert!(run.control.lock().stop.is_none());
+    assert!(run.may_add_risk());
+    assert!(state.entry_stop_reason.is_none());
 }
 
 #[test]
@@ -1306,6 +1412,47 @@ async fn official_runtime_read_mismatch_emits_failed_reconciliation_and_sticky_s
     assert_eq!(run.emitter.last_seq(), 3, "EVALUATE, failed official read, stop");
     assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
     assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
+}
+
+/// run005's silhouette: the runtime read stops the run, then the bounded
+/// shutdown writes the terminal record. Both records keep the same code.
+#[tokio::test]
+async fn live_shutdown_after_a_runtime_read_mismatch_keeps_the_failure_code() {
+    let (broker, _, market, _, _, transport) = sending_fixture("terminal").await;
+    {
+        // The same changed official baseline the mismatch test uses.
+        let mut state = broker.state.lock();
+        state.live.baseline.as_mut().unwrap().collateral_atoms = Some(U256::from(99 * SCALE));
+    }
+    {
+        let lane = broker.live_operation_lane().unwrap();
+        let _operation = lane.lock().await;
+        assert!(live::check_runtime_account(&broker, false).await.is_err());
+    }
+    let data = ShutdownData { broker: broker.clone(), market, fault: "unused",
+        reads: Default::default(), dropped_reads: Default::default(), release: Default::default() };
+    tokio::time::timeout(std::time::Duration::from_secs(5), broker.finish_controlled(&data))
+        .await.expect("the bounded shutdown ends");
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.emitter.is_finished());
+    assert_eq!(run.control.lock().state, LiveRunState::Handoff);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+}
+
+/// The stop names the account path that stopped the run, not only the reason:
+/// the code the check already held reaches the stop and the terminal record.
+#[test]
+fn the_runtime_read_stop_and_final_name_the_failure_code() {
+    let events = capture_production_test(
+        "live_shutdown_after_a_runtime_read_mismatch_keeps_the_failure_code");
+    let stop = events.iter().find(|event| event["event_kind"] == "stop").unwrap();
+    assert_eq!(stop["payload"]["reason"], "RECONCILIATION_REQUIRED");
+    assert_eq!(stop["payload"]["stop_detail"], "ACCOUNT_LEDGER_MISMATCH");
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["event_kind"], "final");
+    assert_eq!(terminal["payload"]["stop_reason"], "RECONCILIATION_REQUIRED");
+    assert_eq!(terminal["payload"]["stop_detail"], "ACCOUNT_LEDGER_MISMATCH");
 }
 
 fn capture_production_test(test_name: &str) -> Vec<serde_json::Value> {
@@ -1397,10 +1544,12 @@ fn two_round_producer_associates_actual_fees_payouts_and_reconciled_owned_positi
 
 #[test]
 fn real_producer_streams_include_acceptance_actual_delta_and_unsent_release() {
-    for (test_name, sent, signed) in [
-        ("original_core_broker_predict_transport_reaches_a_nonzero_fee_post_after_ack", true, true),
-        ("eof_observed_before_ack_closes_the_same_state_before_original_post", false, true),
-        ("preparation_refusal_closes_only_the_unsent_cash_not_the_candidate_evidence", false, false),
+    for (test_name, sent, signed, stopped) in [
+        ("original_core_broker_predict_transport_reaches_a_nonzero_fee_post_after_ack", true, true, false),
+        ("eof_observed_before_ack_closes_the_same_state_before_original_post", false, true, true),
+        // live004: a candidate refused for a moved book leaves no stop event;
+        // the window stays open for the next decision.
+        ("preparation_refusal_closes_only_the_unsent_cash_not_the_candidate_evidence", false, false, false),
     ] {
         let events = capture_production_test(test_name);
         let reservation = events.iter().find(|event| event["payload"]["action"] == "RESERVE").unwrap();
@@ -1439,7 +1588,8 @@ fn real_producer_streams_include_acceptance_actual_delta_and_unsent_release() {
             assert_eq!(last["payload"]["submission"], "NOT_SUBMITTED");
             assert_eq!(last["payload"]["attempt_phase"], "CLOSED");
             assert!(!events.iter().any(|event| event["event_kind"] == "execution"));
-            assert_eq!(events.iter().filter(|event| event["event_kind"] == "stop").count(), 1);
+            assert_eq!(events.iter().filter(|event| event["event_kind"] == "stop").count(),
+                if stopped { 1 } else { 0 }, "{test_name}");
         }
         assert!(events.iter().any(|event| event["event_kind"] == "reconciliation"));
     }
@@ -2214,7 +2364,7 @@ async fn live_startup_missing_authoritative_page_stops_and_finishes_without_an_a
         state.live.baseline = None;
         let run = state.live.controlled.as_mut().unwrap();
         run.identity = identity.clone();
-        run.options.gas_policy.payer_address = identity.trading_address;
+        run.options.gas_policy.payer_address = identity.signer_address;
         run.account_read = None;
     }
     let broker = Arc::new(broker);

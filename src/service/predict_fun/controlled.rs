@@ -412,6 +412,8 @@ pub(crate) struct ControlledSyntheticTrace {
     pub fee_rate_bps: u32,
     /// Every order this transport received, in the order it received them.
     pub orders: std::sync::Mutex<Vec<ControlledOrder>>,
+    /// How many times the venue served a fresh book to a preparation.
+    pub book_reads: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -456,7 +458,8 @@ pub(crate) fn synthetic_controlled_trader_with_trace(
 ) -> (super::PredictFunTrader, std::sync::Arc<super::account::tests::SyntheticRpc>,
     std::sync::Arc<ControlledSyntheticTrace>) {
     controlled_transport(fault, fee_rate_bps, vec![ControlledRound {
-        market_id: 1, yes_token: 77, no_token: 88, condition: 0xcc }])
+        market_id: if fault == "live003" { 4668196 } else { 1 },
+        yes_token: 77, no_token: 88, condition: 0xcc }])
 }
 
 /// The two-round fixture: one adapter, one client and one account gate serve
@@ -518,7 +521,36 @@ struct BookTransport(
 impl BookTransport {
     /// Whether the venue reports a fill for the orders it received.
     fn filled(&self) -> bool {
-        matches!(self.1, "controlled_fill" | "controlled_partial" | "controlled_missing_fee")
+        matches!(self.1, "controlled_fill" | "controlled_partial" | "controlled_missing_fee" | "live003"
+            | "book_bid_moved" | "book_moved_then_frozen" | "book_inside_limit_thin_then_frozen")
+    }
+
+    /// The live002/live004 shape: a fresh book that differs from the frozen one.
+    ///
+    /// - `book_bid_moved`: the bid moved inside the candidate's limit.
+    /// - `book_moved_then_frozen`: the first read is past the limit, later ones
+    ///   are the frozen book, so a window that survives one refusal can still
+    ///   fill its next candidate.
+    /// - `book_past_limit` / `book_past_limit_thin`: the ask moved past the
+    ///   candidate's limit, with and without enough depth for the size.
+    /// - `book_inside_limit_thin`: the ask is inside the candidate's limit but
+    ///   the level cannot cover the frozen quantity.
+    /// - `book_inside_limit_thin_then_frozen`: the first read is inside the
+    ///   limit and too thin, later reads are the frozen book, so a window that
+    ///   survives one refusal can still fill its next candidate.
+    /// - `empty_book`: the venue returns no side at all.
+    fn book_levels(&self) -> (f64, f64, f64) {
+        match self.1 {
+            "live003" => (0.37, 0.36, 100.0),
+            "better_book" => (0.39, 0.3, 100.0),
+            "changed_bid" => (0.4, 0.31, 100.0),
+            "changed_depth" => (0.4, 0.3, 99.0),
+            "book_bid_moved" => (0.4, 0.29, 100.0),
+            "book_past_limit" => (0.41, 0.3, 100.0),
+            "book_past_limit_thin" => (0.41, 0.3, 1.0),
+            "book_inside_limit_thin" => (0.39, 0.3, 1.0),
+            _ => (0.4, 0.3, 100.0),
+        }
     }
 
     /// Whether the venue reports only part of the order as filled.
@@ -623,7 +655,8 @@ impl BookTransport {
         let round = self.2.round_by_id(record.market_id).unwrap();
         let (gross, _, fee) = self.amounts(&record.order);
         let mut leg = json!({"hash":record.order["hash"],"signer":record.order["signer"],
-            "quoteType":"Bid","amount":gross.to_string(),"price":"400000000000000000",
+            "quoteType":"Bid","amount":gross.to_string(),
+            "price":if self.1 == "live003" { "640000000000000000" } else { "400000000000000000" },
             "outcome":{"onChainId":record.token.to_string()},
             "fee":{"amount":fee.to_string(),"type":"SHARES"}});
         if self.1 == "controlled_missing_fee"
@@ -748,13 +781,22 @@ impl super::account::SyntheticTransport for BookTransport {
                         "order":record.order}}).to_string());
                 }
             }
-            if let Some(market_id) = path.strip_prefix("/markets/")
+            if path.strip_prefix("/markets/")
                 .and_then(|rest| rest.strip_suffix("/orderbook"))
                 .and_then(|id| id.parse::<u64>().ok())
+                .is_some()
             {
-                let ask = if self.1 == "better_book" { 0.39 } else { 0.4 };
-                let bid = if self.1 == "changed_bid" { 0.31 } else { 0.3 };
-                let depth = if self.1 == "changed_depth" { 99.0 } else { 100.0 };
+                let read = self.2.book_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.1 == "empty_book" {
+                    return Ok(serde_json::json!({"data":{"asks":[],"bids":[]}}).to_string());
+                }
+                if self.1 == "book_moved_then_frozen" && read == 0 {
+                    return Ok(serde_json::json!({"data":{"asks":[[0.41,100.0]],"bids":[[0.3,100.0]]}}).to_string());
+                }
+                if self.1 == "book_inside_limit_thin_then_frozen" && read == 0 {
+                    return Ok(serde_json::json!({"data":{"asks":[[0.39,1.0]],"bids":[[0.3,100.0]]}}).to_string());
+                }
+                let (ask, bid, depth) = self.book_levels();
                 return Ok(serde_json::json!({"data":{"asks":[[ask,depth]],"bids":[[bid,100.0]]}}).to_string());
             }
             self.0.rest(method, path, bearer, body)

@@ -364,6 +364,8 @@ pub struct StopPayload {
     pub reason: String,
     pub takeover_required: bool,
     pub alert_status: String,
+    /// The failure code the run already held when it stopped, if any.
+    pub stop_detail: Option<String>,
 }
 
 /// The persistent cold-start refusal policy's actual lifecycle state.
@@ -413,6 +415,8 @@ pub struct FinalPayload {
     pub takeover_required: bool,
     pub unresolved: Vec<UnresolvedAttempt>,
     pub positions: Vec<LivePosition>,
+    /// The failure code the stopped run already held, if any.
+    pub stop_detail: Option<String>,
 }
 
 /// One live event, ready to be written.
@@ -521,6 +525,7 @@ pub fn payload_keys(kind: EventKind) -> &'static [&'static str] {
             "reason",
             "takeover_required",
             "alert_status",
+            "stop_detail",
         ],
         EventKind::Recovery => &["policy", "state", "reason"],
         EventKind::Payout => &[
@@ -542,6 +547,7 @@ pub fn payload_keys(kind: EventKind) -> &'static [&'static str] {
             "takeover_required",
             "unresolved",
             "positions",
+            "stop_detail",
         ],
     }
 }

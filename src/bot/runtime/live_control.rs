@@ -77,6 +77,8 @@ impl LiveRunState {
 pub struct LiveStop {
     /// The stable reason token.
     pub reason: String,
+    /// The failure code the stop was already holding, when one was known.
+    pub detail: Option<String>,
     /// Whether a human has to take the remaining risk over.
     pub takeover_required: bool,
     /// The moment the stop was set.
@@ -185,9 +187,25 @@ impl RunControl {
         if self.stop.is_none() {
             self.stop = Some(LiveStop {
                 reason: reason.to_string(),
+                detail: None,
                 takeover_required,
                 at,
             });
+        }
+    }
+
+    /// Stop adding risk with the failure code that was already in hand.
+    ///
+    /// The first stop wins: a later stop cannot rewrite the reason, the
+    /// takeover flag or the code an earlier one recorded.
+    pub fn stop_with_detail(&mut self, reason: &str, detail: &str,
+                            takeover_required: bool, at: DateTime<Utc>) {
+        let first = self.stop.is_none();
+        self.stop(reason, takeover_required, at);
+        if first {
+            if let Some(stop) = self.stop.as_mut() {
+                stop.detail = Some(detail.to_string());
+            }
         }
     }
 }
@@ -452,13 +470,25 @@ impl ControlledSendGuard for LiveCandidateGuard {
     }
 
     fn check_book(&self, book: &crate::models::BookSnapshot) -> Result<()> {
-        let binding = self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
-        let frozen = binding.candidate.frozen_book();
-        let same = |left: &[crate::models::BookLevel], right: &[crate::models::BookLevel]| {
-            left.iter().map(|level| (level.price, level.size))
-                .eq(right.iter().map(|level| (level.price, level.size)))
-        };
-        if !same(&frozen.asks, &book.asks) || !same(&frozen.bids, &book.bids) { bail!("INPUT_CHANGED"); }
+        // The adapter reads this book from the venue inside the guarded
+        // preparation, after `check_preparation` proved the run is still in
+        // window with unchanged inputs, so it is this run's own fresh read.
+        // A book that differs from the evaluation's snapshot is normal market
+        // movement, not a different decision: the frozen decision is carried
+        // by the candidate's limit, `market_amounts`, `FrozenAttempt::check_order`
+        // and `candidate_limit_atoms`, which all still refuse a book that no
+        // longer supports it.
+        self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
+        // A book missing a whole side is missing data, not a refused decision:
+        // retrying the same decision against it cannot succeed.
+        if book.asks.is_empty() || book.bids.is_empty() {
+            return Err(VenueError::new(
+                VenueErrorCode::ReadUnavailable,
+                "controlled_send",
+                "EMPTY_BOOK",
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -773,6 +803,14 @@ impl ControlledLiveState {
         self.control
             .lock()
             .stop(reason, takeover_required, at);
+    }
+
+    /// Stop adding risk with the failure code that was already in hand.
+    pub fn stop_with_detail(&mut self, reason: &str, detail: &str,
+                            takeover_required: bool, at: DateTime<Utc>) {
+        self.control
+            .lock()
+            .stop_with_detail(reason, detail, takeover_required, at);
     }
 }
 

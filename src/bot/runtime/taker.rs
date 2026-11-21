@@ -267,6 +267,26 @@ impl Broker {
             Ok(ticket) => ticket,
             Err(error) => {
                 let event_reason = preparation_reason(&error);
+                // A candidate the venue refused before it could leave, and
+                // only because the fresh book no longer supports the frozen
+                // decision, ends this candidate — not the run. Its cash is
+                // released, the refusal is recorded and the window stays open;
+                // the pending candidate is cleared by the completion guard, so
+                // the same decision can never be taken twice.
+                if error.downcast_ref::<crate::service::venue::CandidateRefused>().is_some() {
+                    // Only a request that provably never left releases cash.
+                    // The original hash/tombstone and any unknown risk survive.
+                    crate::bot::runtime::live::release_not_submitted(self, &handle, &intent_key);
+                    guard.emit_order_result(reservation, event_reason, None)?;
+                    return Ok(LiveTakeOutcome {
+                        // The fresh book no longer supports the frozen decision
+                        // (moved past the limit, or too thin for the size):
+                        // the entry is blocked, the run is not.
+                        result: TakeResult::Blocked(Blocked::ThinBook),
+                        guard: Some(guard),
+                        attempt_id: Some(attempt_id),
+                    });
+                }
                 self.state.lock().live.controlled.as_mut().unwrap()
                     .stop(event_reason, true, chrono::Utc::now());
                 // Only a request that provably never left releases cash.
@@ -356,7 +376,9 @@ impl Broker {
                 balance_atoms, initial_atoms,
             });
         let policy = &controlled.options.gas_policy;
-        if policy.payer_address != controlled.identity.trading_address
+        // Context addresses may be lowercase; the adapter emits EIP-55 checksum case.
+        // Address identity must not depend on that representation.
+        if !policy.payer_address.eq_ignore_ascii_case(&controlled.identity.signer_address)
             || gas.is_some_and(|read| read.balance_atoms > read.initial_atoms)
             || !crate::bot::runtime::live_accounting::check_gas(gas,
                 policy.minimum_balance_atoms, policy.maximum_consumption_atoms).may_add_risk
@@ -384,7 +406,7 @@ impl Broker {
 }
 
 /// Map typed venue failures to the closed public reason set; never emit raw text.
-fn preparation_reason(error: &anyhow::Error) -> &'static str {
+pub(crate) fn preparation_reason(error: &anyhow::Error) -> &'static str {
     use crate::service::venue::{VenueError, VenueErrorCode};
     let Some(error) = error.downcast_ref::<VenueError>() else {
         return if error.to_string() == "INPUT_CHANGED" { "INPUT_CHANGED" } else { "FACT_INCOMPLETE" };

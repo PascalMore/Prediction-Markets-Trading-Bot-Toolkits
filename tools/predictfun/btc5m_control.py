@@ -46,13 +46,15 @@ RUN_SECONDS = 21_600
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-21-btc5m-stop-diagnostics/evidence/deployment/candidate/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "ad4207c2c3bb91f3731c19ffe3e9ac6c25f53b06bbd80b820ccb47d967ed1f37"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
     "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/channel.rs",
     "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/live_accounting.rs",
+    "src/bot/runtime/live_control/tests/live003_regression.rs",
+    "src/bot/runtime/live_control/tests/live004_regression.rs",
     "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/types.rs",
     "src/bot/runtime/live_events/tests.rs", "src/service/predict_fun/request.rs",
     "src/service/predict_fun/controlled.rs", "src/service/predict_fun/fills.rs",
@@ -526,6 +528,36 @@ def boottime() -> float:
     return time.clock_gettime(time.CLOCK_BOOTTIME)
 
 
+def candidate_input_error(frozen: dict[str, Any], decision: dict[str, Any],
+                          market_id: Any, original_market_id: Any, *,
+                          allow_diagnostic_limit: bool = False) -> str | None:
+    """Compare fixed candidate facts, allowing clock-derived valuations to change.
+
+    Inputs have already passed the caller's schema validator. Only paper's
+    diagnostic-limit path may omit depth facts; live retains strict depth checks.
+    """
+    fields = ("decision_id", "candidate_id", "selected_token", "symbol",
+        "prediction_source", "actual_pair", "source_state", "source_epoch",
+        "reset_reason", "settlement_provider", "starts_at", "ends_at",
+        "identity_available_at", "strike_available_at", "strike", "spot",
+        "spot_clock", "book_clock", "decision_at", "decision_elapsed_ms",
+        "samples", "sigma", "fee_rate_bps", "best_yes_bid", "best_yes_ask")
+    if (market_id != original_market_id
+            or any(decision[name] != frozen[name] for name in fields)):
+        return "CANDIDATE_INPUTS"
+    for side in ("up", "down"):
+        if decision[side] is None or frozen[side] is None:
+            if decision[side] != frozen[side]:
+                return "CANDIDATE_SIDE"
+            continue
+        for name in ("token", "limit_price", "gross_shares", "depth_levels", "depth_complete"):
+            if (decision[side][name] != frozen[side][name]
+                    and not (allow_diagnostic_limit and decision["reason"] == "DIAGNOSTIC_LIMIT"
+                             and name.startswith("depth_") and decision[side][name] is None)):
+                return "CANDIDATE_SIDE"
+    return None
+
+
 class _EventRelations:
     """Validate v2 correlations, not a second cash or execution ledger."""
 
@@ -562,25 +594,10 @@ class _EventRelations:
                 if original is None or original["stage"] != expected:
                     raise ValueError("CANDIDATE_PHASE")
                 frozen = original["initial"]
-                fields = ("decision_id", "candidate_id", "selected_token", "symbol",
-                    "prediction_source", "actual_pair", "source_state", "source_epoch",
-                    "reset_reason", "settlement_provider", "starts_at", "ends_at",
-                    "identity_available_at", "strike_available_at", "strike", "spot",
-                    "spot_clock", "book_clock", "decision_at", "decision_elapsed_ms",
-                    "samples", "sigma", "fee_rate_bps", "best_yes_bid", "best_yes_ask")
-                if (event["market_id"] != original["market_id"]
-                        or any(decision[name] != frozen[name] for name in fields)):
-                    raise ValueError("CANDIDATE_INPUTS")
-                for side in ("up", "down"):
-                    if decision[side] is None or frozen[side] is None:
-                        if decision[side] != frozen[side]:
-                            raise ValueError("CANDIDATE_SIDE")
-                        continue
-                    for name in ("token", "limit_price", "gross_shares", "depth_levels", "depth_complete"):
-                        if (decision[side][name] != frozen[side][name]
-                                and not (decision["reason"] == "DIAGNOSTIC_LIMIT"
-                                         and name.startswith("depth_") and decision[side][name] is None)):
-                            raise ValueError("CANDIDATE_SIDE")
+                error = candidate_input_error(frozen, decision, event["market_id"],
+                                              original["market_id"], allow_diagnostic_limit=True)
+                if error is not None:
+                    raise ValueError(error)
                 candidate_update = {**original, "stage": decision["phase"], "last": decision}
         elif kind in {"reservation", "release", "blocked"} or (kind == "fill" and details["side"] == "buy"):
             original = self.candidates.get(candidate_id) if candidate_id is not None else None
@@ -1647,7 +1664,9 @@ def finish_live_evidence(store: Any, facts: dict[str, Any], final: dict[str, Any
     store.finish({"schema_version": live.SCHEMA_VERSION, "run_id": store.started["run_id"],
                   "exit_facts": native, "final_event_seq": final["event_seq"] if final else None,
                   "final_accounting": final["accounting"] if final else None,
-                  "incomplete_reason": reason, **flags})
+                  "incomplete_reason": reason,
+                  # The producer's own failure code, when it stopped with one.
+                  "incomplete_detail": payload.get("stop_detail"), **flags})
 
 
 def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[str, str],

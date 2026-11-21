@@ -482,7 +482,9 @@ struct MarketAmounts {
 
 /// Walk the book for `quantity_wei` shares, as the SDK's MARKET helper does with
 /// no slippage: the signed ratio is the worst level reached. Unlike the SDK this
-/// refuses a partial fill, because callers record the size they asked for.
+/// refuses a partial fill, because callers record the size they asked for. A
+/// complete book that is too thin for the quantity is a candidate-level refusal
+/// (`CandidateRefused`), handled exactly like a book that moved past the limit.
 fn market_amounts(book: &WeiBook, side: Side, quantity_wei: U256) -> Result<MarketAmounts> {
     let quantity = retain_significant_digits(quantity_wei, 5);
     if quantity < U256::from(MIN_QUANTITY_WEI) {
@@ -512,11 +514,17 @@ fn market_amounts(book: &WeiBook, side: Side, quantity_wei: U256) -> Result<Mark
         last_price = *price;
     }
     if !remaining.is_zero() {
-        bail!(
-            "book too thin: {} of {} shares available",
-            wei_to_f64(quantity - remaining),
-            wei_to_f64(quantity)
+        // A complete book whose price is inside the candidate's limit but whose
+        // depth cannot cover the frozen quantity no longer supports the frozen
+        // decision. Nothing has been signed or sent, so this is the same
+        // candidate-level refusal as a book that moved past the limit; an
+        // unparsable or overflowing amount above stays a hard error.
+        debug!(
+            available = wei_to_f64(quantity - remaining),
+            requested = wei_to_f64(quantity),
+            "fresh book too thin for the frozen quantity; refusing this candidate"
         );
+        return Err(crate::service::venue::CandidateRefused.into());
     }
 
     let worst_value = fills::checked_product_atoms(last_price, quantity)?;
@@ -558,6 +566,11 @@ fn limit_amounts(side: Side, price_wei: U256, quantity_wei: U256) -> Result<Mark
 
 /// Refuse a fill worse than `limit_price`. The book is a snapshot, but the signed
 /// ratio caps the price regardless of what it does before matching.
+///
+/// A book that moved past the candidate's limit is a refusal of this candidate
+/// only: nothing has been signed or sent, so the caller releases the attempt's
+/// cash and keeps the window open. Every other failure here (an unreadable
+/// price, a too-small or overflowing order) stays a hard error.
 fn check_limit(amounts: &MarketAmounts, side: Side, limit_price: f64) -> Result<()> {
     let limit = f64_to_wei(limit_price)?;
     let beyond = match side {
@@ -565,10 +578,13 @@ fn check_limit(amounts: &MarketAmounts, side: Side, limit_price: f64) -> Result<
         Side::Sell => amounts.last_price < limit,
     };
     if beyond {
-        bail!(
-            "book moved past the limit: {side:?} needs {} against limit {limit_price}",
-            wei_to_f64(amounts.last_price)
+        debug!(
+            ?side,
+            last_price = wei_to_f64(amounts.last_price),
+            limit_price,
+            "fresh book moved past the candidate's limit; refusing this candidate"
         );
+        return Err(crate::service::venue::CandidateRefused.into());
     }
     Ok(())
 }
@@ -1773,8 +1789,11 @@ mod tests {
 
     #[test]
     fn thin_book_is_refused_rather_than_part_filled() {
+        // R1: insufficient depth is a candidate-level refusal — the same typed
+        // class as a book that moved past the limit — never a partial fill.
         let err = market_amounts(&sdk_book(), Side::Sell, wei("1000")).unwrap_err();
-        assert!(err.to_string().contains("too thin"), "{err}");
+        assert!(err.downcast_ref::<crate::service::venue::CandidateRefused>().is_some(), "{err}");
+        assert_eq!(err.to_string(), "INPUT_CHANGED");
     }
 
     #[test]
