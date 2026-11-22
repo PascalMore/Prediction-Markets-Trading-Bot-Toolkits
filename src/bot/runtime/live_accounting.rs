@@ -12,6 +12,7 @@
 //! not a number to wrap.
 
 use crate::bot::runtime::live::LiveState;
+use crate::config::run_parameters::RunParameters;
 use alloy_primitives::{U256, U512};
 use std::collections::HashMap;
 
@@ -19,16 +20,63 @@ use std::collections::HashMap;
 pub const ASSET_UNITS: u32 = 18;
 /// One asset in atoms.
 pub const ONE: u128 = 1_000_000_000_000_000_000;
+/// The smallest order worth sending, in atoms (0.5 USDT).
+///
+/// This is a dust floor, not a risk threshold: the controlled reservation is
+/// `ceil(shares * limit)`, which is strictly below the configured order size
+/// (a 1.00 USDT order reserves ~0.9999), so the floor must sit below that
+/// reservation or no order could ever be sent. The only cap that decides how
+/// large an order may be stays [`max_order_atoms`].
+pub const MIN_ORDER_ATOMS: u128 = 500_000_000_000_000_000;
 /// The window's allocated budget, in USDT.
-pub const BUDGET_C0_USDT: u64 = 100;
+pub const BUDGET_C0_USDT: u64 = 98;
 /// The largest single order's worst cash, in USDT.
-pub const MAX_ORDER_USDT: u64 = 2;
+pub const MAX_ORDER_USDT: u64 = 1;
 /// The largest per-market worst cash, in USDT.
-pub const MAX_MARKET_USDT: u64 = 2;
+pub const MAX_MARKET_USDT: u64 = 1;
 /// The largest total worst cash, in USDT.
 pub const MAX_TOTAL_USDT: u64 = 10;
 /// The net loss that latches the window, in USDT.
 pub const MAX_LOSS_USDT: u64 = 20;
+
+/// Whether a startup reading funds the window's own budget.
+///
+/// This is the legacy receipt path's coverage test: an account holding at least
+/// the budget is funded. The controlled window's strict equality lives in
+/// [`cash_matches_budget`].
+pub fn startup_funded(budget: U256, collateral: Option<U256>) -> bool {
+    collateral.is_some_and(|cash| cash >= budget)
+}
+
+/// Whether a controlled window's observed starting cash is exactly its budget.
+///
+/// The window's C0 is the budget the run declares. When the venue holds a
+/// different amount the window's budget-relative cash can never equal the
+/// observed balance, so the identity cannot balance against that budget. Startup
+/// refuses rather than letting a mismatched window trade first and discover the
+/// gap at the end. The comparison is atom-for-atom: no rounding, no tolerance.
+pub fn cash_matches_budget(budget: U256, collateral: Option<U256>) -> bool {
+    collateral == Some(budget)
+}
+
+/// Whether the starting cash is the declared budget plus its verified claims.
+///
+/// A claimed payout that already arrived raises the account's collateral above
+/// the pre-claim C0. Only the reader's own exact claim evidence may explain that
+/// increase; every other difference keeps refusing.
+pub fn cash_matches_budget_and_claims(budget: U256, collateral: Option<U256>, claims: U256) -> bool {
+    budget.checked_add(claims) == collateral
+}
+
+/// The exact cash a reader's verified claimed payouts add up to.
+pub fn explained_claim_cash(
+    snapshot: &crate::service::venue::AccountSnapshot,
+) -> Option<U256> {
+    snapshot
+        .claimed_win
+        .iter()
+        .try_fold(U256::ZERO, |total, win| total.checked_add(win.claim_atoms))
+}
 
 /// The window's allocated budget, in atoms.
 pub fn budget_c0_atoms() -> U256 {
@@ -263,6 +311,14 @@ pub trait LiveFacts {
     fn observed_risk_floor(&self, attempt_id: u64) -> Option<U256>;
     /// A confirmed official claim for this exact applied inventory; not cash.
     fn official_claim(&self, _attempt_id: u64) -> Option<(U256, U256)> { None }
+    /// The cash a confirmed official claim already delivered: the claimed
+    /// inventory and the exact atoms the venue paid. This is cash, not a mark.
+    fn claim_credit(&self, _attempt_id: u64) -> Option<(U256, U256)> { None }
+    /// Cash the run's opening account read already received as claimed payouts.
+    fn opening_claim_cash(&self) -> U256 { U256::ZERO }
+    /// The frozen public money of this window. Legacy states keep the
+    /// historical values; a parameterized run carries its own.
+    fn params(&self) -> RunParameters { RunParameters::legacy() }
 }
 
 /// Read the facts of the broker's own live state.
@@ -315,6 +371,26 @@ impl LiveFacts for StateFacts<'_> {
         let outcome = self.state.controlled.as_ref()?.attempt_outcomes.get(&attempt_id)?;
         Some((outcome.position_net_atoms, outcome.claim_value_atoms?))
     }
+
+    fn claim_credit(&self, attempt_id: u64) -> Option<(U256, U256)> {
+        self.state.claims.get(&attempt_id).copied()
+    }
+
+    fn opening_claim_cash(&self) -> U256 {
+        self.state
+            .controlled
+            .as_ref()
+            .map(|run| run.opening_claim_cash)
+            .unwrap_or(U256::ZERO)
+    }
+
+    fn params(&self) -> RunParameters {
+        self.state
+            .controlled
+            .as_ref()
+            .map(|run| run.options.params)
+            .unwrap_or_else(RunParameters::legacy)
+    }
 }
 
 /// The window's projection of the broker's live state.
@@ -326,12 +402,14 @@ pub fn project_window<F: LiveFacts>(
     marks: &Marks,
     gas: Option<GasReading>,
 ) -> WindowAccounting {
-    let budget = budget_c0_atoms();
+    let params = facts.params();
+    let budget = params.budget;
     let mut cost = U256::ZERO;
     let mut reserved = U256::ZERO;
     let mut value: Option<U256> = Some(U256::ZERO);
     let mut applied_total = U256::ZERO;
     let mut released_basis = U256::ZERO;
+    let mut claimed_cash = facts.opening_claim_cash();
     let mut pending_claim_value: Option<U256> = None;
     let mut conflict = false;
 
@@ -352,6 +430,20 @@ pub fn project_window<F: LiveFacts>(
             conflict = true;
             U256::MAX
         });
+        if let Some((claimed_inventory, claimed)) = facts.claim_credit(attempt_id) {
+            // The official claim already paid: the holding is gone, its cost is
+            // released, and the exact atoms are cash this window holds.
+            if claimed_inventory != inventory || !residual.is_zero() {
+                conflict = true;
+                continue;
+            }
+            cost = cost.checked_sub(cash).unwrap_or_else(|| { conflict = true; U256::ZERO });
+            released_basis = released_basis.checked_add(cash)
+                .unwrap_or_else(|| { conflict = true; U256::MAX });
+            claimed_cash = claimed_cash.checked_add(claimed)
+                .unwrap_or_else(|| { conflict = true; U256::MAX });
+            continue;
+        }
         if let Some((covered_inventory, claim)) = facts.official_claim(attempt_id) {
             if covered_inventory != inventory || !residual.is_zero() {
                 conflict = true;
@@ -393,8 +485,15 @@ pub fn project_window<F: LiveFacts>(
         }));
     }
 
-    // The budget balance falls by what the window actually spent.
-    let cash = budget.saturating_sub(applied_total);
+    // The budget balance falls by what the window actually spent and rises by
+    // the claimed payouts it already received.
+    let cash = budget
+        .saturating_sub(applied_total)
+        .checked_add(claimed_cash)
+        .unwrap_or_else(|| {
+            conflict = true;
+            U256::MAX
+        });
     let available = cash.saturating_sub(reserved);
     let status = match value {
         _ if conflict || applied_total > budget
@@ -403,9 +502,15 @@ pub fn project_window<F: LiveFacts>(
         None => AccountingStatus::Incomplete(ProjectionGap::UnknownMark),
     };
 
-    // The realized gain is whatever the window recovered; the unrealized gain
-    // is the value of what it still holds, less what it paid for it.
-    let realized = SignedAtoms::negative(released_basis);
+    // The realized gain is what the window recovered: the claimed cash it
+    // received, less the cost basis those holdings released. The unrealized
+    // gain is the value of what it still holds, less what it paid for it.
+    // Keeping the claim inside `realized` is what makes the identity
+    // `cash = C0 + realized - cost` hold after a claim was paid.
+    let realized = match claimed_cash.checked_sub(released_basis) {
+        Some(gain) => SignedAtoms::positive(gain),
+        None => SignedAtoms::negative(released_basis - claimed_cash),
+    };
     let value = value.unwrap_or(U256::ZERO);
     let unrealized = SignedAtoms::checked_sub(value, cost).unwrap_or_else(SignedAtoms::zero);
     // NAV is budget cash plus the valuation. Only net_pnl subtracts C0;
@@ -414,7 +519,7 @@ pub fn project_window<F: LiveFacts>(
     let net_pnl = SignedAtoms::checked_sub(cash.saturating_add(value), budget)
         .unwrap_or_else(SignedAtoms::zero);
     let loss_latched = net_pnl.is_negative()
-        && net_pnl.magnitude() >= max_loss_atoms();
+        && net_pnl.magnitude() >= params.loss;
 
     WindowAccounting {
         budget,
@@ -457,12 +562,16 @@ pub fn risk_exposure(state: &LiveState) -> Option<RiskExposure> {
         };
         let reserved = state.reservations.get(id).copied().unwrap_or(U256::ZERO)
             .max(floor.saturating_sub(cost));
-        let cost = match (StateFacts { state }).official_claim(*id) {
-            Some((inventory, claim)) if claim.is_zero()
-                && inventory == state.net_inventory.get(id).copied().unwrap_or(U256::ZERO)
-                && reserved.is_zero() => U256::ZERO,
-            _ => cost,
-        };
+        let facts = StateFacts { state };
+        let inventory = state.net_inventory.get(id).copied().unwrap_or(U256::ZERO);
+        // A claimed payout that already arrived is cash, not risk: its cost is
+        // released exactly like a write-off. An unclaimed or unconfirmed win
+        // keeps its cost.
+        let settled = reserved.is_zero()
+            && (facts.claim_credit(*id).is_some_and(|(claimed, _)| claimed == inventory)
+                || matches!(facts.official_claim(*id),
+                    Some((covered, claim)) if claim.is_zero() && covered == inventory));
+        let cost = if settled { U256::ZERO } else { cost };
         exposure.cost = exposure.cost.checked_add(cost)?;
         exposure.reserved = exposure.reserved.checked_add(reserved)?;
         let market = exposure.markets.entry(record.identity.market_id).or_default();
@@ -470,7 +579,9 @@ pub fn risk_exposure(state: &LiveState) -> Option<RiskExposure> {
         market.1 = market.1.checked_add(reserved)?;
     }
     if state.net_cash.keys().chain(state.reservations.keys())
-        .chain(state.observed_risk_floor.keys()).any(|id| !state.attempts.contains_key(id))
+        .chain(state.observed_risk_floor.keys())
+        .chain(state.claims.keys())
+        .any(|id| !state.attempts.contains_key(id))
     {
         return None;
     }
@@ -649,6 +760,22 @@ fn apply_official_result(
         payloads.push((id, record.identity.token_id,
             if claim.is_zero() { "CONFIRMED" } else { "CASH_PENDING" }, payout, Some(claim)));
     }
+    // Book every claim this result confirms before the run's own borrow: a
+    // proven claim becomes ledger cash exactly when the confirmed result
+    // owes this amount, atom for atom.
+    for (id, _, status, _, claim) in &payloads {
+        if *status == "CONFLICT" { continue; }
+        let Some(claim) = *claim else { continue; };
+        if claim.is_zero() { continue; }
+        let inventory = state.live.net_inventory[id];
+        let credited = state.live.claims.get(id).copied()
+            .is_some_and(|(held, cash)| held == inventory && cash == claim);
+        let proven = state.live.pending_claims.get(id).copied()
+            .is_some_and(|(held, cash)| held == inventory && cash == claim);
+        if !credited && proven {
+            super::live_control::promote_pending_claim(state, *id, inventory, claim);
+        }
+    }
     let run = state.live.controlled.as_mut().unwrap();
     if result == Settlement::Pending && !payloads.iter().any(|(_, _, status, _, _)| *status == "CONFLICT")
         && !(identity == paper::RoundIdentity::Match && normal_unpublished_result(market))
@@ -659,12 +786,20 @@ fn apply_official_result(
         if *status == "CONFLICT" {
             run.stop("FACT_CONFLICT", true, now.utc);
         } else {
+            let inventory = state.live.net_inventory[id];
+            // Only a claim that pays this holding exactly is already cash. One
+            // atom short or long is still an unexplained claim, not a wait that
+            // anything may clear.
+            let booked = state.live.claims.get(id).copied()
+                .is_some_and(|(held, cash)| held == inventory && Some(cash) == *claim);
             run.attempt_outcomes.insert(*id, LiveOutcome {
                 payout_yes: *payout, result_prices: prices.unwrap(),
-                position_net_atoms: state.live.net_inventory[id], claim_value_atoms: *claim,
-                cash_confirmed: false,
+                position_net_atoms: inventory, claim_value_atoms: *claim,
+                cash_confirmed: booked,
             });
-            if claim.is_some_and(|claim| !claim.is_zero()) { run.stop("CASH_PENDING", true, now.utc); }
+            if claim.is_some_and(|claim| !claim.is_zero()) && !booked {
+                run.stop("CASH_PENDING", true, now.utc);
+            }
         }
     }
     super::live_control::refresh_live_risk(state);
@@ -710,6 +845,7 @@ impl CapsCheck {
 /// `market_reserved` are what the market already carries; `total_cost` and
 /// `total_reserved` are what the window already carries.
 pub fn check_caps(
+    params: &RunParameters,
     worst_cash: U256,
     market_cost: U256,
     market_reserved: U256,
@@ -717,15 +853,15 @@ pub fn check_caps(
     total_reserved: U256,
     available: U256,
 ) -> CapsCheck {
-    let order_ok = worst_cash >= U256::from(ONE) && worst_cash <= max_order_atoms();
+    let order_ok = worst_cash >= U256::from(MIN_ORDER_ATOMS) && worst_cash <= params.order;
     let market_ok = market_cost
         .saturating_add(market_reserved)
         .saturating_add(worst_cash)
-        <= max_market_atoms();
+        <= params.market;
     let total_ok = total_cost
         .saturating_add(total_reserved)
         .saturating_add(worst_cash)
-        <= max_total_atoms();
+        <= params.total;
     let available_ok = worst_cash <= available;
     CapsCheck {
         order_ok,
@@ -890,6 +1026,113 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_gate_uses_the_configured_budget_and_never_resizes_it() {
+        let budget = crate::config::RunParameters::legacy().budget;
+        // The approved change is the budget itself: the same 97.422 account
+        // passes a 97 window and is refused by the historical 98 one.
+        let cash = U256::from(97_422_000_000_000_000_000u128);
+        let approved = crate::config::RunParameters {
+            budget: U256::from(97u64) * U256::from(ONE),
+            ..crate::config::RunParameters::legacy()
+        };
+        assert!(startup_funded(approved.budget, Some(cash)));
+        assert!(!startup_funded(budget, Some(cash)));
+        // Equality funds the window; one atom less does not; an unknown
+        // reading is never treated as funded.
+        assert!(startup_funded(approved.budget, Some(approved.budget)));
+        assert!(!startup_funded(approved.budget, Some(approved.budget - U256::from(1u64))));
+        assert!(!startup_funded(approved.budget, None));
+    }
+
+    #[test]
+    fn a_controlled_startup_requires_cash_equal_to_the_budget_to_the_atom() {
+        let budget = U256::from(97_422_000_000_000_000_000u128);
+        assert!(cash_matches_budget(budget, Some(budget)));
+        assert!(!cash_matches_budget(budget, Some(budget - U256::from(1u64))));
+        assert!(!cash_matches_budget(budget, Some(budget + U256::from(1u64))));
+        assert!(!cash_matches_budget(budget, None));
+        // The historical 98/100 window is not resized: 100 is not 98.
+        assert!(!cash_matches_budget(
+            U256::from(98u64) * U256::from(ONE),
+            Some(U256::from(100u64) * U256::from(ONE))
+        ));
+    }
+
+    #[test]
+    fn a_claimed_payout_is_cash_not_mark_and_keeps_the_projection_complete() {
+        struct Claimed {
+            budget: U256,
+            inventory: U256,
+            credit: Option<(U256, U256)>,
+        }
+        impl LiveFacts for Claimed {
+            fn applied_net_cash(&self, _id: u64) -> U256 { atoms(2 * ONE) }
+            fn applied_net_inventory(&self, _id: u64) -> U256 { self.inventory }
+            fn reservation(&self, _id: u64) -> U256 { U256::ZERO }
+            fn attempt_market(&self, _id: u64) -> Option<u64> { Some(1) }
+            fn attempt_token(&self, _id: u64) -> Option<String> { Some("77".into()) }
+            fn attempt_ids(&self) -> Vec<u64> { vec![1] }
+            fn observed_risk_floor(&self, _id: u64) -> Option<U256> { Some(U256::ZERO) }
+            fn claim_credit(&self, _id: u64) -> Option<(U256, U256)> { self.credit }
+            fn params(&self) -> RunParameters {
+                RunParameters { budget: self.budget, ..RunParameters::legacy() }
+            }
+        }
+        let inventory = atoms(5 * ONE);
+        let budget = atoms(10 * ONE);
+        let credit = Some((inventory, inventory));
+        let projected = project_window(
+            &Claimed { budget, inventory, credit },
+            &Marks::default(),
+            None,
+        );
+        assert_eq!(projected.status, AccountingStatus::Complete);
+        // Two USDT spent, five shares won and paid: the claim is cash.
+        assert_eq!(projected.cash, atoms(10 * ONE) - atoms(2 * ONE) + inventory);
+        assert_eq!(projected.net_pnl.magnitude(), inventory - atoms(2 * ONE));
+        assert!(projected.pending_claim_value.is_none());
+        // A credit that doesn't cover the ledger's inventory is a conflict, not
+        // a quiet cash increase.
+        let conflict = project_window(
+            &Claimed { budget, inventory, credit: Some((inventory - U256::from(1), inventory)) },
+            &Marks::default(),
+            None,
+        );
+        assert_eq!(conflict.status, AccountingStatus::Conflict);
+        // An unclaimed win is pending, never cash.
+        let pending = project_window(
+            &Claimed { budget, inventory, credit: None },
+            &Marks::default(),
+            None,
+        );
+        assert_eq!(pending.cash, budget - atoms(2 * ONE));
+        assert!(pending.pending_claim_value.is_none());
+    }
+
+    #[test]
+    fn an_opening_claimed_payout_adds_exactly_its_cash() {
+        struct Opening;
+        impl LiveFacts for Opening {
+            fn applied_net_cash(&self, _id: u64) -> U256 { U256::ZERO }
+            fn applied_net_inventory(&self, _id: u64) -> U256 { U256::ZERO }
+            fn reservation(&self, _id: u64) -> U256 { U256::ZERO }
+            fn attempt_market(&self, _id: u64) -> Option<u64> { None }
+            fn attempt_token(&self, _id: u64) -> Option<String> { None }
+            fn attempt_ids(&self) -> Vec<u64> { Vec::new() }
+            fn observed_risk_floor(&self, _id: u64) -> Option<U256> { None }
+            fn opening_claim_cash(&self) -> U256 { atoms(ONE) }
+            fn params(&self) -> RunParameters {
+                RunParameters { budget: atoms(10 * ONE), ..RunParameters::legacy() }
+            }
+        }
+        let projected = project_window(&Opening, &Marks::default(), None);
+        assert_eq!(projected.status, AccountingStatus::Complete);
+        assert_eq!(projected.cash, atoms(11 * ONE));
+        assert_eq!(projected.net_pnl.magnitude(), atoms(ONE));
+        assert!(!projected.net_pnl.is_negative());
+    }
+
+    #[test]
     fn a_loss_of_exactly_twenty_latches_and_one_atom_less_does_not() {
         let exact = max_loss_atoms();
         assert!(SignedAtoms::negative(exact).magnitude() >= max_loss_atoms());
@@ -904,13 +1147,26 @@ mod tests {
 
     #[test]
     fn the_caps_are_independent_and_equality_is_allowed() {
-        let two = max_order_atoms();
-        let check = check_caps(two, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, two);
+        let params = crate::config::RunParameters::legacy();
+        let cap = max_order_atoms();
+        let check = check_caps(&params, cap, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, cap);
         assert!(check.all_ok());
+        // A 1.00 USDT order reserves `ceil(shares * limit)` atoms, which is
+        // strictly below the configured size: 0.9999 USDT must pass the dust
+        // floor and the per-order cap.
+        let nearly_one = U256::from(999_900_000_000_000_000u128);
+        assert!(check_caps(&params, nearly_one, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, cap).all_ok());
+        // A 2.00 USDT order reserves 1.9998 and is refused by the order cap.
+        let two = U256::from(1_999_800_000_000_000_000u128);
+        let over = check_caps(&params, two, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO,
+            U256::from(100u64) * U256::from(ONE));
+        assert!(!over.order_ok);
+        assert!(over.total_ok);
         // One atom over the per-order cap is refused even though the total
         // would still fit.
         let over = check_caps(
-            two + U256::from(1u64),
+            &params,
+            cap + U256::from(1u64),
             U256::ZERO,
             U256::ZERO,
             U256::ZERO,
@@ -922,9 +1178,32 @@ mod tests {
     }
 
     #[test]
+    fn the_frozen_parameters_move_the_caps_they_no_longer_fix() {
+        let params = crate::config::RunParameters {
+            budget: U256::from(80u64) * U256::from(ONE),
+            target: U256::from(2u64) * U256::from(ONE),
+            order: U256::from(3u64) * U256::from(ONE),
+            market: U256::from(5u64) * U256::from(ONE),
+            total: U256::from(12u64) * U256::from(ONE),
+            loss: U256::from(30u64) * U256::from(ONE),
+        };
+        let three = U256::from(3u64) * U256::from(ONE);
+        let available = U256::from(80u64) * U256::from(ONE);
+        assert!(check_caps(&params, three, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, available).all_ok());
+        // The legacy caps would have refused this order; the frozen ones admit it.
+        assert!(!check_caps(&crate::config::RunParameters::legacy(), three, U256::ZERO,
+            U256::ZERO, U256::ZERO, U256::ZERO, available).order_ok);
+        let over_market = check_caps(&params, U256::from(2u64) * U256::from(ONE), three,
+            U256::ZERO, U256::from(11u64) * U256::from(ONE), U256::ZERO, available);
+        assert!(over_market.market_ok && !over_market.total_ok);
+    }
+
+    #[test]
     fn the_market_cap_is_checked_on_its_own() {
+        let params = crate::config::RunParameters::legacy();
         let two = max_order_atoms();
         let check = check_caps(
+            &params,
             two,
             two,
             U256::ZERO,

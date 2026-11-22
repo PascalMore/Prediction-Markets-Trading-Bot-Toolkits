@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "btc5m-reconciliation-read.v1";
+const SCHEMA_VERSION: &str = "btc5m-reconciliation-read.v2";
 const EXIT_OK: u8 = 0;
 const EXIT_INPUT: u8 = 2;
 const EXIT_READ: u8 = 3;
@@ -448,6 +448,28 @@ fn project(
             }).collect::<Vec<_>>(),
             "open_orders": open_orders,
             "positions_explained": snapshot.positions_explained,
+            "settled_zero": snapshot.settled_zero.iter().map(|zero| {
+                json!({
+                    "token": zero.token,
+                    "market_id": zero.market_id,
+                    "oracle_status": zero.oracle_status,
+                    "trading_status": zero.trading_status,
+                    "outcome_status": zero.outcome_status,
+                    "payout_millionths": zero.payout_millionths,
+                })
+            }).collect::<Vec<_>>(),
+            "claimed_win": snapshot.claimed_win.iter().map(|win| {
+                json!({
+                    "token": win.token,
+                    "market_id": win.market_id,
+                    "oracle_status": win.oracle_status,
+                    "trading_status": win.trading_status,
+                    "outcome_status": win.outcome_status,
+                    "payout_millionths": win.payout_millionths,
+                    "inventory_atoms": win.inventory_atoms.to_string(),
+                    "claim_atoms": win.claim_atoms.to_string(),
+                })
+            }).collect::<Vec<_>>(),
             "pagination_complete": snapshot.complete,
         },
         "reconciliation": {
@@ -549,12 +571,21 @@ async fn run(args: Args) -> Result<(String, bool), Failure> {
     }
     let config = AppConfig::load_controlled(&args.config, ControlledMode::SignedFutureLive)
         .map_err(|error| classify(&error, "public_config"))?;
+    // The declared C0 lets the native reader explain a claimed payout against
+    // the exact pre-claim cash. A file without a controlled_run declares none.
+    let raw = std::fs::read_to_string(&args.config)
+        .map_err(|_| Failure::input("PUBLIC_CONFIG"))?;
+    let budget_atoms = polymarket_toolkits::config::RunParameters::declared_settings(&raw)
+        .ok()
+        .flatten()
+        .and_then(|settings| settings.budget_atoms().ok());
     let rpc_url =
         parse_rpc_url(&args.rpc_url).map_err(|error| classify(&error.into(), "rpc_input"))?;
     run_confirmation_slot().install_context(RunContext {
         confirmation: None,
         reconciled_orders: args.reconciled_orders.clone(),
         rpc_url: Some(rpc_url),
+        budget_atoms,
     });
     // Missing or unusable credentials are input problems, never reads: the
     // cause is not echoed so no key material can escape.
@@ -673,6 +704,8 @@ mod tests {
                 ("9001".to_string(), U256::from(1u8)),
             ],
             positions_explained: true,
+            settled_zero: vec![],
+            claimed_win: vec![],
             open_orders: vec!["order-b".to_string(), "order-a".to_string()],
             complete: true,
         }
@@ -730,6 +763,15 @@ mod tests {
             "shares_atoms",
             "open_orders",
             "positions_explained",
+            "settled_zero",
+            "claimed_win",
+            "inventory_atoms",
+            "claim_atoms",
+            "market_id",
+            "oracle_status",
+            "trading_status",
+            "outcome_status",
+            "payout_millionths",
             "pagination_complete",
             "reconciliation",
             "declared_orders",
@@ -763,6 +805,36 @@ mod tests {
             projection["observation"]["anchor_semantics"],
             "NATIVE_FIXED_BLOCK_WITHIN_OBSERVED_RANGE"
         );
+    }
+
+    #[test]
+    fn projection_publishes_a_claimed_win_with_its_exact_atoms() {
+        let mut snapshot = snapshot();
+        snapshot.claimed_win.push(polymarket_toolkits::service::venue::ClaimedWin {
+            token: "9001".into(),
+            market_id: 7,
+            oracle_status: "RESOLVED".into(),
+            trading_status: "CLOSED".into(),
+            outcome_status: "WON".into(),
+            payout_millionths: 1_000_000,
+            inventory_atoms: U256::from(5),
+            claim_atoms: U256::from(5),
+        });
+        let started = Utc.timestamp_opt(1_790_000_000, 0).unwrap();
+        let projection = project(
+            &identity(),
+            &snapshot,
+            &[],
+            &block(1),
+            &block(2),
+            started,
+            started,
+        );
+        let win = &projection["account"]["claimed_win"][0];
+        assert_eq!(win["token"], "9001");
+        assert_eq!(win["payout_millionths"], 1_000_000);
+        assert_eq!(win["inventory_atoms"], "5");
+        assert_eq!(win["claim_atoms"], "5");
     }
 
     #[test]

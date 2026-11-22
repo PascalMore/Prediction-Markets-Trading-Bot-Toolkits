@@ -35,12 +35,15 @@ impl PredictFunClient {
     ) -> Result<String> {
         #[cfg(test)]
         if let Some(transport) = &self.synthetic {
+            crate::bot::runtime::timing::net_call();
+            crate::bot::runtime::timing::synth_round_trip().await;
             let result = transport.rest(&method, path, bearer, body);
             if method == Method::POST && path == "/orders" && transport.pending_post() {
                 std::future::pending::<()>().await;
             }
             return result;
         }
+        crate::bot::runtime::timing::net_call();
         let url = format!("{}{}", self.deployment.api_base, path);
         let mut req = self.http.request(method.clone(), &url);
         if let Some(key) = &self.api_key {
@@ -168,6 +171,7 @@ impl PredictFunTrader {
                     VenueError::new(crate::service::venue::VenueErrorCode::InvalidInput,
                         "controlled_send", "INPUT_CHANGED")
                 }), &mut || {
+                    crate::bot::runtime::timing::mark("first_poll");
                     first = false;
                     response = Some(request.as_mut().poll(cx));
                 })?;
@@ -201,6 +205,56 @@ impl PredictFunTrader {
             .authed_text(method.clone(), path, body, ReplayPolicy::NoReplay)
             .await?;
         serde_json::from_str(&text).with_context(|| format!("parsing {method} {path} response"))
+    }
+}
+
+/// Project typed account-read failures at the request boundary, never their
+/// URL, body or display text. Callers supply only fixed operation labels.
+/// Typed failures leave this boundary without the raw request cause: public
+/// consumers may format the returned error with Debug, including its chain.
+pub(super) fn account_read_error(error: anyhow::Error, operation: &'static str) -> anyhow::Error {
+    use crate::service::venue::VenueErrorCode;
+    if let Some(venue) = error.downcast_ref::<VenueError>() {
+        return venue.clone().into();
+    }
+    let (code, reason) = if let Some(api) = error.downcast_ref::<ApiError>() {
+        (VenueErrorCode::ReadUnavailable,
+            format!("{operation}_READ_UNAVAILABLE_HTTP_{}", api.status.as_u16()))
+    } else if error.is::<reqwest::Error>() {
+        (VenueErrorCode::ReadUnavailable, format!("{operation}_READ_UNAVAILABLE"))
+    } else if error.is::<serde_json::Error>() {
+        (VenueErrorCode::FactIncomplete, format!("{operation}_FACT_INCOMPLETE"))
+    } else {
+        return error;
+    };
+    VenueError::new(code, operation, &reason).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_projection_uses_only_fixed_labels_types_and_integer_status() {
+        use crate::service::venue::VenueErrorCode;
+        for operation in ["POSITIONS", "OPEN_ORDERS", "ACCOUNT", "MATCHES", "HISTORY_ORDER"] {
+            for status in [401, 429, 503] {
+                let error = anyhow::Error::new(ApiError {
+                    status: StatusCode::from_u16(status).unwrap(), body: "SECRET_SENTINEL".into(),
+                }).context("SECRET_SENTINEL URL/query/header");
+                let error = account_read_error(error, operation);
+                let venue = error.downcast_ref::<VenueError>().unwrap();
+                assert_eq!(venue.code, VenueErrorCode::ReadUnavailable);
+                assert_eq!(venue.step, operation);
+                assert_eq!(venue.reason, format!("{operation}_READ_UNAVAILABLE_HTTP_{status}"));
+                assert!(!format!("{error:?}").contains("SECRET_SENTINEL"));
+                assert_eq!(error.chain().count(), 1);
+                assert!(venue.reason.len() <= 64);
+                // A second outer account operation must not overwrite the first.
+                let again = account_read_error(error, "ACCOUNT");
+                assert_eq!(again.downcast_ref::<VenueError>().unwrap().step, operation);
+            }
+        }
     }
 }
 

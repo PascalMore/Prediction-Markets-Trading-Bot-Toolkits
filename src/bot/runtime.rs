@@ -36,6 +36,7 @@ pub mod observer;
 pub mod paper;
 pub mod phase1_control;
 pub mod taker;
+pub(crate) mod timing;
 
 pub use paper::{PaperCash, PaperSnapshot, Settlement, EVENT_PREFIX};
 

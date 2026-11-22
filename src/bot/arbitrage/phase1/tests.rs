@@ -418,6 +418,12 @@ fn native_dynamic_valuation_consumer_fixture() {
     market.ends_at = Some(market.starts_at.unwrap() + chrono::Duration::seconds(300));
     let depth = crate::bot::runtime::test_support::book(&[(0.3, 100.0)], &[(0.4, 100.0)]);
     let mut input = inputs(&market, &depth);
+    // This diagnostic stream is substituted into the live window's intact native
+    // financial stream, and that window runs the 1-USDT contract. Size the native
+    // candidate the same way: 1.0 USDT at the 0.4 ask is 2.5 shares and 1.0 USDT
+    // of cost — the same figures the live stream records, not the 2-USDT fixture
+    // scale (5.0 shares / 2.0 USDT) this helper defaults to.
+    input.order_usd = 1.0;
     input.spot_price = quote.price;
     input.spot_clock = Some(clock_at_latest());
     input.book_clock = Some(clock_at_latest());

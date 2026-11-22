@@ -1053,7 +1053,7 @@ fn check_payload(kind: EventKind, payload: &Map<String, Value>) -> Result<(), St
                 return Err("PAYOUT_YES_INVALID".into());
             }
             if payload["status"] == "CASH_CONFIRMED"
-                && (payload["cash_received_atoms"].is_null() || payload["tx_hash"].is_null())
+                && payload["cash_received_atoms"].is_null()
             {
                 return Err("PAYOUT_CASH_INVALID".into());
             }

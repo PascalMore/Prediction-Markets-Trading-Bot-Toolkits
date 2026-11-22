@@ -414,6 +414,9 @@ pub(crate) struct ControlledSyntheticTrace {
     pub orders: std::sync::Mutex<Vec<ControlledOrder>>,
     /// How many times the venue served a fresh book to a preparation.
     pub book_reads: std::sync::atomic::AtomicU64,
+    /// Test-only: fills stay invisible to the execution read until this
+    /// instant, modelling a venue whose acceptance is ahead of its fills.
+    pub hidden_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[cfg(test)]
@@ -523,6 +526,15 @@ impl BookTransport {
     fn filled(&self) -> bool {
         matches!(self.1, "controlled_fill" | "controlled_partial" | "controlled_missing_fee" | "live003"
             | "book_bid_moved" | "book_moved_then_frozen" | "book_inside_limit_thin_then_frozen")
+    }
+
+    /// Whether the venue's fill read still lags behind its acceptance.
+    fn fill_hidden(&self) -> bool {
+        self.2
+            .hidden_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 
     /// The live002/live004 shape: a fresh book that differs from the frozen one.
@@ -762,6 +774,22 @@ impl super::account::SyntheticTransport for BookTransport {
                 debug_assert!(tx_hash.starts_with("0x"));
             }
             if self.filled() {
+                if self.fill_hidden() {
+                    if path.starts_with("/positions?") {
+                        return Ok(serde_json::json!({"data":[]}).to_string());
+                    }
+                    if path.starts_with("/orders/matches?") {
+                        return Ok(serde_json::json!({"data":[]}).to_string());
+                    }
+                    if path.starts_with("/orders/") && !path.contains('?') {
+                        let hash = path.trim_start_matches("/orders/");
+                        let record = self.2.order_by_hash(hash)
+                            .ok_or_else(|| anyhow::anyhow!("CONTROLLED_UNKNOWN_ORDER"))?;
+                        return Ok(serde_json::json!({"data":{"id":"synthetic-order",
+                            "marketId":record.market_id,"amountFilled":"0","status":"OPEN",
+                            "order":record.order}}).to_string());
+                    }
+                }
                 if path.starts_with("/positions?") {
                     return Ok(serde_json::json!({"data":self.positions()}).to_string());
                 }

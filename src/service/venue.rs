@@ -238,6 +238,58 @@ impl ExecutionSnapshot {
     }
 }
 
+/// A history-only position the venue's own official result pays zero.
+///
+/// Settlement cancels such a claim without a sell or a mint: the venue stops
+/// listing the position while its last trade stays in the history. These are
+/// the venue's own facts that say so; a pending or missing result is never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledZero {
+    /// The settled outcome token.
+    pub token: String,
+    /// The market whose official result pays this token zero.
+    pub market_id: u64,
+    /// The oracle state the venue reported, e.g. `RESOLVED`.
+    pub oracle_status: String,
+    /// The matching state the venue reported, e.g. `CLOSED`.
+    pub trading_status: String,
+    /// The outcome's own status, e.g. `LOST`.
+    pub outcome_status: String,
+    /// This token's payout in millionths of a share: zero.
+    pub payout_millionths: u32,
+}
+
+/// A history-only position the venue's own official result pays a positive
+/// amount for, and whose cash the account already received.
+///
+/// A claimed winner leaves the same trace as a settled loser — the venue stops
+/// listing the position while its last trade stays in the history — but its
+/// payout lands in the collateral balance. These are the venue's own facts plus
+/// the exact atoms that explain the cash increase; an official result that is
+/// not confirmed, a token that doesn't belong to its market, or any amount that
+/// is not atom-exact is never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedWin {
+    /// The claimed outcome token.
+    pub token: String,
+    /// The market whose official result pays this token.
+    pub market_id: u64,
+    /// The oracle state the venue reported, e.g. `RESOLVED`.
+    pub oracle_status: String,
+    /// The matching state the venue reported, e.g. `CLOSED`.
+    pub trading_status: String,
+    /// The outcome's own status, e.g. `WON`.
+    pub outcome_status: String,
+    /// This token's payout in millionths of a share: `1000000` for a win and
+    /// `500000` for a tie.
+    pub payout_millionths: u32,
+    /// The inventory the history carries for this token, in atoms.
+    pub inventory_atoms: U256,
+    /// `inventory_atoms * payout`, floored exactly in atoms. This is the cash
+    /// the claim must have delivered.
+    pub claim_atoms: U256,
+}
+
 /// What the account looks like right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
@@ -250,6 +302,13 @@ pub struct AccountSnapshot {
     pub positions: Vec<(String, U256)>,
     /// Closed, settled historical net inventory exactly explains startup positions.
     pub positions_explained: bool,
+    /// History-only positions the venue's official result pays zero, with the
+    /// venue facts that say so.
+    pub settled_zero: Vec<SettledZero>,
+    /// History-only positions the venue's official result pays a positive
+    /// amount for, whose cash increase was verified atom-for-atom against the
+    /// declared budget.
+    pub claimed_win: Vec<ClaimedWin>,
     /// Orders the venue still lists as open.
     pub open_orders: Vec<String>,
     /// Every required read succeeded and every page was read to the end.
@@ -306,15 +365,17 @@ pub struct SignedExecutionBound {
     pub signed_hash: String,
 }
 
-/// A guarded order the venue refused before it could leave, only because the
-/// fresh book no longer supports the frozen decision: its price moved past the
-/// candidate's limit, or its depth cannot cover the frozen quantity.
+/// A guarded order the venue refused because the frozen decision no longer
+/// stands while the request provably never left: the fresh book moved past the
+/// candidate's limit or cannot cover the frozen quantity, or the frozen inputs
+/// (book/spot age, edge, remaining round time) aged out at the last check after
+/// signing but before the send permission and the first transport poll.
 ///
 /// It is a refusal of one candidate, not of the run: the cash the attempt
-/// reserved is released, the refusal is recorded and the risk window stays
-/// open for the next decision. Any doubt about whether the order left — and
-/// any account, identity, quantity, bound, fee or evidence mismatch — is never
-/// this error; those stay hard stops.
+/// reserved is released, the refusal is recorded with the candidate's evidence,
+/// and the risk window stays open for the next decision. Any doubt about
+/// whether the order left — and any account, identity, quantity, bound, fee or
+/// evidence mismatch — is never this error; those stay hard stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateRefused;
 

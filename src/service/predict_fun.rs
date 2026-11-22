@@ -982,6 +982,13 @@ impl MarketData for PredictFunClient {
 
     async fn market(&self, id: u64) -> Result<TradableMarket> {
         let market = self.get::<ApiMarket>(&format!("/markets/{id}")).await?.data;
+        // Do not overwrite an established outcome binding with a replacement
+        // or swapped pair: a later account read must not trust poisoned cache.
+        let same_binding = self.markets.read().values().filter(|known| known.id == market.id)
+            .all(|known| known.outcomes.len() == 2 && market.outcomes.len() == 2
+                && known.outcomes.iter().zip(&market.outcomes)
+                    .all(|(old, fresh)| old.on_chain_id == fresh.on_chain_id));
+        if !same_binding { anyhow::bail!("FACT_INCOMPLETE:MARKET_TOKEN_IDENTITY"); }
         self.remember_market(&market);
         let slug = market.category_slug.clone().unwrap_or_default();
         let event = if slug.is_empty() {

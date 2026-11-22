@@ -168,7 +168,7 @@ def validate_activation(activation: dict, expected: dict, now: dt.datetime) -> d
                  and expected["cash_recovery_policy"] == "MANUAL_PAUSE")
         start, deadline = events.timestamp(expected["started_at"]), events.timestamp(activation["deadline_at"])
         _require(events.timestamp(activation["not_before"]) <= start <= now < deadline)
-        _require(dt.timedelta(0) < deadline - start <= dt.timedelta(hours=6))
+        _require(events.activation_window_allowed(expected["operations_mode"], deadline - start))
         units = expected["asset_units"]
         events.fields(units, "collateral_symbol:USDT collateral_decimals:integer share_decimals:integer gas_symbol:BNB gas_decimals:integer")
         _require(all(units[key] == 18 for key in ("collateral_decimals", "share_decimals", "gas_decimals")))

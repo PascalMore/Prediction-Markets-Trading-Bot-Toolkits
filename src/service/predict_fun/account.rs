@@ -10,7 +10,8 @@
 
 use super::{ApiMarket, PredictFunTrader, ECDSA_VALIDATOR};
 use crate::service::venue::{
-    AccountIdentity, AccountMode, AccountSnapshot, AttemptPhase, VenueError, VenueErrorCode,
+    AccountIdentity, AccountMode, AccountSnapshot, AttemptPhase, ClaimedWin, SettledZero,
+    VenueError, VenueErrorCode,
 };
 use alloy_primitives::{address, Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolEvent};
@@ -179,8 +180,11 @@ impl PredictFunTrader {
         };
         #[cfg(test)]
         if let Some(transport) = &self.client.synthetic {
+            crate::bot::runtime::timing::net_call();
+            crate::bot::runtime::timing::synth_round_trip().await;
             return transport.rpc(method, &params);
         }
+        crate::bot::runtime::timing::net_call();
         let response = self
             .client
             .http
@@ -206,13 +210,18 @@ impl PredictFunTrader {
     }
 
     pub(super) async fn chain_read(&self) -> Result<ChainRead<'_>, VenueError> {
-        let chain = rpc_quantity(&self.rpc("eth_chainId", json!([])).await?)?;
+        // The chain id and the pinned block are independent reads: issue them
+        // together, then validate in the same order, so the proof keeps its
+        // fail-closed reasons without paying two round trips for one snapshot.
+        let (chain, block) = tokio::join!(
+            self.rpc("eth_chainId", json!([])),
+            self.rpc("eth_getBlockByNumber", json!(["latest", false]))
+        );
+        let chain = rpc_quantity(&chain?)?;
         if chain != U256::from(self.identity().chain_id) {
             return Err(mismatch("CHAIN_MISMATCH"));
         }
-        let block = self
-            .rpc("eth_getBlockByNumber", json!(["latest", false]))
-            .await?;
+        let block = block?;
         let number = rpc_quantity(&block["number"])?;
         let timestamp = rpc_quantity(&block["timestamp"])?;
         let _: B256 = block["hash"]
@@ -252,48 +261,105 @@ impl ChainRead<'_> {
         if identity.mode == AccountMode::Eoa && owner != signer {
             return Err(mismatch("SIGNER_MISMATCH"));
         }
+        let (usdt, _, _) = assets(identity.chain_id, false, false);
+        // Every read below is independent and pinned to the same block, so they
+        // are issued together and validated afterwards in the original order:
+        // the same proofs and reasons, one round trip instead of five.
+        let validator = async {
+            if identity.mode != AccountMode::PredictAccount { return Ok((true, signer)); }
+            let (initialized, observed) = tokio::join!(
+                self.call(ECDSA_VALIDATOR, ValidatorRead::isInitializedCall { smartAccount: owner }),
+                self.call(ECDSA_VALIDATOR, ValidatorRead::ecdsaValidatorStorageCall { smartAccount: owner })
+            );
+            Ok((initialized?._0, observed?._0))
+        };
+        let (validator, decimals, collateral, gas) = tokio::join!(
+            validator,
+            self.call(usdt, TokenRead::decimalsCall {}),
+            self.call(usdt, TokenRead::balanceOfCall { owner }),
+            self.trader.rpc("eth_getBalance", json!([signer, self.block]))
+        );
+        let (initialized, observed) = validator?;
         if identity.mode == AccountMode::PredictAccount {
-            if !self
-                .call(
-                    ECDSA_VALIDATOR,
-                    ValidatorRead::isInitializedCall {
-                        smartAccount: owner,
-                    },
-                )
-                .await?
-                ._0
-            {
+            if !initialized {
                 return Err(mismatch("ACCOUNT_NOT_INITIALIZED"));
             }
-            let observed = self
-                .call(
-                    ECDSA_VALIDATOR,
-                    ValidatorRead::ecdsaValidatorStorageCall {
-                        smartAccount: owner,
-                    },
-                )
-                .await?
-                ._0;
             if observed == Address::ZERO || observed != signer {
                 return Err(mismatch("OWNER_MISMATCH"));
             }
         }
-        let (usdt, _, _) = assets(identity.chain_id, false, false);
-        if self.call(usdt, TokenRead::decimalsCall {}).await?._0 != 18 {
+        if decimals?._0 != 18 {
             return Err(read_error("COLLATERAL_DECIMALS"));
         }
-        let collateral = self
-            .call(usdt, TokenRead::balanceOfCall { owner })
-            .await?
-            ._0;
+        let collateral = collateral?._0;
         // Supported direct SDK route: Privy pays its account-operation gas.
-        let gas = rpc_quantity(
-            &self
-                .trader
-                .rpc("eth_getBalance", json!([signer, self.block]))
-                .await?,
-        )?;
+        let gas = rpc_quantity(&gas?)?;
         Ok((collateral, gas))
+    }
+}
+
+/// The verdict of one account read's position explanation.
+///
+/// Evidence is kept even when the verdict is `false`: a claim whose official
+/// facts are complete but whose cash is not exact is still the venue's own
+/// result, and the runtime consumer verifies it against its own basis.
+#[derive(Debug, Default)]
+struct ExplainedPositions {
+    settled_zero: Vec<SettledZero>,
+    claimed_win: Vec<ClaimedWin>,
+    explained: bool,
+}
+
+/// One confirmed official result, as the account reader bound it to a token.
+struct OfficialSettlement {
+    market_id: u64,
+    oracle_status: String,
+    trading_status: String,
+    outcome_status: String,
+    /// The token's payout per share: `0` for a loss, `0.5` for a tie, `1` for a win.
+    payout: f64,
+}
+
+impl OfficialSettlement {
+    /// The settlement evidence of a token the result pays zero.
+    fn settled_zero(&self, token: &str) -> SettledZero {
+        SettledZero {
+            token: token.to_string(),
+            market_id: self.market_id,
+            oracle_status: self.oracle_status.clone(),
+            trading_status: self.trading_status.clone(),
+            outcome_status: self.outcome_status.clone(),
+            payout_millionths: 0,
+        }
+    }
+
+    /// The claimed-payout evidence for `inventory`, when the payout is positive
+    /// and the claim is a whole number of atoms.
+    fn claimed_win(&self, token: &str, inventory: U256) -> Option<ClaimedWin> {
+        if inventory.is_zero() || !(self.payout > 0.0) {
+            return None;
+        }
+        // The settlement path only pays 0, 0.5 or 1; anything else is not a
+        // result this reader may turn into cash.
+        let millionths = (self.payout * 1_000_000.0).round();
+        if millionths != 500_000.0 && millionths != 1_000_000.0 {
+            return None;
+        }
+        let claim_atoms =
+            crate::bot::runtime::live_accounting::exact_floor_mul(inventory, self.payout)?;
+        if claim_atoms.is_zero() {
+            return None;
+        }
+        Some(ClaimedWin {
+            token: token.to_string(),
+            market_id: self.market_id,
+            oracle_status: self.oracle_status.clone(),
+            trading_status: self.trading_status.clone(),
+            outcome_status: self.outcome_status.clone(),
+            payout_millionths: millionths as u32,
+            inventory_atoms: inventory,
+            claim_atoms,
+        })
     }
 }
 
@@ -326,7 +392,7 @@ impl PredictFunTrader {
                         &format!("{}?{}", url.path(), url.query().unwrap()),
                         None,
                     )
-                    .await?;
+                    .await.map_err(|error| super::request::account_read_error(error, "OPEN_ORDERS"))?;
                 for order in page.data {
                     if open_orders.contains(&order.id) {
                         anyhow::bail!("FACT_INCOMPLETE:DUPLICATE_ORDER");
@@ -351,7 +417,7 @@ impl PredictFunTrader {
             }
             let observed = self
                 .authed::<ApiAccount>(Method::GET, "/account", None)
-                .await?
+                .await.map_err(|error| super::request::account_read_error(error, "ACCOUNT"))?
                 .data
                 .address;
             check_identity(&observed, &identity)?;
@@ -362,8 +428,11 @@ impl PredictFunTrader {
                 .filter(|(_, amount)| !amount.is_zero())
                 .cloned()
                 .collect();
-            let positions_explained = history == observed;
             let (collateral_atoms, gas_atoms) = chain.balances().await?;
+            let explanation = self
+                .explain_positions(&history, &observed, collateral_atoms)
+                .await?;
+            let positions_explained = explanation.explained;
             for (token, amount) in &positions {
                 let market = self.client.market_for_token(token)?;
                 chain.position(&market, token, *amount).await?;
@@ -374,6 +443,8 @@ impl PredictFunTrader {
                 gas_atoms: Some(gas_atoms),
                 positions,
                 positions_explained,
+                settled_zero: explanation.settled_zero,
+                claimed_win: explanation.claimed_win,
                 open_orders,
                 complete: true,
             })
@@ -396,6 +467,127 @@ impl PredictFunTrader {
         result
     }
 
+    /// `history` explains `observed` exactly, or a history-only entry is a claim
+    /// the venue's own official result settles: zero for a loss, and its exact
+    /// payout for a win whose cash already arrived. Every other difference
+    /// stays unexplained: a market that hasn't resolved, or one that stopped
+    /// listing inventory without a payout that explains the cash, is still
+    /// missing position risk.
+    async fn explain_positions(
+        &self,
+        history: &HashMap<String, U256>,
+        observed: &HashMap<String, U256>,
+        collateral_atoms: U256,
+    ) -> anyhow::Result<ExplainedPositions> {
+        // An observed position the history doesn't carry is unexplained risk,
+        // whether it is extra or a different amount.
+        if observed
+            .iter()
+            .any(|(token, amount)| history.get(token) != Some(amount))
+        {
+            return Ok(ExplainedPositions::default());
+        }
+        let mut settled_zero = Vec::new();
+        let mut claimed_win = Vec::new();
+        for (token, amount) in history {
+            match observed.get(token) {
+                Some(held) if held == amount => {}
+                Some(_) => return Ok(ExplainedPositions::default()),
+                None => match self.official_settlement(token).await? {
+                    Some(settlement) if settlement.payout == 0.0 => {
+                        settled_zero.push(settlement.settled_zero(token))
+                    }
+                    Some(settlement) => match settlement.claimed_win(token, *amount) {
+                        Some(basis) => claimed_win.push(basis),
+                        None => return Ok(ExplainedPositions::default()),
+                    },
+                    None => return Ok(ExplainedPositions::default()),
+                },
+            }
+        }
+        // A claimed payout is only explained by the exact cash increase over
+        // the declared pre-claim C0. No declared budget, an unknown balance, or
+        // one atom of difference keeps the claim unexplained.
+        let explained = claimed_win.is_empty()
+            || self.claimed_cash_matches(collateral_atoms, &claimed_win);
+        Ok(ExplainedPositions {
+            settled_zero,
+            claimed_win,
+            explained,
+        })
+    }
+
+    /// Whether the observed cash is exactly the declared budget plus the claims.
+    fn claimed_cash_matches(&self, collateral_atoms: U256, claims: &[ClaimedWin]) -> bool {
+        let Some(budget) = self
+            .run_context
+            .read()
+            .as_ref()
+            .and_then(|context| context.budget_atoms)
+        else {
+            return false;
+        };
+        let Some(claimed) = claims
+            .iter()
+            .try_fold(U256::ZERO, |total, claim| total.checked_add(claim.claim_atoms))
+        else {
+            return false;
+        };
+        budget.checked_add(claimed) == Some(collateral_atoms)
+    }
+
+    /// The venue's own official result for `token`, when it confirms a payout.
+    ///
+    /// Reuses the settlement verdict the controlled live path applies to the
+    /// same facts: only a confirmed result pays, and an exact tie pays half.
+    async fn official_settlement(&self, token: &str) -> anyhow::Result<Option<OfficialSettlement>> {
+        use crate::bot::runtime::paper::{settle_from_facts, settlement_payout, Settlement};
+        use crate::service::venue::MarketData;
+        let known = self.client.market_for_token(token)?;
+        // The market alone carries no round prices: read it the same way the
+        // controlled settlement path reads an official result.
+        let market = self.client.market(known.id).await?;
+        // Compare against the pre-read binding: market() refreshes the cache.
+        // A matching market id alone cannot identify a claim or its side.
+        let known_yes = known.outcomes.first().map(|outcome| outcome.on_chain_id.as_str());
+        let known_no = known.outcomes.get(1).map(|outcome| outcome.on_chain_id.as_str());
+        if market.id != known.id || known.outcomes.len() != 2
+            || market.yes_token.is_empty() || market.no_token.is_empty()
+            || market.yes_token == market.no_token
+            || known_yes != Some(market.yes_token.as_str())
+            || known_no != Some(market.no_token.as_str())
+            || (token != market.yes_token && token != market.no_token)
+        {
+            return Ok(None);
+        }
+        let (Some(facts), Some((start, end))) = (
+            market.round_facts.as_ref(),
+            market.start_price.zip(market.end_price),
+        ) else {
+            return Ok(None);
+        };
+        if settle_from_facts(&market, facts, start, end) != Settlement::Confirmed {
+            return Ok(None);
+        }
+        let Some(up_payout) = settlement_payout(&market, start, end) else {
+            return Ok(None);
+        };
+        let yes = market.is_yes(token);
+        let payout = if yes { up_payout } else { 1.0 - up_payout };
+        let status = if yes {
+            &facts.yes_status
+        } else {
+            &facts.no_status
+        };
+        Ok(Some(OfficialSettlement {
+            market_id: market.id,
+            oracle_status: facts.oracle_status.clone().unwrap_or_default(),
+            trading_status: facts.trading_status.clone().unwrap_or_default(),
+            outcome_status: status.clone().unwrap_or_default(),
+            payout,
+        }))
+    }
+
     /// Read all position pages; duplicate tokens and cursor loops are ambiguous.
     pub(super) async fn read_positions(&self) -> anyhow::Result<Vec<(String, U256)>> {
         let mut cursor: Option<String> = None;
@@ -416,7 +608,7 @@ impl PredictFunTrader {
                     &format!("{}?{}", url.path(), url.query().unwrap()),
                     None,
                 )
-                .await?;
+                .await.map_err(|error| super::request::account_read_error(error, "POSITIONS"))?;
             for position in page.data {
                 self.client.remember_market(&position.market);
                 if out
@@ -475,7 +667,7 @@ impl PredictFunTrader {
             let path = format!("{}?{}", url.path(), url.query().unwrap());
             let page = self
                 .authed::<Vec<ApiMatch>>(reqwest::Method::GET, &path, None)
-                .await?;
+                .await.map_err(|error| super::request::account_read_error(error, "MATCHES"))?;
             for event in page.data {
                 if !fingerprints.insert(format!("{event:?}")) {
                     anyhow::bail!("FACT_INCOMPLETE:AMBIGUOUS_MATCH_DUPLICATE");
@@ -519,7 +711,7 @@ impl PredictFunTrader {
             }
             let data = self
                 .authed::<ApiOrderData>(reqwest::Method::GET, &format!("/orders/{hash}"), None)
-                .await?
+                .await.map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?
                 .data;
             let contract = data
                 .order
@@ -574,7 +766,8 @@ impl PredictFunTrader {
                     .expiration
                     .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:EXPIRATION"))?,
             };
-            let snapshot = self.read_order_execution(&hash, &bound).await?;
+            let snapshot = self.read_order_execution(&hash, &bound).await
+                .map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?;
             if !snapshot.pages_complete
                 || !snapshot.accounting_complete()
                 || !matches!(
@@ -638,7 +831,6 @@ impl ChainRead<'_> {
         side: crate::models::Side,
         required: U256,
     ) -> Result<(), VenueError> {
-        self.token_identity(market, token).await?;
         let identity = self.trader.identity();
         let owner = self.trader.trading_address();
         let exchange = self
@@ -651,19 +843,40 @@ impl ChainRead<'_> {
             market.is_neg_risk,
             market.is_yield_bearing,
         );
-        let collateral = self
-            .call(exchange, ExchangeRead::getCollateralCall {})
-            .await?
-            ._0;
-        let observed_ctf = self.call(exchange, ExchangeRead::getCtfCall {}).await?._0;
+        // The token's registration and the exchange's asset route are
+        // independent reads on one pinned block: issue them together, then
+        // apply the original checks in the original order.
+        let adapter_route = async {
+            match adapter {
+                Some(adapter) => {
+                    let (col, route_ctf, wrapped) = tokio::join!(
+                        self.call(adapter, AdapterRead::colCall {}),
+                        self.call(adapter, AdapterRead::ctfCall {}),
+                        self.call(adapter, AdapterRead::wcolCall {})
+                    );
+                    Ok(Some((col?._0, route_ctf?._0, wrapped?._0)))
+                }
+                None => Ok(None),
+            }
+        };
+        let (registered, collateral, observed_ctf, adapter_route) = tokio::join!(
+            self.token_identity(market, token),
+            self.call(exchange, ExchangeRead::getCollateralCall {}),
+            self.call(exchange, ExchangeRead::getCtfCall {}),
+            adapter_route
+        );
+        registered?;
+        let collateral = collateral?._0;
+        let observed_ctf = observed_ctf?._0;
+        let adapter_route = adapter_route?;
         if let Some(adapter) = adapter {
-            if self.call(adapter, AdapterRead::colCall {}).await?._0 != usdt
-                || self.call(adapter, AdapterRead::ctfCall {}).await?._0 != ctf
+            let (adapter_usdt, adapter_ctf, wrapped) =
+                adapter_route.expect("the adapter route was read with the exchange route");
+            if adapter_usdt != usdt || adapter_ctf != ctf
                 || (observed_ctf != ctf && observed_ctf != adapter)
             {
                 return Err(mismatch("ASSET_ROUTE_MISMATCH"));
             }
-            let wrapped = self.call(adapter, AdapterRead::wcolCall {}).await?._0;
             if collateral != usdt && collateral != wrapped {
                 return Err(mismatch("ASSET_ROUTE_MISMATCH"));
             }
@@ -1467,6 +1680,13 @@ pub struct RunContext {
     pub confirmation: Option<RunConfirmation>,
     pub reconciled_orders: Vec<String>,
     pub rpc_url: Option<RedactedRpcUrl>,
+    /// The run's declared C0 in collateral atoms, when the caller declared one.
+    ///
+    /// A claimed payout is explained only against this exact pre-claim cash:
+    /// `collateral - budget` must equal `inventory * payout` atom-for-atom.
+    /// With no declared budget the reader cannot separate a claimed win from a
+    /// foreign cash increase, so the position stays unexplained.
+    pub budget_atoms: Option<U256>,
 }
 
 /// The one-shot hand-off between the command line and the running bot.
@@ -1503,6 +1723,7 @@ impl ConfirmationSlot {
             reconciled_orders: confirmation.reconciled_orders.clone(),
             confirmation: Some(confirmation),
             rpc_url: None,
+            budget_atoms: None,
         });
     }
 
@@ -1772,6 +1993,24 @@ pub(crate) mod tests {
             _bearer: Option<&str>,
             body: Option<&Value>,
         ) -> anyhow::Result<String> {
+            if path.starts_with("/positions?") && self.stage.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                match self.fault {
+                    "account_http" => return Err(anyhow::Error::new(super::super::ApiError {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body: "SECRET_SENTINEL response JWT signature address".into(),
+                    }).context("GET /positions?after=SECRET_SENTINEL")),
+                    "account_transport" => return Err(anyhow::Error::new(
+                        reqwest::Client::new().get("SECRET_SENTINEL://invalid").build().unwrap_err()
+                    ).context("GET /positions?after=SECRET_SENTINEL")),
+                    "account_parse" => return Ok("{SECRET_SENTINEL".into()),
+                    "account_short" => return Err(anyhow::anyhow!("ACCOUNT_LEDGER_MISMATCH")
+                        .context("SECRET_SENTINEL context")),
+                    "account_venue" => return Err(anyhow::Error::new(read_error("RPC_JSON"))
+                        .context("SECRET_SENTINEL context")),
+                    "account_unknown" => anyhow::bail!("SECRET_SENTINEL response body https://invalid/?jwt=secret"),
+                    _ => {},
+                }
+            }
             if path == "/orders/remove" {
                 return Ok(
                     json!({"removed":["synthetic-order"],"noop":[],"rejected":[]}).to_string(),
@@ -2254,6 +2493,7 @@ pub(crate) mod tests {
             confirmation: Some(confirmation),
             rpc_url: Some(url),
             reconciled_orders: vec![hash.clone()],
+            budget_atoms: None,
         });
         let context = slot.claim_context(&identity()).unwrap().unwrap();
         assert_eq!(context.reconciled_orders, vec![hash]);
@@ -2263,6 +2503,7 @@ pub(crate) mod tests {
             confirmation: Some(parse_confirmation("97:0xABC:eoa").unwrap()),
             rpc_url: None,
             reconciled_orders: vec![],
+            budget_atoms: None,
         });
         assert_eq!(
             slot.claim_context(&identity()).unwrap_err().code,
@@ -2339,6 +2580,8 @@ pub(crate) mod tests {
             gas_atoms: Some(U256::ZERO),
             positions: vec![],
             positions_explained: true,
+            settled_zero: vec![],
+            claimed_win: vec![],
             open_orders: vec![],
             complete: true,
         };
@@ -2353,6 +2596,8 @@ pub(crate) mod tests {
             gas_atoms: None,
             positions: vec![],
             positions_explained: true,
+            settled_zero: vec![],
+            claimed_win: vec![],
             open_orders: vec![],
             complete: false,
         };
@@ -2375,6 +2620,8 @@ pub(crate) mod tests {
                 gas_atoms,
                 positions: vec![],
                 positions_explained: true,
+                settled_zero: vec![],
+                claimed_win: vec![],
                 open_orders: vec![],
                 complete: true,
             };
@@ -2392,5 +2639,223 @@ pub(crate) mod tests {
             check_identity("0xdef", &identity()).unwrap_err().code,
             VenueErrorCode::AccountMismatch
         );
+    }
+
+    #[tokio::test]
+    async fn settled_zero_requires_the_original_official_token_side_binding() {
+        // Fault only raw official responses; all history/RPC/account consumers stay original.
+        struct OfficialResult {
+            base: Arc<super::super::fills::tests::Scenario>,
+            fault: &'static str,
+        }
+        impl SyntheticTransport for OfficialResult {
+            fn auth_token(&self) -> String { self.base.auth_token() }
+            fn sign(&self, order: &super::super::Order) -> anyhow::Result<(B256, String)> {
+                self.base.sign(order)
+            }
+            fn rpc(&self, method: &str, params: &Value) -> Result<Value, VenueError> {
+                self.base.rpc(method, params)
+            }
+            fn rest(&self, method: &reqwest::Method, path: &str, bearer: Option<&str>,
+                    body: Option<&Value>) -> anyhow::Result<String> {
+                let mut raw: Value = serde_json::from_str(&self.base.rest(method, path, bearer, body)?)?;
+                if path == "/markets/1" {
+                    match self.fault {
+                        "missing" => raw["data"]["outcomes"].as_array_mut().unwrap().remove(0),
+                        "empty" => { raw["data"]["outcomes"] = json!([]); Value::Null }
+                        "duplicate" => {
+                            raw["data"]["outcomes"][1]["onChainId"] = json!("77"); Value::Null
+                        }
+                        "extra" => {
+                            raw["data"]["outcomes"].as_array_mut().unwrap().push(
+                                json!({"onChainId":"99","name":"Other","status":"LOST"})); Value::Null
+                        }
+                        "replaced" => {
+                            raw["data"]["outcomes"][0]["onChainId"] = json!("99");
+                            raw["data"]["outcomes"][1]["onChainId"] = json!("100");
+                            // Up wins, so unknown token77 would formerly default to No/zero.
+                            raw["data"]["outcomes"][0]["status"] = json!("WON");
+                            raw["data"]["outcomes"][1]["status"] = json!("LOST");
+                            Value::Null
+                        }
+                        "swapped" => {
+                            raw["data"]["outcomes"][0]["onChainId"] = json!("88");
+                            raw["data"]["outcomes"][1]["onChainId"] = json!("77");
+                            raw["data"]["outcomes"][0]["status"] = json!("WON");
+                            raw["data"]["outcomes"][1]["status"] = json!("LOST");
+                            Value::Null
+                        }
+                        "other_replaced" => {
+                            raw["data"]["outcomes"][1]["onChainId"] = json!("99"); Value::Null
+                        }
+                        "contested" => { raw["data"]["status"] = json!("PRICE_DISPUTED"); Value::Null }
+                        "positive" | "contradictory" => {
+                            raw["data"]["outcomes"][0]["status"] = json!("WON");
+                            raw["data"]["outcomes"][1]["status"] = json!("LOST"); Value::Null
+                        }
+                        _ => Value::Null,
+                    };
+                }
+                if path == "/categories/sports" {
+                    match self.fault {
+                        "replaced" | "swapped" | "positive" => raw["data"]["variantData"]["endPrice"] = json!(110),
+                        "tie" => raw["data"]["variantData"]["endPrice"] = json!(100),
+                        "no_prices" => raw["data"]["variantData"] = Value::Null,
+                        _ => (),
+                    }
+                }
+                if path.starts_with("/positions?") && matches!(self.fault, "quantity" | "extra_position") {
+                    raw = serde_json::from_str(&self.base.base.rest(method, path, bearer, body)?)?;
+                    if self.fault == "quantity" {
+                        raw["data"][0]["amount"] = json!("1");
+                    } else {
+                        let mut extra = raw["data"][0].clone();
+                        extra["outcome"]["onChainId"] = json!("88");
+                        raw["data"].as_array_mut().unwrap().push(extra);
+                    }
+                }
+                Ok(raw.to_string())
+            }
+        }
+        for fault in ["missing", "empty", "duplicate", "extra", "replaced", "swapped", "other_replaced",
+                      "contested", "positive", "contradictory", "tie", "no_prices",
+                      "quantity", "extra_position", "valid"] {
+            let (mut trader, transport, _) = super::super::fills::tests::historical_trader("history_settled_zero").await;
+            Arc::get_mut(&mut trader.client).unwrap().synthetic = Some(Arc::new(OfficialResult {
+                base: transport, fault,
+            }));
+            // A rejected result cannot poison the next read's historical binding.
+            for _ in 0..2 {
+                match trader.read_account_snapshot().await {
+                    Ok(snapshot) => {
+                        assert_eq!(snapshot.positions_explained, fault == "valid", "{fault}");
+                        assert_eq!(snapshot.settled_zero.len(), usize::from(fault == "valid"), "{fault}");
+                        assert!(snapshot.complete);
+                    }
+                    Err(error) => {
+                        assert!(matches!(fault, "missing" | "empty" | "duplicate" | "extra" |
+                            "replaced" | "swapped" | "other_replaced" | "quantity" | "extra_position"), "{fault}: {error}");
+                        if !matches!(fault, "quantity" | "extra_position") {
+                            assert_eq!(error.to_string(), "FACT_INCOMPLETE:MARKET_TOKEN_IDENTITY");
+                        } else {
+                            let failure = error.downcast_ref::<VenueError>().unwrap();
+                            assert_eq!(failure.code, VenueErrorCode::ReconciliationRequired);
+                            assert_eq!(failure.reason, "INVENTORY_MISMATCH");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_settled_zero_position_is_explained_by_the_venue_result() {
+        // History carries the bought claim; the venue no longer lists it
+        // because the market settled against it. The venue's own official
+        // result is what explains the difference.
+        let (trader, _, _) = super::super::fills::tests::historical_trader("history_settled_zero").await;
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(snapshot.positions_explained);
+        assert!(snapshot.positions.is_empty());
+        assert!(snapshot.complete);
+        assert!(check_snapshot_complete(&snapshot).is_ok());
+        assert_eq!(snapshot.settled_zero.len(), 1);
+        let basis = &snapshot.settled_zero[0];
+        assert_eq!(basis.token, "77");
+        assert_eq!(basis.market_id, 1);
+        assert_eq!(basis.oracle_status, "RESOLVED");
+        assert_eq!(basis.trading_status, "CLOSED");
+        assert_eq!(basis.outcome_status, "LOST");
+        assert_eq!(basis.payout_millionths, 0);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_win_is_explained_by_the_confirmed_payout_and_exact_cash() {
+        // History carries the bought claim; the venue no longer lists it
+        // because the claimed payout already arrived. The confirmed official
+        // result plus the exact cash increase over the declared C0 explains it.
+        let (mut trader, _, _) = super::super::fills::tests::historical_trader("history_claimed_win").await;
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(snapshot.positions_explained);
+        assert!(snapshot.positions.is_empty());
+        assert!(snapshot.complete);
+        assert!(check_snapshot_complete(&snapshot).is_ok());
+        assert!(snapshot.settled_zero.is_empty());
+        assert_eq!(snapshot.claimed_win.len(), 1);
+        let basis = &snapshot.claimed_win[0];
+        assert_eq!(basis.token, "77");
+        assert_eq!(basis.market_id, 1);
+        assert_eq!(basis.oracle_status, "RESOLVED");
+        assert_eq!(basis.trading_status, "CLOSED");
+        assert_eq!(basis.outcome_status, "WON");
+        assert_eq!(basis.payout_millionths, 1_000_000);
+        assert_eq!(basis.inventory_atoms, U256::from(99) * U256::from(super::super::WEI) / U256::from(10));
+        assert_eq!(basis.claim_atoms, basis.inventory_atoms);
+
+        // One atom of the claim missing, or one atom too much, is unexplained.
+        let budget = trader.run_context.read().as_ref().unwrap().budget_atoms.unwrap();
+        for drift in [U256::from(1u64), U256::MAX] {
+            trader.run_context.write().as_mut().unwrap().budget_atoms =
+                Some(if drift == U256::MAX { budget - U256::from(1u64) } else { budget + drift });
+            let unexplained = trader.read_account_snapshot().await.unwrap();
+            assert!(!unexplained.positions_explained, "{drift}");
+            assert!(unexplained.complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claimed_tie_pays_half_and_needs_its_exact_cash() {
+        let (trader, _, _) = super::super::fills::tests::historical_trader("history_claimed_tie").await;
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(snapshot.positions_explained);
+        assert_eq!(snapshot.claimed_win.len(), 1);
+        let basis = &snapshot.claimed_win[0];
+        assert_eq!(basis.payout_millionths, 500_000);
+        let inventory = U256::from(99) * U256::from(super::super::WEI) / U256::from(10);
+        assert_eq!(basis.inventory_atoms, inventory);
+        // The exact half of the net holding, not a rounded float.
+        assert_eq!(basis.claim_atoms, inventory / U256::from(2u64));
+    }
+
+    #[tokio::test]
+    async fn a_claimed_win_without_a_declared_budget_stays_unexplained() {
+        let (mut trader, _, _) = super::super::fills::tests::historical_trader("history_claimed_win").await;
+        trader.run_context.write().as_mut().unwrap().budget_atoms = None;
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(!snapshot.positions_explained);
+        assert_eq!(snapshot.claimed_win.len(), 1);
+        assert!(check_snapshot_complete(&snapshot).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_replaced_result_token_is_not_a_claim() {
+        // The fresh official result lists outcomes the history never traded:
+        // a matching market id alone never turns that into a claimed payout,
+        // and the reader refuses the binding outright.
+        let (trader, _, _) = super::super::fills::tests::historical_trader("history_claimed_win_replaced").await;
+        let error = trader.read_account_snapshot().await.unwrap_err();
+        assert_eq!(error.to_string(), "FACT_INCOMPLETE:MARKET_TOKEN_IDENTITY");
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_missing_position_stays_unexplained() {
+        // Same shape, but the market has no result: a missing position must
+        // stay fail-closed instead of being explained by settlement.
+        let (trader, _, _) = super::super::fills::tests::historical_trader("history_settled_pending").await;
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(!snapshot.positions_explained);
+        assert!(snapshot.settled_zero.is_empty());
+        assert!(snapshot.complete);
+    }
+
+    #[tokio::test]
+    async fn an_empty_account_keeps_its_prior_explanation() {
+        let (trader, _) = synthetic_trader("");
+        let snapshot = trader.read_account_snapshot().await.unwrap();
+        assert!(snapshot.positions.is_empty());
+        assert!(snapshot.positions_explained);
+        assert!(snapshot.settled_zero.is_empty());
+        assert!(snapshot.complete);
+        assert!(check_snapshot_complete(&snapshot).is_ok());
     }
 }

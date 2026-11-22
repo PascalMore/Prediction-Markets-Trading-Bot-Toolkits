@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import btc5m_live_events as live
 
 @functools.lru_cache(maxsize=None)
-def native_stream(first: int, last: int) -> list[bytes]:
+def native_stream(first, last=None):
     """Run the original offline producer; legacy range pairs name intact fixtures."""
     fixtures = {
         (745, 755): "live_shutdown_after_pending_post_cancellation_keeps_unknown_risk_and_one_hash",
@@ -34,8 +34,14 @@ def native_stream(first: int, last: int) -> list[bytes]:
         # run005's silhouette: a failed runtime account read, the stop it owns
         # and the terminal record the bounded shutdown writes afterwards.
         (96, 98): "live_shutdown_after_a_runtime_read_mismatch_keeps_the_failure_code",
+        # run011's silhouette (R6): the startup read failed and the stop now
+        # names the code that read actually held. Same three records.
+        (301, 303): "startup_read_failure_stop_and_final_name_the_failure_code",
     }
-    name = "bot::runtime::live_control::candidate_tests::" + fixtures[first, last]
+    if last is None:
+        name = "bot::runtime::live_control::candidate_tests::" + first
+    else:
+        name = "bot::runtime::live_control::candidate_tests::" + fixtures[first, last]
     result = subprocess.run(["cargo", "test", "--locked", "--offline", "--target-dir",
                              os.environ["CARGO_TARGET_DIR"], "--lib", name,
                              "--", "--exact", "--nocapture"],
@@ -94,7 +100,7 @@ def metadata(first_frame: bytes) -> tuple[dict, dict, dict]:
         "candidate_identity": {"main_head": "a" * 40, "bot_head": "b" * 40,
                                "binary_sha256": "c" * 64, "files": {"src/main.rs": "d" * 64}},
         "public_config_identity": {"sha256": hashlib.sha256(live.canonical(public)).hexdigest(),
-                                   "initial_cash": 100, "max_order_usd": 2, "max_market_usd": 2,
+                                   "initial_cash": 98, "max_order_usd": 1, "max_market_usd": 1,
                                    "max_total_usd": 10, "max_loss_usd": 20},
     }
     context = {key: copy.deepcopy(started[key]) for key in set(live.CONTEXT_KEYS.split()) & set(started)}
@@ -128,6 +134,24 @@ class EventTests(unittest.TestCase):
         cls.two_round = native_stream(1664, 1690)
         # run005's silhouette: a failed runtime account read and its stop.
         cls.runtime_stop = native_stream(96, 98)
+        # R13c: the claim is judged before it is booked. The native producer's
+        # one-atom-short claim must not close the cash, and the exact claim must
+        # clear the wait the reader can observe.
+        cls.short_claim = native_stream(
+            "claim_wait::the_real_producer_refuses_a_claim_one_atom_short")
+        cls.exact_claim = native_stream(
+            "claim_wait::the_real_producer_pays_the_claim_and_the_reader_can_follow_it")
+        # R13d: the paid claim revokes its own stop, and the window's next
+        # order must still be readable afterwards.
+        cls.resumed = native_stream(
+            "claim_wait::the_real_producer_trades_again_after_the_exact_claim_and_the_reader_follows_it")
+        cls.drive_output = subprocess.run(
+            ["cargo", "test", "--locked", "--offline", "--lib",
+             "bot::runtime::live_control::candidate_tests::contextual_account_failures_stop_safely_without_disclosing_raw_errors",
+             "--", "--exact", "--nocapture"], cwd=Path(__file__).resolve().parents[3],
+            capture_output=True, timeout=120)
+        if cls.drive_output.returncode:
+            raise AssertionError(cls.drive_output.stderr.decode() + cls.drive_output.stdout.decode())
         # Schema cases are independent objects, never a combined relation stream.
         cls.schema_cases = cls.decoded + [live.validate_live_event(frame)
                                          for stream in (cls.payout_stream, cls.loss_stream)
@@ -159,6 +183,88 @@ class EventTests(unittest.TestCase):
 
     def frame(self, event):
         return live.EVENT_PREFIX + json.dumps(event, separators=(",", ":")).encode() + b"\n"
+
+    def test_legacy_details_default_to_null_but_other_keys_stay_strict(self):
+        events = [live.validate_live_event(frame) for frame in self.runtime_stop]
+        legacy = copy.deepcopy(events)
+        for event in legacy:
+            if event["event_kind"] in ("stop", "final"):
+                del event["payload"]["stop_detail"]
+                self.assertIsNone(live.validate_live_event(event)["payload"]["stop_detail"])
+                for change in ("unknown", "required"):
+                    bad = copy.deepcopy(event)
+                    if change == "unknown":
+                        bad["payload"]["unexpected"] = None
+                    else:
+                        del bad["payload"]["takeover_required"]
+                    with self.assertRaises(live.LiveInvalid):
+                        live.validate_live_event(bad)
+        store = self.store(self.runtime_stop)
+        for event in legacy:
+            store.append(self.frame(event))
+        ended = ended_from_native(events[-1])
+        del ended["incomplete_detail"]
+        store.finish(ended)
+        read = live.read_live_run(store.directory)
+        self.assertEqual(read["status"], "INCOMPLETE")
+        self.assertNotIn("OUTPUT_INVALID", read["reasons"])
+        self.assertIsNone(read["ended"]["incomplete_detail"])
+        for change in ("unknown", "required"):
+            bad = copy.deepcopy(ended)
+            if change == "unknown":
+                bad["unexpected"] = None
+            else:
+                del bad["audit_complete"]
+            with self.assertRaises(live.LiveInvalid):
+                live.check_ended(bad, store.started, store.relations)
+
+    def test_historical_run005_and_run006_read_only_replay(self):
+        from btc5m_control import BOT
+        root = BOT.parents[4] / "data/reports"
+        for date, suffix, count, detail in (("2026-11-21", "005", 98, None),
+                                           ("2026-11-22", "006", 44, "UNKNOWN")):
+            directory = root / (date + "-btc5m-controlled-paper/evidence") / ("btc5m-supervised-live-" + suffix)
+            names = ("started.json", "public-config.json", "live-context.json", "events.jsonl", "ended.json")
+            before = {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in names}
+            result = live.read_live_run(directory)
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertEqual(len(result["events"]), count)
+            self.assertEqual(result["reasons"], ["FACT_INCOMPLETE"])
+            self.assertEqual(result["ended"]["incomplete_detail"], detail)
+            self.assertFalse(result["ended"]["cash_complete"])
+            self.assertEqual(before, {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+                                      for name in names})
+
+    def test_real_drive_logs_and_persisted_protocol_exclude_account_causes(self):
+        self.assertNotIn(b"SECRET_SENTINEL", self.drive_output.stdout)
+        self.assertNotIn(b"SECRET_SENTINEL", self.drive_output.stderr)
+        self.assertEqual(self.drive_output.stdout.count(b"order state check failed"), 6)
+        groups, frames = [], []
+        for line in self.drive_output.stdout.splitlines():
+            if not line.startswith(live.EVENT_PREFIX):
+                continue
+            frame = line + b"\n"
+            frames.append(frame)
+            if live.validate_live_event(frame)["event_kind"] == "final":
+                groups.append(frames)
+                frames = []
+        self.assertFalse(frames)
+        expected = ("POSITIONS_READ_UNAVAILABLE_HTTP_503", "POSITIONS_READ_UNAVAILABLE",
+                    "POSITIONS_FACT_INCOMPLETE", "ACCOUNT_LEDGER_MISMATCH", "RPC_JSON", "UNKNOWN")
+        self.assertEqual(len(groups), len(expected))
+        for frames, detail in zip(groups, expected):
+            store = self.store(frames)
+            for frame in frames:
+                store.append(frame)
+            terminal = live.validate_live_event(frames[-1])
+            store.finish(ended_from_native(terminal))
+            read = live.read_live_run(store.directory)
+            self.assertEqual(read["status"], "INCOMPLETE")
+            self.assertEqual(read["ended"]["incomplete_detail"], detail)
+            stop = next(event for event in read["events"] if event["event_kind"] == "stop")
+            self.assertEqual(stop["payload"]["stop_detail"], detail)
+            for name in ("events.jsonl", "ended.json"):
+                self.assertNotIn(b"SECRET_SENTINEL", (store.directory / name).read_bytes())
 
     def test_native_producer_to_first_write_ack_reader_and_final(self):
         for frames in (self.pending, self.cleanup):
@@ -270,6 +376,26 @@ class EventTests(unittest.TestCase):
                 with self.assertRaises(live.LiveInvalid):
                     relation.stage(self.decoded[index])
 
+    def test_metadata_activation_window_cap_is_mode_bound_and_inclusive(self):
+        """Exercise the metadata consumer, not merely the shared bound helper."""
+        started, public, context = metadata(self.cleanup[0])
+        start = live.timestamp(started["started_at"])
+        stamp = lambda value: value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        for mode, cap in (("supervised", 21600), ("unattended", 86400), ("unknown", 0)):
+            for seconds in (-1, 0, 1, 21599, 21600, 21601, 86399, 86400, 86401):
+                accepted = mode != "unknown" and 0 < seconds <= cap
+                with self.subTest(mode=mode, seconds=seconds):
+                    candidate = copy.deepcopy(started)
+                    candidate_context = copy.deepcopy(context)
+                    candidate["operations_mode"] = candidate_context["operations_mode"] = mode
+                    candidate["deadline_at"] = candidate_context["deadline_at"] = stamp(
+                        start + dt.timedelta(seconds=seconds))
+                    if accepted:
+                        live.check_metadata(candidate, public, candidate_context)
+                    else:
+                        with self.assertRaises(live.LiveInvalid):
+                            live.check_metadata(candidate, public, candidate_context)
+
     def test_gas_metadata_requires_the_distinct_fixed_signer(self):
         started, public, context = metadata(self.cleanup[0])
         self.assertNotEqual(started["account_identity"]["trading_address"],
@@ -299,6 +425,9 @@ class EventTests(unittest.TestCase):
         for event in self.schema_cases:
             for path, obj in objects(event):
                 for key in obj:
+                    if (path == ("payload",) and key == "stop_detail"
+                            and event["event_kind"] in ("stop", "final")):
+                        continue  # Only this historical nullable key may be absent.
                     broken = copy.deepcopy(event)
                     target = broken
                     for component in path:
@@ -553,11 +682,138 @@ class EventTests(unittest.TestCase):
         self.assertEqual(store.relations.seq, 27)
         self.assertEqual(len(store.relations.attempts), 2)
         for attempt in store.relations.attempts.values():
-            self.assertEqual(attempt["applied"]["net_cash_atoms"], 2 * live.SCALE)
-            self.assertEqual(attempt["applied"]["share_fee_atoms"], 5 * 10 ** 16)
-            self.assertEqual(attempt["applied"]["net_inventory_atoms"], 495 * 10 ** 16)
+            self.assertEqual(attempt["applied"]["net_cash_atoms"], live.SCALE)
+            self.assertEqual(attempt["applied"]["share_fee_atoms"], 25 * 10 ** 15)
+            self.assertEqual(attempt["applied"]["net_inventory_atoms"], 2475 * 10 ** 15)
         self.assertTrue(store.relations.cash_pending)
         self.assertEqual(live.read_live_run(store.directory)["status"], "INCOMPLETE")
+
+    def test_a_claim_is_judged_before_it_is_booked_and_the_reader_agrees(self):
+        # A claim one atom short of what the confirmed result owes is never
+        # booked as cash: the terminal record keeps the cash incomplete, and
+        # the reader observes the same pending wait.
+        short_store = self.store(self.short_claim)
+        for frame in self.short_claim:
+            short_store.append(frame)
+        short_final = short_store.relations.final
+        self.assertFalse(short_final["payload"]["cash_complete"],
+                         "a claim one atom short never closes the cash")
+        self.assertTrue(short_store.relations.cash_pending,
+                        "the reader still sees the cash wait")
+        self.assertEqual(live.read_live_run(short_store.directory)["status"], "INCOMPLETE")
+        # The exact claim does close it, and the reader observes the cleared
+        # wait through the wire's own CASH_CONFIRMED record.
+        exact_store = self.store(self.exact_claim)
+        for frame in self.exact_claim:
+            exact_store.append(frame)
+        exact_final = exact_store.relations.final
+        self.assertTrue(exact_final["payload"]["cash_complete"],
+                        "the exact claim's cash is received, not pending")
+        self.assertFalse(exact_store.relations.cash_pending,
+                         "the reader must see the wait released")
+        paid = [event for event in
+                (live.validate_live_event(frame) for frame in self.exact_claim)
+                if event["event_kind"] == "payout"
+                and event["payload"]["status"] == "CASH_CONFIRMED"]
+        self.assertEqual(len(paid), 1, "the paid claim is on the wire")
+        self.assertIsNotNone(paid[0]["payload"]["cash_received_atoms"])
+        # The terminal positions of both streams agree with the reconciliation:
+        # a holding the venue no longer lists is not a position any more.
+        for store in (short_store, exact_store):
+            self.assertEqual(store.relations.positions,
+                             store.relations.final["payload"]["positions"])
+
+    def test_the_reader_follows_the_run_that_trades_again_after_the_paid_claim(self):
+        # The exact claim's CASH_CONFIRMED is the wire fact that revokes the
+        # wait it caused. The next round's RESERVE and FINAL_SEND follow it on
+        # the same stream: the run is legal, so the reader must not call its
+        # own continued ordering OUTPUT_INVALID.
+        store = self.store(self.resumed)
+        events = [live.validate_live_event(frame) for frame in self.resumed]
+        for frame in self.resumed:
+            store.append(frame)
+        paid = next(index for index, event in enumerate(events)
+                    if event["event_kind"] == "payout"
+                    and event["payload"]["status"] == "CASH_CONFIRMED")
+        self.assertFalse(store.relations.cash_pending)
+        self.assertFalse(store.relations.stopped,
+                         "the paid claim revokes the stop it caused")
+        resumed = [event for event in events[paid + 1:]]
+        self.assertTrue(any(event["event_kind"] == "reservation"
+                            and event["payload"]["action"] == "RESERVE"
+                            for event in resumed),
+                        "the resumed window's next order is on the wire")
+        self.assertTrue(any(event["event_kind"] == "decision"
+                            and event["payload"]["decision"]["phase"] == "FINAL_SEND"
+                            for event in resumed),
+                        "the resumed window's next send permission is on the wire")
+        read = live.read_live_run(store.directory)
+        self.assertEqual(read["status"], "INCOMPLETE")
+        self.assertNotIn("OUTPUT_INVALID", read["reasons"])
+
+    def test_a_stop_from_another_cause_survives_the_paid_claim(self):
+        # Only the wait the missing claim caused is revocable. A run stopped
+        # for another reason keeps that stop, so the later order is refused.
+        events = [live.validate_live_event(frame) for frame in self.resumed]
+        paid = next(index for index, event in enumerate(events)
+                    if event["event_kind"] == "payout"
+                    and event["payload"]["status"] == "CASH_CONFIRMED")
+        relation = live.LiveRelations(events[0]["run_id"], events[0]["risk_window_id"])
+        for event in events[:paid]:
+            relation = relation.stage(event)
+        self.assertTrue(relation.stopped)
+        self.assertEqual(relation.stop_reason, "CASH_PENDING")
+        relation.stopped, relation.stop_reason = True, "DATA_UNAVAILABLE"
+        relation = relation.stage(events[paid])
+        self.assertTrue(relation.stopped, "another cause's stop is not the cash wait")
+        self.assertEqual(relation.stop_reason, "DATA_UNAVAILABLE")
+        self.assertFalse(relation.cash_pending)
+        with self.assertRaises(live.LiveInvalid):
+            for event in events[paid + 1:]:
+                relation = relation.stage(event)
+
+    def test_the_first_stop_cause_outlives_the_settlement_that_follows_it(self):
+        # The producer emits its stop record once, so a stop for another cause
+        # can precede this settlement's own payout CASH_PENDING. The reader must
+        # keep the first cause: CASH_CONFIRMED revokes only a stop the cash wait
+        # caused, and the window's next send permission stays shut.
+        events = [live.validate_live_event(frame) for frame in self.resumed]
+        pending = next(index for index, event in enumerate(events)
+                       if event["event_kind"] == "payout"
+                       and event["payload"]["status"] == "CASH_PENDING")
+        stop = next(index for index, event in enumerate(events) if event["event_kind"] == "stop")
+        events[stop]["payload"]["reason"] = "DATA_UNAVAILABLE"
+        events[stop]["payload"]["stop_detail"] = "READ_FAILED"
+        order = []
+        for index, event in enumerate(events):
+            if index == pending:
+                order.append(events[stop])
+            if index != stop:
+                order.append(event)
+        for position, event in enumerate(order, start=1):
+            event["event_seq"] = position
+        relation = live.LiveRelations(order[0]["run_id"], order[0]["risk_window_id"])
+        stop_seq, accepted, refused = events[stop]["event_seq"], [], None
+        for event in order:
+            try:
+                relation = relation.stage(event)
+            except live.LiveInvalid:
+                refused = event
+                break
+            accepted.append(event)
+        self.assertTrue(relation.stopped, "the first stop cause is never released")
+        self.assertEqual(relation.stop_reason, "DATA_UNAVAILABLE")
+        self.assertFalse(relation.cash_pending, "the paid claim ends the wait, not the stop")
+        if refused is None:
+            self.fail("the stopped window's next order is refused")
+        self.assertEqual((refused["event_kind"], refused["payload"]["action"]),
+                         ("reservation", "RESERVE"))
+        self.assertEqual(refused["event_seq"], relation.seq + 1,
+                         "the refused frame is the run's own next legal frame")
+        self.assertFalse([event for event in accepted if event["event_kind"] == "decision"
+                          and event["payload"]["decision"]["phase"] == "FINAL_SEND"
+                          and event["event_seq"] > stop_seq],
+                         "no send permission after the first-cause stop is admitted")
 
     def test_all_ten_payload_schemas_and_array_limits(self):
         self.assertEqual({event["event_kind"] for event in self.schema_cases}, set(live.PAYLOADS))

@@ -34,7 +34,7 @@ fn down_evaluation(clock: &FixtureClock) -> (
         market: &market, book: &book, spot_price: 99.9,
         spot_source: Some(crate::service::spot::SpotSource::Binance), actual_pair: Some("BTCUSDT".into()),
         spot_clock: Some(observation.clone()), book_clock: Some(observation), now: clock.now().unwrap(),
-        order_usd: 2.0, min_edge: 0.03, min_secs_left: 30.0, entered: false,
+        order_usd: 1.0, min_edge: 0.03, min_secs_left: 30.0, entered: false,
         identity_available_at: market.starts_at, strike_available_at: market.starts_at,
         settlement_provider: SettlementProvider::Chainlink,
     });
@@ -43,14 +43,16 @@ fn down_evaluation(clock: &FixtureClock) -> (
 
 #[tokio::test]
 async fn lowercase_payer_reaches_native_down_send_after_multiple_account_reads() {
-    // Public live003 inputs: Down 3.12 @ 0.64, 200bps, PRIMARY, 1144ms recheck.
+    // Public live003 inputs: Down 1.56 @ 0.64 under the current 1-USDT order
+    // contract (the original 2-USDT run saw 3.12 shares), 200bps, PRIMARY,
+    // 1144ms recheck.
     // Source events.jsonl SHA256: 435fa46b907afb54add360260bcd319b572ca1e17713aeb5fc118eb7ad19f5bd.
     // Synthetic spot history and short token ids are not the original incident replay.
     let (mut broker, clock) = risk_fixture();
     let (market, book, evaluation) = down_evaluation(&clock);
     let candidate = evaluation.candidate.unwrap();
     assert_eq!(candidate.token(), "88");
-    assert_eq!(candidate.gross_shares(), 3.12);
+    assert_eq!(candidate.gross_shares(), 1.56);
     assert_eq!(candidate.limit_price(), 0.64);
     assert_eq!(candidate.fee_rate_bps(), 200);
     assert_eq!(evaluation.diagnostic.source_state, crate::bot::arbitrage::phase1::SourceState::Primary);
@@ -88,8 +90,8 @@ async fn lowercase_payer_reaches_native_down_send_after_multiple_account_reads()
     assert!(guard.is_acked() && guard.was_consumed());
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
     assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
-    let gross = U256::from(3_120_000_000_000_000_000u128);
-    let cash = U256::from(1_996_800_000_000_000_000u128);
+    let gross = U256::from(1_560_000_000_000_000_000u128);
+    let cash = U256::from(998_400_000_000_000_000u128);
     let fee = gross / U256::from(100); // Existing fixture reports an actual 1% share fee.
     let bound = guard.bound.lock().clone().unwrap();
     assert_eq!(bound.request_gross_atoms, gross);
@@ -108,7 +110,7 @@ async fn lowercase_payer_reaches_native_down_send_after_multiple_account_reads()
     live::check_runtime_account(&broker, false).await.unwrap();
     assert!(broker.gate.as_ref().unwrap().allows_new_orders(&identity));
     // A later candidate uses the same broker, account gate and committed ledger.
-    // The existing 2-USDT per-market cap must still refuse another full order.
+    // The existing 1-USDT per-market cap must still refuse another full order.
     let (next_market, next_book, next_evaluation) = down_evaluation(&clock);
     let next_candidate = next_evaluation.candidate.unwrap();
     live::check_runtime_account(&broker, false).await.unwrap();
@@ -142,7 +144,7 @@ fn gas_payer_case_equivalence_preserves_address_gas_receipt_and_budget_refusals(
     state.live.controlled.as_mut().unwrap().identity = identity;
     let receipt = account_receipt(&state).unwrap();
     record_account_read(&mut state, &baseline, receipt).unwrap();
-    let cash = U256::from(1_996_800_000_000_000_000u128);
+    let cash = U256::from(998_400_000_000_000_000u128);
     for (payer, expected) in [
         (raw, None), (checksum.as_str(), None),
         ("0x5129330159F4E6A99EF873F86901E3CAFA7F9A7D", None),
@@ -154,7 +156,7 @@ fn gas_payer_case_equivalence_preserves_address_gas_receipt_and_budget_refusals(
         assert_eq!(broker.check_live_entry(&mut state, 4668196, cash), expected, "{payer}");
     }
     state.live.controlled.as_mut().unwrap().options.gas_policy.payer_address = raw.into();
-    assert_eq!(broker.check_live_entry(&mut state, 4668196, U256::from(2*SCALE+1)), Some(Blocked::OrderCap));
+    assert_eq!(broker.check_live_entry(&mut state, 4668196, U256::from(SCALE+1)), Some(Blocked::OrderCap));
     for (gas, expected) in [(Some(1000u64), None), (Some(900), Some(Blocked::DataIncomplete)),
         (Some(0), Some(Blocked::DataIncomplete)), (Some(1001), Some(Blocked::DataIncomplete)),
         (None, Some(Blocked::DataIncomplete))] {

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -17,8 +18,22 @@ from btc5m_control import candidate_input_error
 SCHEMA_VERSION = "btc5m-controlled-live.v1"
 EVENT_PREFIX = b"BTC5M_EVENT "
 MAX_LINE_BYTES = 65536
+# Activation policy is shared by metadata, guard and controller.
+_ACTIVATION_WINDOWS = {"supervised": dt.timedelta(hours=6), "unattended": dt.timedelta(hours=24)}
+
+
+def activation_window_allowed(mode: str, duration: dt.timedelta) -> bool:
+    """Accept positive windows up to the mode's inclusive authorized limit."""
+    limit = _ACTIVATION_WINDOWS.get(mode)
+    return limit is not None and dt.timedelta(0) < duration <= limit
+
+
 U256_MAX = (1 << 256) - 1
 SCALE = 10 ** 18
+# The window's budget, in whole USDT: the accounting identity's C0.
+BUDGET_C0_USDT = 98
+# Frozen runs recorded C0=100; their evidence stays readable byte for byte.
+LEGACY_BUDGET_C0_USDT = 100
 REASONS = tuple("NONE CONTEXT_MISSING SOURCE_NOT_ALLOWED INPUT_CHANGED SIGNED_BOUND_UNPROVEN "
                 "ALREADY_RUNNING RECOVERY_GUARD_UNAVAILABLE RECONCILIATION_REQUIRED "
                 "SUBMISSION_UNKNOWN FACT_INCOMPLETE FACT_CONFLICT ACCOUNT_MISMATCH READ_UNAVAILABLE "
@@ -226,22 +241,63 @@ PAYLOADS = {
 }
 
 
-def check_accounting(accounting: dict) -> None:
-    """Check integer identities without creating a spendable balance."""
+def check_accounting(accounting: dict, budget_atoms: int | None = None,
+                     loss_atoms: int | None = None) -> None:
+    """Check integer identities without creating a spendable balance.
+
+    A caller that knows the run's frozen parameters passes them in atoms; the
+    reader then accepts only that budget and that loss threshold. Evidence
+    written before the public identity carried them keeps the two window
+    values those runs recorded (98 and the legacy 100).
+    """
     fields(accounting, ACCOUNTING)
     if accounting["status"] == "COMPLETE":
         names = "cash available reserved cost realized unrealized nav net_pnl".split()
         require(all(accounting[name] is not None for name in names))
         amounts = {name: int(accounting[name]) for name in names}
-        require(amounts["cash"] == 100 * SCALE + amounts["realized"] - amounts["cost"])
+        # The identity is `cash = C0 + realized - cost` with one C0 per window.
+        # Frozen runs recorded C0=100 USDT and current runs use 98; a
+        # parameterized run records its own budget. nav must use the same base.
+        base = amounts["cash"] - amounts["realized"] + amounts["cost"]
+        if budget_atoms is not None:
+            require(type(budget_atoms) is int and budget_atoms > 0)
+            require(base == budget_atoms)
+        else:
+            require(base in (BUDGET_C0_USDT * SCALE, LEGACY_BUDGET_C0_USDT * SCALE))
         require(amounts["net_pnl"] == amounts["realized"] + amounts["unrealized"])
-        require(amounts["nav"] == 100 * SCALE + amounts["net_pnl"])
+        require(amounts["nav"] == base + amounts["net_pnl"])
         require(amounts["available"] <= max(0, amounts["cash"] - amounts["reserved"]))
-        require(amounts["net_pnl"] > -20 * SCALE or accounting["loss_latched"])
+        threshold = loss_atoms if loss_atoms is not None else 20 * SCALE
+        require(type(threshold) is int and threshold > 0)
+        require(amounts["net_pnl"] > -threshold or accounting["loss_latched"])
     require((accounting["gas_status"] == "KNOWN") == (accounting["gas_paid_atoms"] is not None))
 
 
-def validate_live_event(raw: bytes | str | dict) -> dict:
+def frozen_window(identity: dict | None) -> tuple[int | None, int | None]:
+    """The budget and loss atoms a run's frozen public identity binds.
+
+    `initial_cash` is the window's C0 and `max_loss_usd` its loss threshold, so
+    a parameterized run's events and ending must use exactly those values. Only
+    evidence written before the identity carried them returns `(None, None)`
+    and keeps the historical window.
+    """
+    if type(identity) is not dict:
+        return None, None
+    budget, loss = identity.get("initial_cash"), identity.get("max_loss_usd")
+    if budget is None and loss is None:
+        return None, None
+    for value in (budget, loss):
+        # A budget may be stated as a plain decimal string to eighteen places so a
+        # claimed payout's atoms survive; a number keeps the historical six.
+        require((isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) > 0)
+                or (isinstance(value, str) and len(value) > 0 and value.count('.') <= 1
+                    and all(ch.isdigit() or ch == '.' for ch in value)
+                    and len(value.rpartition('.')[2]) <= 18 and any(ch.isdigit() for ch in value)))
+    return int(Decimal(str(budget)) * SCALE), int(Decimal(str(loss)) * SCALE)
+
+
+def validate_live_event(raw: bytes | str | dict,
+                        public_identity: dict | None = None) -> dict:
     """Validate a complete wire frame (or an already decoded audit object)."""
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
@@ -259,8 +315,12 @@ def validate_live_event(raw: bytes | str | dict) -> dict:
         _scalar(event[key], kind)
     kind = event["event_kind"]
     require(type(kind) is str and kind in PAYLOADS)
+    # Only the diagnostic field was absent in the original v1 stop/final.
+    # Normalize in memory before exact-key validation, never on disk.
+    if kind in ("stop", "final") and type(event["payload"]) is dict:
+        event["payload"].setdefault("stop_detail", None)
     fields(event["payload"], PAYLOADS[kind])
-    check_accounting(event["accounting"])
+    check_accounting(event["accounting"], *frozen_window(public_identity))
     payload = event["payload"]
     if kind in ("stop", "final"):
         payload["stop_detail"] = detail_code(payload["stop_detail"])
@@ -299,17 +359,20 @@ def validate_live_event(raw: bytes | str | dict) -> dict:
         if payload["status"] in ("CONFIRMED", "CASH_PENDING", "CASH_CONFIRMED"):
             require(payload["payout_yes"] is not None)
         if payload["status"] == "CASH_CONFIRMED":
-            require(payload["cash_received_atoms"] is not None and payload["tx_hash"] is not None)
+            require(payload["cash_received_atoms"] is not None)
     return event
 
 
 class LiveRelations:
     """Staged audit relationships and observed watermarks, never an execution ledger."""
 
-    def __init__(self, run_id: str, risk_window_id: str) -> None:
+    def __init__(self, run_id: str, risk_window_id: str,
+                 public_identity: dict | None = None) -> None:
         _scalar(run_id, "public")
         _scalar(risk_window_id, "public")
         self.run_id, self.risk_window_id = run_id, risk_window_id
+        # The run's own frozen window, so every staged event uses its budget.
+        self.public_identity = public_identity
         self.seq = 0
         self.final = None
         self.candidates = {}
@@ -317,6 +380,9 @@ class LiveRelations:
         self.hashes = {}
         self.latched = False
         self.stopped = False
+        # Why the run is stopped. Only a CASH_PENDING wait is revocable: the
+        # paid claim is the wire fact that ends it.
+        self.stop_reason = None
         self.cash_pending = False
         self.positions = None
         self.previous_accounting = None
@@ -324,7 +390,7 @@ class LiveRelations:
 
     def stage(self, event: dict) -> LiveRelations:
         """Return a validated next index; callers commit only after durable readback."""
-        event = validate_live_event(event)
+        event = validate_live_event(event, self.public_identity)
         require(event["run_id"] == self.run_id and event["risk_window_id"] == self.risk_window_id)
         require(self.final is None and event["event_seq"] == self.seq + 1)
         staged = copy.deepcopy(self)
@@ -423,12 +489,27 @@ class LiveRelations:
             require(any(attempt["identity"] == market_token for attempt in self.attempts.values()))
             if payload["status"] == "CASH_PENDING":
                 self.cash_pending = True
-                self.stopped = True
+                # The first cause wins: a settlement's own pending claim does
+                # not rename a stop another cause already recorded.
+                if self.stop_reason in (None, "CASH_PENDING"):
+                    self.stopped = True
+                    self.stop_reason = "CASH_PENDING"
+            if payload["status"] == "CASH_CONFIRMED":
+                # The claim's cash arrived. The wait it caused is over: a
+                # pending claim that was later paid is no longer pending, and a
+                # stop only that wait caused is revoked with it. A stop from
+                # any other cause stays latched.
+                require(payload["cash_received_atoms"] is not None)
+                self.cash_pending = False
+                if self.stop_reason == "CASH_PENDING":
+                    self.stopped = False
+                    self.stop_reason = None
             if payload["cash_received_atoms"] is None and self.seq and accounting["cash"] is not None:
                 # Payout/claim is not a cash receipt. Compare only known audit projections.
                 require(self.previous_cash is None or accounting["cash"] == self.previous_cash)
         elif kind == "stop":
             self.stopped = True
+            self.stop_reason = payload["reason"]
         elif kind == "final":
             unresolved = {item["attempt_id"]: item for item in payload["unresolved"]}
             require(len(unresolved) == len(payload["unresolved"]))
@@ -575,7 +656,7 @@ def check_metadata(started: dict, public_config: dict, context: dict) -> None:
     fields(units, "collateral_symbol:USDT collateral_decimals:integer share_decimals:integer gas_symbol:BNB gas_decimals:integer")
     require(all(units[key] == 18 for key in ("collateral_decimals", "share_decimals", "gas_decimals")))
     duration = timestamp(started["deadline_at"]) - timestamp(started["started_at"])
-    require(dt.timedelta(0) < duration <= dt.timedelta(hours=6))
+    require(activation_window_allowed(started["operations_mode"], duration))
     identity = started["candidate_identity"]
     exact(identity, "main_head bot_head binary_sha256 files")
     for key in ("main_head", "bot_head"):
@@ -589,8 +670,39 @@ def check_metadata(started: dict, public_config: dict, context: dict) -> None:
     public = started["public_config_identity"]
     exact(public, "sha256 initial_cash max_order_usd max_market_usd max_total_usd max_loss_usd")
     require(public["sha256"] == hashlib.sha256(canonical(public_config)).hexdigest())
-    for key, value in zip("initial_cash max_order_usd max_market_usd max_total_usd max_loss_usd".split(), (100, 2, 2, 10, 20)):
-        require(type(public[key]) in (int, float) and public[key] == value)
+    # Every window carries its own frozen record: the identity must equal the
+    # contract the run was actually launched with, so a frozen run from an
+    # earlier contract (C0=100, 2-USDT caps) stays readable exactly as recorded.
+    strategies = public_config.get("strategies")
+    limits = strategies.get("limits") if type(strategies) is dict else None
+    btc = strategies.get("btc_arb") if type(strategies) is dict else None
+    if type(limits) is dict and type(btc) is dict:
+        for key in ("max_order_usd", "max_market_usd", "max_total_usd", "max_loss_usd"):
+            require(type(public[key]) in (int, float) and public[key] == limits[key])
+        # `btc_arb.order_usd` is the per-order target and `limits.max_order_usd`
+        # its cap: a parameterized run may target less than the cap, never more.
+        require(type(btc["order_usd"]) in (int, float)
+                and 0 < btc["order_usd"] <= limits["max_order_usd"])
+    else:
+        # Offline fixtures carry no deployment config; they use the current window.
+        for key, value in zip("max_order_usd max_market_usd max_total_usd max_loss_usd".split(), (1, 1, 10, 20)):
+            require(type(public[key]) in (int, float) and public[key] == value)
+    cash = public["initial_cash"]
+    require((type(cash) in (int, float) and cash > 0)
+            or (isinstance(cash, str) and len(cash) > 0 and cash.count('.') <= 1
+                and all(ch.isdigit() or ch == '.' for ch in cash) and any(ch.isdigit() for ch in cash)))
+    # A parameterized run carries its own budget and duration: the identity it
+    # wrote must be the one the configuration declares, or the run is refused.
+    settings = public_config.get("controlled_run") if type(public_config) is dict else None
+    if type(settings) is dict:
+        budget = settings.get("budget_usdt")
+        require((isinstance(budget, (int, float)) and not isinstance(budget, bool) and float(budget) > 0)
+                or (isinstance(budget, str) and len(budget) > 0 and budget.count('.') <= 1
+                    and all(ch.isdigit() or ch == '.' for ch in budget) and any(ch.isdigit() for ch in budget)))
+        require(public["initial_cash"] == budget)
+        seconds = settings.get("duration_seconds")
+        require(isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0)
+        require(int(duration.total_seconds()) == seconds)
     require(context["candidate_digest"] == candidate_digest(started))
     for key in set(context) & set(started) - {"schema_version"}:
         require(context[key] == started[key])
@@ -635,7 +747,8 @@ class LiveEventStore:
         check_metadata(started, public_config, context)
         self.directory = Path(directory)
         self.started = copy.deepcopy(started)
-        self.relations = LiveRelations(started["run_id"], started["risk_window_id"])
+        self.relations = LiveRelations(started["run_id"], started["risk_window_id"],
+                                       started["public_config_identity"])
         self.failed = False
         self.stream: BinaryIO | None = None
         try:
@@ -655,7 +768,7 @@ class LiveEventStore:
         """Validate, write once, flush/fsync/readback, commit, then acknowledge an order."""
         require(not self.failed and self.stream is not None, "AUDIT_UNAVAILABLE")
         try:
-            event = validate_live_event(raw)
+            event = validate_live_event(raw, self.started["public_config_identity"])
             staged = self.relations.stage(event)
             line = canonical(event) + b"\n"
         except (LiveInvalid, ValueError, TypeError, RecursionError):
@@ -700,6 +813,8 @@ class LiveEventStore:
 
 def check_ended(ended: dict, started: dict, relations: LiveRelations) -> None:
     """Cross-check native result dimensions against the actual final evidence."""
+    if type(ended) is dict:
+        ended.setdefault("incomplete_detail", None)
     exact(ended, ENDED_KEYS)
     require(ended["schema_version"] == SCHEMA_VERSION and ended["run_id"] == started["run_id"])
     exit_facts = ended["exit_facts"]
@@ -721,7 +836,7 @@ def check_ended(ended: dict, started: dict, relations: LiveRelations) -> None:
                 and not ended["audit_complete"] and ended["incomplete_reason"] is not None
                 and ended["incomplete_detail"] is None)
     else:
-        check_accounting(ended["final_accounting"])
+        check_accounting(ended["final_accounting"], *frozen_window(started.get("public_config_identity")))
         require(ended["final_event_seq"] == final["event_seq"] and ended["final_accounting"] == final["accounting"])
         require(exit_facts["stop_reason"] == final["payload"]["stop_reason"])
         require(ended["incomplete_detail"] == final["payload"]["stop_detail"])
@@ -749,11 +864,12 @@ def read_live_run(directory: Path) -> dict:
         context = strict_json(_read_file(directory / "live-context.json", MAX_LINE_BYTES))
         check_metadata(started, public, context)
         result["run_id"] = started["run_id"]
-        relations = LiveRelations(started["run_id"], started["risk_window_id"])
+        relations = LiveRelations(started["run_id"], started["risk_window_id"],
+                                  started["public_config_identity"])
         raw = _read_file(directory / "events.jsonl", 64 * 1024 * 1024)
         for line in raw.splitlines(keepends=True):
             require(line.endswith(b"\n") and len(line) + len(EVENT_PREFIX) <= MAX_LINE_BYTES)
-            event = validate_live_event(EVENT_PREFIX + line)
+            event = validate_live_event(EVENT_PREFIX + line, started["public_config_identity"])
             relations = relations.stage(event)
             result["events"].append(event)
         ended = strict_json(_read_file(directory / "ended.json", MAX_LINE_BYTES))

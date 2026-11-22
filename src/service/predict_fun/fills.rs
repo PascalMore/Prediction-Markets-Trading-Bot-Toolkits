@@ -300,15 +300,18 @@ impl OrderVenue for PredictFunTrader {
             bail!("EXECUTION_NOT_ENABLED:CONTROLLED_LIVE_REQUIRED");
         }
         let result = async {
+            use crate::bot::runtime::timing;
             self.check_allows_new_order()?;
             // Capture the broker's original identity and quantity before any
             // adapter preparation can mutate the shared handle.
             let frozen = controlled::FrozenAttempt::capture(&handle, planned, &self.identity())?;
             guard.check_preparation()?;
             self.begin_attempt(&handle)?;
+            timing::mark("checks");
             let snapshot = self.read_account_snapshot().await?;
             guard.check_preparation()?;
             account::check_snapshot_complete(&snapshot)?;
+            timing::mark("account_read");
 
             let market = self.client.market_for_token(&planned.token_id)?;
             let quantity = f64_to_wei(planned.shares)?;
@@ -316,6 +319,7 @@ impl OrderVenue for PredictFunTrader {
             let raw_book = self.client.book(market.id).await?;
             guard.check_preparation()?;
             guard.check_book(&super::to_snapshot(&raw_book.asks, &raw_book.bids))?;
+            timing::mark("book");
             let book = WeiBook::from_api(&raw_book, mirrored)?;
             let amounts = market_amounts(&book, planned.side, quantity)?;
             check_limit(&amounts, planned.side, planned.limit_price)?;
@@ -331,8 +335,10 @@ impl OrderVenue for PredictFunTrader {
 
             let read = self.chain_read().await?;
             guard.check_preparation()?;
+            timing::mark("chain_read");
             let (collateral, gas) = read.balances().await?;
             guard.check_preparation()?;
+            timing::mark("balances");
             let required = amounts.maker_amount;
             if gas.is_zero() || collateral < required {
                 return Err(VenueError::new(
@@ -345,10 +351,12 @@ impl OrderVenue for PredictFunTrader {
             read.authorize(&market, order.tokenId, planned.side, required)
                 .await?;
             guard.check_preparation()?;
+            timing::mark("authorize");
 
             let (digest, signature) = self.sign_order(&order, &market).await?;
             let order_hash = format!("0x{}", hex::encode(digest));
             frozen.check_order(&handle, &order, &market, self.trading_address())?;
+            timing::mark("sign");
             // Only the newly learned hash is added. Identity and frozen gross
             // quantity remain the broker's facts, never adapter replacements.
             handle.lock().identity.signed_hash = Some(order_hash.clone());
@@ -387,10 +395,14 @@ impl OrderVenue for PredictFunTrader {
             guard.check_preparation()?;
             let read = self.chain_read().await?;
             guard.check_preparation()?;
+            timing::mark("chain_read2");
             read.signature(digest, &signature).await?;
             guard.check_preparation()?;
+            timing::mark("signature");
             controlled::check_guarded_facts(guard, &bound)?;
+            timing::mark("facts");
             controlled::await_guarded_ack(guard, &bound)?;
+            timing::mark("acked");
 
             let attempt_id = handle.lock().identity.local_attempt_id;
             let body = controlled::guarded_body(&order, &order_hash, &signature, &amounts, expiration);
@@ -416,6 +428,7 @@ impl OrderVenue for PredictFunTrader {
                     controlled::created_order_metadata(&created, 0),
                 );
             }
+            timing::mark("posted");
             let mut ticket = OrderTicket {
                 token_id: planned.token_id.clone(),
                 maker_amount: amounts.maker_amount.to_string(),
@@ -1541,6 +1554,56 @@ pub(crate) mod tests {
         ) -> Result<String> {
             self.paths.lock().push(path.into());
             let mode = *self.mode.lock();
+            // A settled result zeroes a history-only claim: the venue stops
+            // listing the position while still reporting the result of it. A
+            // claimed win leaves the same history trace but pays out.
+            if matches!(mode, "history_settled_zero" | "history_settled_pending"
+                | "history_claimed_win" | "history_claimed_tie"
+                | "history_claimed_win_replaced") {
+                if path.starts_with("/positions?") {
+                    return Ok(json!({"data":[]}).to_string());
+                }
+                if path == "/markets/1" {
+                    let resolved = mode != "history_settled_pending";
+                    let winner = if mode == "history_claimed_win" { "WON" } else if mode == "history_settled_zero" { "LOST" } else { "WON" };
+                    let loser = if winner == "WON" { "LOST" } else { "WON" };
+                    // The replaced fixture reports outcomes the history never saw.
+                    let (yes_id, no_id) = if mode == "history_claimed_win_replaced" {
+                        ("99", "100")
+                    } else {
+                        ("77", "88")
+                    };
+                    return Ok(json!({"data":{
+                        "id":1,
+                        "question":"synthetic round",
+                        "tradingStatus": if resolved {"CLOSED"} else {"OPEN"},
+                        "isNegRisk":false,
+                        "isYieldBearing":false,
+                        "feeRateBps":0,
+                        "categorySlug":"sports",
+                        "status": if resolved {"RESOLVED"} else {"REGISTERED"},
+                        "marketVariant":"CRYPTO_UP_DOWN",
+                        "outcomes": if resolved {
+                            json!([{"onChainId":yes_id,"name":"Up","status":winner},
+                                   {"onChainId":no_id,"name":"Down","status":loser}])
+                        } else {
+                            json!([{"onChainId":"77","name":"Up"},{"onChainId":"88","name":"Down"}])
+                        }
+                    }}).to_string());
+                }
+                if path == "/categories/sports" {
+                    let variant = match mode {
+                        "history_settled_zero" => Some(90.0),
+                        "history_claimed_win" | "history_claimed_win_replaced" => Some(110.0),
+                        "history_claimed_tie" => Some(100.0),
+                        _ => None,
+                    };
+                    let variant = variant.map(|end| json!({"startPrice":100.0,"endPrice":end,
+                               "priceFeedSymbol":"BTCUSDT","priceFeedProvider":"CHAINLINK"}))
+                        .unwrap_or(Value::Null);
+                    return Ok(json!({"data":{"variantData":variant,"markets":[]}}).to_string());
+                }
+            }
             if mode == "get401"
                 && *method == Method::GET
                 && path.starts_with("/orders/")
@@ -1734,6 +1797,15 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .reconciled_orders = vec![hash.clone(), zero_hash.clone()];
+        // The pre-claim C0 of a claimed-payout fixture: the account's collateral
+        // after this fill is 95.38 USDT, and the net holding is 9.9 shares, so
+        // the declared budget is that minus the claim the official result pays
+        // (9.9 shares won, or 4.95 for a tie).
+        trader.run_context.write().as_mut().unwrap().budget_atoms = match mode {
+            "history_claimed_win" => Some(U256::from(85_480_000_000_000_000_000u128)),
+            "history_claimed_tie" => Some(U256::from(90_430_000_000_000_000_000u128)),
+            _ => None,
+        };
         if mode == "history_undeclared" {
             trader
                 .run_context

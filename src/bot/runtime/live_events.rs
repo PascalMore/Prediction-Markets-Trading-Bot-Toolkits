@@ -354,6 +354,55 @@ pub(super) fn prepare_reconciliation(
         })).map(Some)
 }
 
+/// `true` when the holding is settled: a zero write-off, or a claimed payout
+/// already received as exact cash. Anything else is still open risk.
+///
+/// A claim settles the holding only when it pays exactly what the confirmed
+/// official result owes: the same net inventory and the same claim value. A
+/// claim one atom off is an unexplained payout, not a settled holding.
+fn settled_holding(
+    inventory: U256,
+    credit: Option<(U256, U256)>,
+    outcome: Option<&super::live_control::LiveOutcome>,
+) -> bool {
+    credit.is_some_and(|(claimed, paid)| {
+        claimed == inventory
+            && outcome.is_some_and(|outcome| {
+                outcome.position_net_atoms == inventory
+                    && outcome.claim_value_atoms == Some(paid)
+            })
+    })
+        || outcome.is_some_and(|outcome| {
+            outcome.position_net_atoms == inventory
+                && outcome.claim_value_atoms == Some(U256::ZERO)
+        })
+}
+
+/// Prepare the payout record of a claim that became ledger cash.
+///
+/// The claim's cash is the venue's own read-back of the exact atoms it paid,
+/// so the record carries the received atoms and no transaction hash of its
+/// own: no redeem transaction is performed by this runtime.
+pub(super) fn prepare_claim_paid(
+    state: &crate::bot::runtime::State,
+    id: u64,
+    inventory: U256,
+    cash: U256,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<PreparedLiveEvent>, String> {
+    let run = state.live.controlled.as_ref().ok_or("CONTEXT_MISSING")?;
+    let record = state.live.attempts.get(&id).ok_or("UNBOUND_ATTEMPT")?.lock().clone();
+    let outcome = run.attempt_outcomes.get(&id).ok_or("CONTEXT_MISSING")?;
+    run.emitter.prepare(observed_at, Some(record.identity.market_id.to_string()),
+        Some(record.identity.token_id.clone()), &state_accounting(state),
+        LivePayload::Payout(PayoutPayload { status: "CASH_CONFIRMED".into(),
+            payout_yes: outcome.payout_yes, position_net_atoms: inventory.to_string(),
+            claim_value_atoms: Some(cash.to_string()),
+            cash_received_atoms: Some(cash.to_string()), tx_hash: None,
+            observed_at, reason: reason::NONE.into(),
+        })).map(Some)
+}
+
 /// Produce the one terminal live record from the original locked ledger.
 /// The operation-lane owner has already finished all bounded read-only work.
 pub(super) fn prepare_final(
@@ -381,13 +430,32 @@ pub(super) fn prepare_final(
         }
         let inventory = state.live.net_inventory.get(&id).copied().unwrap_or(U256::ZERO);
         if !inventory.is_zero() {
-            let zero_claim = run.attempt_outcomes.get(&id).is_some_and(|outcome|
-                outcome.position_net_atoms == inventory && outcome.claim_value_atoms == Some(U256::ZERO));
-            if !zero_claim { cash_complete = false; }
-            positions.push(LivePosition { market_id: record.identity.market_id.to_string(),
-                token: record.identity.token_id.clone(), net_shares_atoms: inventory.to_string(),
-                cost_atoms: if zero_claim { Some("0".into()) }
-                    else { state.live.net_cash.get(&id).map(|cash| cash.to_string()) } });
+            // A settled holding is not open risk: a zero write-off, or a
+            // claimed payout the confirmed result owes exactly.
+            let credit = state.live.claims.get(&id).copied();
+            let outcome = run.attempt_outcomes.get(&id);
+            let settled = settled_holding(inventory, credit, outcome);
+            if !settled {
+                cash_complete = false;
+                // An unsettled holding is open risk and stays in the terminal
+                // set unless the venue's own account read explains it as a
+                // claimed win: the same token with the same inventory. That
+                // claim is the only venue fact that removes a holding while
+                // leaving a residual (a claim that did not pay exactly), and
+                // the reader can reconcile the remainder only when the
+                // position is gone. Every other unsettled holding is retained.
+                let claimed = run.account_read.as_ref().is_some_and(|read| read
+                    .snapshot
+                    .claimed_win
+                    .iter()
+                    .any(|win| win.token == record.identity.token_id
+                        && win.inventory_atoms == inventory));
+                if !claimed {
+                    positions.push(LivePosition { market_id: record.identity.market_id.to_string(),
+                        token: record.identity.token_id.clone(), net_shares_atoms: inventory.to_string(),
+                        cost_atoms: state.live.net_cash.get(&id).map(|cash| cash.to_string()) });
+                }
+            }
         }
     }
     // An empty local ledger is not evidence of an empty authoritative account:

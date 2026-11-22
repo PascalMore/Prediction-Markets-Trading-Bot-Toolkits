@@ -12,8 +12,10 @@ use std::path::Path;
 use std::time::Instant;
 
 pub mod controlled_live;
+pub mod run_parameters;
 
 pub use controlled_live::ControlledLiveOptions;
+pub use run_parameters::{RunParameters, RunSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -44,6 +46,11 @@ pub struct AppConfig {
     /// run; present only in the controlled unsigned-paper configuration.
     #[serde(default)]
     pub controlled_paper: Option<ControlledPaperConfig>,
+
+    /// Opt-in public run settings: the budget and duration of a controlled
+    /// run. Absent in every legacy run, which keeps its historical values.
+    #[serde(default)]
+    pub controlled_run: Option<RunSettings>,
 
     /// The controlled run's identity and clock. Set by the launcher through the
     /// command line, never read from the public configuration file.
@@ -969,20 +976,48 @@ impl StrictJson {
         let limits = strategies
             .get("limits")
             .ok_or_else(|| anyhow::anyhow!("PUBLIC_CONFIG: strategy limits are required"))?;
-        for (name, expected) in [
-            ("max_order_usd", 2.0),
-            ("max_market_usd", 2.0),
-            ("max_total_usd", 10.0),
-            ("max_loss_usd", 20.0),
-        ] {
-            let value = limits.get(name).and_then(serde_json::Value::as_f64);
-            if value != Some(expected) {
-                bail!("PUBLIC_CONFIG: limits.{name} must be {expected}");
+        let positive = |value: &serde_json::Value| {
+            value.as_f64().filter(|number| number.is_finite() && *number > 0.0)
+        };
+        let mut caps = [0.0f64; 3];
+        for (slot, name) in caps.iter_mut().zip(["max_order_usd", "max_market_usd", "max_total_usd"]) {
+            *slot = limits
+                .get(name)
+                .and_then(&positive)
+                .ok_or_else(|| anyhow::anyhow!("PUBLIC_CONFIG: limits.{name} must be positive"))?;
+        }
+        if limits.get("max_loss_usd").and_then(&positive).is_none() {
+            bail!("PUBLIC_CONFIG: limits.max_loss_usd must be positive");
+        }
+        if unsigned {
+            // The controlled unsigned-paper run keeps its historical values.
+            for (name, expected) in [
+                ("max_order_usd", 1.0),
+                ("max_market_usd", 1.0),
+                ("max_total_usd", 10.0),
+                ("max_loss_usd", 20.0),
+            ] {
+                if limits.get(name).and_then(serde_json::Value::as_f64) != Some(expected) {
+                    bail!("PUBLIC_CONFIG: limits.{name} must be {expected}");
+                }
             }
         }
         let btc = strategies
             .get("btc_arb")
             .ok_or_else(|| anyhow::anyhow!("PUBLIC_CONFIG: btc_arb settings are required"))?;
+        let order = btc
+            .get("order_usd")
+            .and_then(&positive)
+            .ok_or_else(|| anyhow::anyhow!("PUBLIC_CONFIG: btc_arb.order_usd must be positive"))?;
+        if unsigned && order != 1.0 {
+            bail!("PUBLIC_CONFIG: btc_arb.order_usd must be 1");
+        }
+        // The signed branch accepts any positive, ordered bounds. The budget
+        // relation and the exact atom values are rechecked on the original
+        // tokens by `RunParameters::from_raw`, which is the only path to atoms.
+        if order > caps[0] || caps[0] > caps[1] || caps[1] > caps[2] {
+            bail!("PUBLIC_CONFIG: MONEY_RELATION");
+        }
         let symbols = btc
             .get("symbols")
             .and_then(serde_json::Value::as_array)
@@ -1010,13 +1045,6 @@ impl StrictJson {
             != Some(Self::REQUIRED_MIN_SECS_LEFT)
         {
             bail!("PUBLIC_CONFIG: btc_arb.min_secs_left must be 30");
-        }
-        let order = btc
-            .get("order_usd")
-            .and_then(serde_json::Value::as_f64)
-            .ok_or_else(|| anyhow::anyhow!("PUBLIC_CONFIG: btc_arb.order_usd is required"))?;
-        if order != 2.0 {
-            bail!("PUBLIC_CONFIG: btc_arb.order_usd must be 2");
         }
         Ok(())
     }
@@ -1205,8 +1233,8 @@ mod tests {
         value["bot"]["mock_trading"] = serde_json::json!(true);
         value["predict_fun"]["network"] = serde_json::json!("mainnet");
         value["strategies"]["limits"] = serde_json::json!({
-            "max_order_usd": 2.0,
-            "max_market_usd": 2.0,
+            "max_order_usd": 1.0,
+            "max_market_usd": 1.0,
             "max_total_usd": 10.0,
             "max_loss_usd": 20.0
         });
@@ -1214,7 +1242,7 @@ mod tests {
             "symbols": ["BTCUSDT"],
             "round_interval_secs": 300,
             "min_edge": 0.03,
-            "order_usd": 2.0,
+            "order_usd": 1.0,
             "min_secs_left": 30,
             "vol_floor": 0.00005
         });
@@ -1250,7 +1278,7 @@ mod tests {
         assert_eq!(paper.fee_model, "paper_net_shares");
         assert_eq!(cfg.strategies.limits.max_total_usd, 10.0);
         assert_eq!(cfg.strategies.limits.max_loss_usd, 20.0);
-        assert_eq!(cfg.strategies.btc_arb.order_usd, 2.0);
+        assert_eq!(cfg.strategies.btc_arb.order_usd, 1.0);
         // No credential was read: the wallet stays empty.
         assert!(cfg.credentials.private_key.is_empty());
     }
@@ -1422,11 +1450,11 @@ mod controlled_example_tests {
         let cfg = AppConfig::load_controlled_unsigned_paper(&path).unwrap();
         assert_eq!(cfg.venue, VenueId::PredictFun);
         assert!(!cfg.live_trading_allowed());
-        assert_eq!(cfg.strategies.limits.max_order_usd, 2.0);
-        assert_eq!(cfg.strategies.limits.max_market_usd, 2.0);
+        assert_eq!(cfg.strategies.limits.max_order_usd, 1.0);
+        assert_eq!(cfg.strategies.limits.max_market_usd, 1.0);
         assert_eq!(cfg.strategies.limits.max_total_usd, 10.0);
         assert_eq!(cfg.strategies.limits.max_loss_usd, 20.0);
-        assert_eq!(cfg.strategies.btc_arb.order_usd, 2.0);
+        assert_eq!(cfg.strategies.btc_arb.order_usd, 1.0);
         assert_eq!(cfg.strategies.btc_arb.round_interval_secs, Some(300));
         let paper = cfg.controlled_paper.expect("the opt-in is present");
         assert_eq!(paper.initial_cash, 100.0);

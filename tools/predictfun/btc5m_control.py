@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from contextlib import nullcontext
+from decimal import Decimal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,14 +44,20 @@ STRATEGY_CONTRACT = "phase1_net_shares"
 MODE_UNSIGNED_PAPER = "unsigned-paper"
 MODE_SIGNED_FUTURE_LIVE = "signed-future-live"
 RUN_SECONDS = 21_600
+# A launcher computes a frozen window's deadline from the moment it read its
+# script; the controller's own clock starts a little later. The configuration's
+# duration owns that window's start, and the clock may agree with it only this
+# closely: an older deadline would start a window that is already partly gone.
+EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-21-btc5m-stop-diagnostics/evidence/deployment/candidate/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "ad4207c2c3bb91f3731c19ffe3e9ac6c25f53b06bbd80b820ccb47d967ed1f37"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-22-btc5m-minimal-remediation/evidence/parameterization/candidate-r13d/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "fcfbdab52a765872d8e363fb3e151f9240800fc29efb6fa4065ced5e9f06d3c8"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
+    "src/bot/runtime/timing.rs",
     "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/channel.rs",
     "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/live_accounting.rs",
     "src/bot/runtime/live_control/tests/live003_regression.rs",
@@ -62,6 +69,11 @@ LIVE_PATHS = (
     "tools/predictfun/btc5m_live_events.py", "tools/predictfun/btc5m_live_guard.py",
     "tools/predictfun/tests/test_btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_guard.py",
     "tools/predictfun/local_signer.py", "tools/predictfun/README.md", "docs/LIVE-TRADING.md",
+    # Run-parameter surface: the parser, the generic launcher and their tests are
+    # part of what a live run's frozen identity must bind.
+    "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs",
+    "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py",
+    "tools/predictfun/tests/test_btc5m_parameterization.py",
     "Cargo.toml", "Cargo.lock",
 )
 CLEANUP_SECONDS = 30
@@ -131,13 +143,18 @@ class _Duration(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Define the fixed public interface: a mode, a config and a run id."""
+    """Define the fixed public interface: a mode, a config, a run id and the
+    operator's own declarations about history they have explained."""
     parser = _Parser(prog="btc5m_control", allow_abbrev=False)
     parser.add_argument("--mode", choices=(MODE_UNSIGNED_PAPER, MODE_SIGNED_FUTURE_LIVE),
                         required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--predict-budget-confirmation")
+    # A historical order hash a human says they explained. Repeatable, and
+    # valid only inside a signed live run: it is the child's own input.
+    parser.add_argument("--predict-reconciled-order", action="append", metavar="HASH",
+                        default=None)
     parser.add_argument("--predict-rpc-url")
     parser.add_argument("--post-entry-observer", action="store_true")
     parser.set_defaults(duration_supplied=False)
@@ -304,24 +321,129 @@ def check_fixed_values(data: dict[str, Any], mode: str) -> None:
     limits = strategies.get("limits")
     if not isinstance(limits, dict):
         raise Refused("PUBLIC_CONFIG", "config", "LIMITS")
-    for name, expected in (("max_order_usd", 2.0), ("max_market_usd", 2.0),
-                           ("max_total_usd", 10.0), ("max_loss_usd", 20.0)):
-        value = limits.get(name)
-        if not _finite(value) or float(value) != expected:
-            raise Refused("PUBLIC_CONFIG", "config", "LIMITS")
+    caps = []
+    for name in ("max_order_usd", "max_market_usd", "max_total_usd"):
+        caps.append(_positive(limits.get(name), "LIMITS"))
+    _positive(limits.get("max_loss_usd"), "LIMITS")
+    settings = data.get("controlled_run")
+    if settings is not None and type(settings) is not dict:
+        raise Refused("PUBLIC_CONFIG", "config", "CONTROLLED_RUN")
+    if settings is not None and mode == MODE_UNSIGNED_PAPER:
+        # The parameterized entry is a signed live run, never a paper one.
+        raise Refused("PUBLIC_CONFIG", "config", "CONTROLLED_RUN")
+    if mode == MODE_UNSIGNED_PAPER:
+        # The controlled unsigned-paper run keeps its historical values.
+        for name, expected in (("max_order_usd", 1.0), ("max_market_usd", 1.0),
+                               ("max_total_usd", 10.0), ("max_loss_usd", 20.0)):
+            if float(limits[name]) != expected:
+                raise Refused("PUBLIC_CONFIG", "config", "LIMITS")
     btc = strategies.get("btc_arb")
     if not isinstance(btc, dict):
         raise Refused("PUBLIC_CONFIG", "config", "BTC_ARB")
+    order = _positive(btc.get("order_usd"), "PARAMETERS")
+    if mode == MODE_UNSIGNED_PAPER and float(order) != 1.0:
+        raise Refused("PUBLIC_CONFIG", "config", "PARAMETERS")
+    if not float(order) <= caps[0] <= caps[1] <= caps[2]:
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_RELATION")
+    if settings is not None:
+        parameters(data)
     if btc.get("symbols") != ["BTCUSDT"]:
         raise Refused("PUBLIC_CONFIG", "config", "SYMBOLS")
     if type(btc.get("round_interval_secs")) is not int or btc.get("round_interval_secs") != 300:
         raise Refused("PUBLIC_CONFIG", "config", "ROUND_INTERVAL")
-    for name, expected in (("min_edge", 0.03), ("vol_floor", 0.00005), ("order_usd", 2.0)):
+    for name, expected in (("min_edge", 0.03), ("vol_floor", 0.00005)):
         value = btc.get(name)
         if not _finite(value) or float(value) != expected:
             raise Refused("PUBLIC_CONFIG", "config", "PARAMETERS")
     if type(btc.get("min_secs_left")) is not int or btc.get("min_secs_left") != 30:
         raise Refused("PUBLIC_CONFIG", "config", "PARAMETERS")
+
+
+def _positive(value: Any, reason: str) -> float:
+    """One strictly positive, finite public number, or a refusal."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not _finite(value):
+        raise Refused("PUBLIC_CONFIG", "config", reason)
+    if value <= 0:
+        raise Refused("PUBLIC_CONFIG", "config", reason)
+    return float(value)
+
+
+def _money_atoms(value: Any) -> int:
+    """The exact atoms of a public money value, or a refusal.
+
+    Only the shortest decimal text is read, so no float multiply decides a
+    spendable amount; more than six decimals or a non-positive value refuse.
+    """
+    if not _finite(value):
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
+    try:
+        amount = Decimal(str(value))
+    except (ValueError, ArithmeticError):
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION") from None
+    if amount <= 0 or amount.as_tuple().exponent < -6 or amount > Decimal(10) ** 9:
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
+    return int(amount * (Decimal(10) ** 18))
+
+
+def _budget_atoms(value: Any) -> int:
+    """The budget's exact atoms: a decimal string (≤18 places) or a number (≤6).
+
+    A string is the only form that can state a budget at atom precision, for
+    example a post-claim balance of ``98.148096491228070176``; it is read as a
+    plain decimal with ``Decimal``, never through a float. A string with a sign,
+    an exponent, a trailing dot or more than eighteen fractional digits is a
+    refusal, never a truncation or a rounding.
+    """
+    if not isinstance(value, str):
+        return _money_atoms(value)
+    whole, dot, fraction = value.partition(".")
+    if (not whole.isdigit() or not whole or len(fraction) > 18
+            or (dot and not fraction.isdigit())):
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
+    amount = Decimal(value)
+    if amount <= 0 or amount > Decimal(10) ** 9:
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
+    return int(amount * (Decimal(10) ** 18))
+
+
+def parameters(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The frozen money and duration this public configuration declares.
+
+    A legacy file declares none and keeps the historical values; the
+    parameterized entry declares all of them, and its relation
+    `target<=order<=market<=total<=budget` must hold exactly.
+    """
+    settings = data.get("controlled_run")
+    if settings is None:
+        return None
+    if not isinstance(settings, dict) or set(settings) != {"budget_usdt", "duration_seconds",
+                                                          "operations_mode"}:
+        raise Refused("PUBLIC_CONFIG", "config", "CONTROLLED_RUN")
+    mode = settings["operations_mode"]
+    seconds = settings["duration_seconds"]
+    if mode not in {"supervised", "unattended"} or type(seconds) is not int or isinstance(seconds, bool):
+        raise Refused("PUBLIC_CONFIG", "config", "CONTROLLED_RUN")
+    if not 0 < seconds <= (21_600 if mode == "supervised" else 86_400):
+        raise Refused("PUBLIC_CONFIG", "config", "DURATION")
+    strategies = data.get("strategies")
+    if not isinstance(strategies, dict):
+        raise Refused("PUBLIC_CONFIG", "config", "STRATEGIES")
+    try:
+        limits = strategies["limits"]
+        btc = strategies["btc_arb"]
+        result = {"budget": _budget_atoms(settings["budget_usdt"]),
+                  "target": _money_atoms(btc["order_usd"]),
+                  "order": _money_atoms(limits["max_order_usd"]),
+                  "market": _money_atoms(limits["max_market_usd"]),
+                  "total": _money_atoms(limits["max_total_usd"]),
+                  "loss": _money_atoms(limits["max_loss_usd"]),
+                  "duration": seconds, "operations_mode": mode}
+    except (KeyError, TypeError):
+        raise Refused("PUBLIC_CONFIG", "config", "CONTROLLED_RUN") from None
+    if not (result["target"] <= result["order"] <= result["market"]
+            <= result["total"] <= result["budget"]):
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_RELATION")
+    return result
 
 
 def _parse_api_source(text: str) -> str:
@@ -494,9 +616,11 @@ def start_evidence(directory: Path, run_id: str, started_at: str, deadline_at: s
         "candidate_identity": identity,
         "public_config_identity": {
             "sha256": config_sha,
+            # The paper window is funded from its own simulated cash (100); the
+            # signed window's budget (98) is written by run_live below.
             "initial_cash": 100 if mode == MODE_UNSIGNED_PAPER else None,
-            "max_order_usd": 2,
-            "max_market_usd": 2,
+            "max_order_usd": 1,
+            "max_market_usd": 1,
             "max_total_usd": 10,
             "max_loss_usd": 20,
         },
@@ -696,7 +820,7 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
     # decision has already reached its terminal event.
     relations = _EventRelations()
     run_seconds = RUN_SECONDS if run_seconds is None else run_seconds
-    from btc5m_live_events import LiveEventStore
+    from btc5m_live_events import LiveEventStore, LiveInvalid
     live = isinstance(evidence, LiveEventStore)
     paper72 = not live and evidence.mode == MODE_UNSIGNED_PAPER and run_seconds == PAPER72_SECONDS
     line_limit = PAPER72_FINAL_BYTES if paper72 else MAX_LINE_BYTES
@@ -717,13 +841,45 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
         if signum is None:
             final = None
         facts["launcher_exit"] = 128 + signum if signum else 1
-        facts["stop_reason"] = "SIGNAL" if signum else reason
+        cause = "SIGNAL" if signum else reason
+        # The cause that stopped the run stands: output that only arrives after
+        # it is a consequence of the stop, never a cause of it, so an ambiguous
+        # audit failure can never be rewritten as OUTPUT_INVALID (or the other
+        # way round) by a later stop.
+        if facts["stop_reason"] is None:
+            facts["stop_reason"] = cause
+            # This run stopped on its own output only when that output is the
+            # one cause. The marker is the single write-through condition and
+            # cannot be set or moved by anything that follows it.
+            if cause == "OUTPUT_INVALID":
+                facts["output_invalid_origin"] = True
         proposed = boottime() + CLEANUP_SECONDS
         cleanup_at = min(cleanup_at, proposed) if cleanup_at is not None else proposed
         if process.stdin and not process.stdin.closed:
             process.stdin.close()
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
+
+    # The first fragment that stops a live run is the only output that
+    # explains the stop, and the one piece that never reaches the evidence by
+    # itself. It is remembered here, redacted at write time, and written
+    # before the run's terminal record; later fragments are its consequences.
+    stopped: dict[str, Any] | None = None
+
+    def keep_stopped(stream, raw):
+        """Keep the first stopping fragment of a live run, before it is dropped."""
+        nonlocal stopped
+        if stopped is not None or not live:
+            return
+        if facts["stop_reason"] not in (None, "OUTPUT_INVALID"):
+            # The run already stopped for another cause: this fragment is one
+            # consequence of that stop, never the fragment that explains it.
+            return
+        stopped = {"stream": "stdout" if stream is process.stdout else "stderr",
+                   "raw": bytes(raw),
+                   "newline_terminated": bytes(raw).endswith(b"\n"),
+                   "occurred_at": datetime.datetime.now(datetime.timezone.utc)
+                   .isoformat(timespec="milliseconds").replace("+00:00", "Z")}
 
     def drain_observer():
         """Read at most one observation frame, after the trading stream.
@@ -809,6 +965,7 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                     if not chunk:
                         selector.unregister(stream)
                         if buffers[stream] or stream in dropping:
+                            keep_stopped(stream, buffers[stream])
                             stop()
                         continue
                     for fragment in chunk.splitlines(keepends=True):
@@ -818,6 +975,7 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                                      and buffers[stream].startswith(EVENT_PREFIX.encode()) else MAX_LINE_BYTES)
                             if len(buffers[stream]) > limit:
                                 dropping.add(stream)
+                                keep_stopped(stream, buffers[stream])
                                 buffers[stream].clear()
                                 stop()
                         if fragment.endswith(b"\n"):
@@ -834,8 +992,16 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                                     raise ValueError("OUTPUT_INVALID")
                                 if live:
                                     if stream is not process.stdout:
+                                        keep_stopped(stream, raw)
                                         raise ValueError("OUTPUT_INVALID")
-                                    event = evidence.append(raw, acknowledge)
+                                    try:
+                                        event = evidence.append(raw, acknowledge)
+                                    except LiveInvalid as error:
+                                        # Only the store's refusal of this line
+                                        # makes it the reason the run stops.
+                                        if error.reason == "OUTPUT_INVALID":
+                                            keep_stopped(stream, raw)
+                                        raise
                                     facts["events"] += 1
                                     if event["event_kind"] == "final":
                                         final = event
@@ -906,6 +1072,15 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                 facts["stop_reason"] = "REAP_TIMEOUT"
         facts["child_returncode"] = process.returncode
         facts["child_signal"] = -process.returncode if process.returncode is not None and process.returncode < 0 else None
+        if stopped is not None:
+            # The fragment is written first: the terminal record that says the
+            # run stopped on its own output must be able to say what it was.
+            # A failed write never becomes the reason the run stopped.
+            try:
+                write_stop_output(evidence, stopped, facts)
+                facts["stop_output"] = "WRITTEN"
+            except (OSError, ValueError):
+                facts.update(launcher_exit=1, stop_output="WRITE_FAILED")
         for stream in (process.stdout, process.stderr):
             stream.close()
         selector.close()
@@ -1637,6 +1812,54 @@ def _check_decision_formulas(decision: dict[str, Any]) -> None:
                 check("execution_edge", executed_ev / shares)
 
 
+# --- The fragment that stopped the run ---------------------------------------
+# A stopped run's evidence says it stopped; the fragment it stopped on is the
+# one piece of child output that never reaches that evidence. It is kept, but
+# only redacted and only to a bound: the launcher never writes raw child bytes.
+STOP_OUTPUT_SCHEMA = "btc5m-stop-output/1"
+STOP_OUTPUT_LIMIT = 2048
+REDACTED = "<REDACTED>"
+# The names this project already refuses in public input, plus the usual token
+# spellings: a value that follows one of them is never kept.
+_SECRET_NAMES = tuple(sorted({name.lower() for name in FORBIDDEN_ENV} | {
+    "api_key", "api_passphrase", "api_secret", "authorization", "credentials", "jwt",
+    "mnemonic", "password", "predict_api_key", "predict_jwt", "private_key", "seed",
+    "signature", "token"}))
+_SECRET_PAIR = re.compile(
+    r"(?i)\b(" + "|".join(re.escape(name) for name in _SECRET_NAMES) + r")\b"
+    r"(\"?\s*[:=]\s*)(?:bearer\s+)?(\"[^\"]*\"|'[^']*'|[^\s,;}\]\"']+)")
+_SECRET_URI = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s\"'<>]+")
+_SECRET_BEARER = re.compile(r"(?i)\bbearer\b\s+\S+")
+# A bare 64-hex token is a private key; a 0x-prefixed hash is public and stays.
+_SECRET_HEX = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{64}(?![0-9A-Za-z])")
+
+
+def redact_output(text: str) -> str:
+    """Replace every secret-shaped token before a fragment is kept."""
+    text = _SECRET_URI.sub(REDACTED, text)
+    text = _SECRET_PAIR.sub(lambda match: match.group(1) + match.group(2) + REDACTED, text)
+    text = _SECRET_BEARER.sub("Bearer " + REDACTED, text)
+    return _SECRET_HEX.sub(REDACTED, text)
+
+
+def stop_output_record(fragment: dict[str, Any], facts: dict[str, Any],
+                       run_id: str) -> dict[str, Any]:
+    """Describe one stopped fragment: its stream, its size and what it said."""
+    text = redact_output(fragment["raw"].decode("utf-8", "backslashreplace"))
+    return {"schema_version": STOP_OUTPUT_SCHEMA, "run_id": run_id,
+            "stream": fragment["stream"], "bytes": len(fragment["raw"]),
+            "newline_terminated": fragment["newline_terminated"],
+            "truncated": len(text) > STOP_OUTPUT_LIMIT, "text": text[:STOP_OUTPUT_LIMIT],
+            "occurred_at": fragment["occurred_at"], "child_returncode": facts["child_returncode"]}
+
+
+def write_stop_output(store: Any, fragment: dict[str, Any], facts: dict[str, Any]) -> None:
+    """Create this run's stop-output record once, before its terminal record."""
+    import btc5m_live_events as live
+    record = stop_output_record(fragment, facts, store.started["run_id"])
+    live._create_file(store.directory / "stop-output.json", live.canonical(record) + b"\n")
+
+
 def finish_live_evidence(store: Any, facts: dict[str, Any], final: dict[str, Any] | None) -> None:
     """Record native exits and the producer's independent completeness flags."""
     import btc5m_live_events as live
@@ -1661,12 +1884,23 @@ def finish_live_evidence(store: Any, facts: dict[str, Any], final: dict[str, Any
         reason = "PROCESS_FAILED"
     elif not all(flags[key] for key in ("execution_complete", "cash_complete", "audit_complete")):
         reason = "FACT_INCOMPLETE"
-    store.finish({"schema_version": live.SCHEMA_VERSION, "run_id": store.started["run_id"],
-                  "exit_facts": native, "final_event_seq": final["event_seq"] if final else None,
-                  "final_accounting": final["accounting"] if final else None,
-                  "incomplete_reason": reason,
-                  # The producer's own failure code, when it stopped with one.
-                  "incomplete_detail": payload.get("stop_detail"), **flags})
+    ended = {"schema_version": live.SCHEMA_VERSION, "run_id": store.started["run_id"],
+             "exit_facts": native, "final_event_seq": final["event_seq"] if final else None,
+             "final_accounting": final["accounting"] if final else None,
+             "incomplete_reason": reason,
+             # The producer's own failure code, when it stopped with one.
+             "incomplete_detail": payload.get("stop_detail"), **flags}
+    if store.failed and not facts.get("output_invalid_origin"):
+        # An ambiguous audit write is never repaired into a healthy ending.
+        raise live.LiveInvalid("AUDIT_UNAVAILABLE")
+    if store.failed:
+        # Only a refused output line failed this store: that line was never
+        # appended, so the tail is intact and the same record is written
+        # through the store's own checks; its guard is left failing.
+        live.check_ended(ended, store.started, store.relations)
+        live._create_file(store.directory / "ended.json", live.canonical(ended) + b"\n")
+        return
+    store.finish(ended)
 
 
 def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[str, str],
@@ -1683,11 +1917,33 @@ def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[s
     final = None
     try:
         deadline = live.timestamp(args.deadline_at)
-        if not datetime.timedelta(0) < deadline - started_at <= datetime.timedelta(seconds=RUN_SECONDS):
+        frozen = parameters(data)
+        if frozen is not None:
+            # The configuration owns the window: a supplied duration or a
+            # different mode is a conflict, never an override.
+            if args.duration_supplied or args.operations_mode != frozen["operations_mode"]:
+                raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
+            # The launcher can only compute the deadline from the moment it read
+            # its script, so this process's clock always starts a little after
+            # the frozen window did. The declared duration therefore fixes the
+            # start, and the clock must agree with it to within the accepted
+            # skew; any larger difference is a stale deadline, still refused.
+            effective_start = deadline - datetime.timedelta(seconds=frozen["duration"])
+            if abs((started_at - effective_start).total_seconds()) > EFFECTIVE_START_SKEW_SECONDS:
+                raise Refused("CONTROLLED_MODE", "args", "DEADLINE")
+            started_at = effective_start
+        if not live.activation_window_allowed(args.operations_mode, deadline - started_at):
             raise Refused("CONTROLLED_MODE", "args", "DEADLINE")
         for value in (args.risk_window_id, args.authorization_ref):
             if RUN_ID_PATTERN.fullmatch(value) is None:
                 raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
+        # Each declared hash is the child's own form, checked with the consumer's
+        # own hash rule: one bad declaration refuses the run, never half of it.
+        for value in args.predict_reconciled_order or ():
+            try:
+                live._scalar(value, "hash")
+            except live.LiveInvalid:
+                raise Refused("CONTROLLED_MODE", "args", "BAD_ARGUMENTS") from None
         local_signer._check_environment(environment)
         identity = public_identity(environment, live=True)
         if os.path.lexists(BOT / "tools/predictfun/.keyring-no-credentials"):
@@ -1695,6 +1951,17 @@ def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[s
         activation = live.strict_json(live._read_file(guard.ACTIVATION_PATH, MAX_LINE_BYTES))
         started_text = started_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
         deadline_text = args.deadline_at
+        limits = data["strategies"]["limits"]
+        # The identity is read from the same configuration the child will read;
+        # a legacy file keeps the historical values it always wrote.
+        frozen_public = {"initial_cash": 98, "max_order_usd": 1, "max_market_usd": 1,
+                         "max_total_usd": 10, "max_loss_usd": 20}
+        if frozen is not None:
+            frozen_public.update(initial_cash=data["controlled_run"]["budget_usdt"],
+                                 max_order_usd=limits["max_order_usd"],
+                                 max_market_usd=limits["max_market_usd"],
+                                 max_total_usd=limits["max_total_usd"],
+                                 max_loss_usd=limits["max_loss_usd"])
         started = {"schema_version": live.SCHEMA_VERSION, "strategy_contract": args.live_contract,
                    "operations_mode": args.operations_mode, "risk_window_id": args.risk_window_id,
                    "account_identity": activation["account_identity"], "authorization_ref": args.authorization_ref,
@@ -1704,8 +1971,7 @@ def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[s
                    "run_id": args.run_id, "started_at": started_text, "deadline_at": deadline_text,
                    "candidate_identity": identity,
                    "public_config_identity": {"sha256": hashlib.sha256(live.canonical(data)).hexdigest(),
-                                              "initial_cash": 100, "max_order_usd": 2, "max_market_usd": 2,
-                                              "max_total_usd": 10, "max_loss_usd": 20}}
+                                              **frozen_public}}
         context = {key: started[key] for key in set(live.CONTEXT_KEYS.split()) & set(started)}
         context.update(schema_version="btc5m-live-context/1", candidate_digest=live.candidate_digest(started),
                        gas_policy=activation["gas_policy"])
@@ -1732,6 +1998,11 @@ def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[s
                         "--controlled-risk-window-id", args.risk_window_id,
                         "--controlled-authorization-ref", args.authorization_ref,
                         "--controlled-live-manifest", str(directory / "live-context.json")]
+        # The operator's declarations travel to the child verbatim and in the
+        # order they were given; with none, the command line is unchanged.
+        if args.predict_reconciled_order:
+            command[1:1] = [item for value in args.predict_reconciled_order
+                            for item in ("--predict-reconciled-order", value)]
         seconds = (deadline - started_at).total_seconds()
         if max(boottime() - started_boot,
                (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds()) >= seconds:
@@ -1755,9 +2026,9 @@ def run_live(args: argparse.Namespace, data: dict[str, Any], environment: dict[s
         try:
             if store is not None:
                 try:
-                    # A corrupt/ambiguous write must not be repaired into a healthy ending.
-                    if not store.failed:
-                        finish_live_evidence(store, facts, final)
+                    # Every route that stops the run still gets its ending; a
+                    # corrupt/ambiguous audit write is never repaired into one.
+                    finish_live_evidence(store, facts, final)
                 finally:
                     store.close()
         except (OSError, ValueError):
@@ -1784,6 +2055,14 @@ def run(argv: list[str] | None = None, *, environment: dict[str, str] | None = N
     if new_live and (unsigned or not all(value is not None for value in live_options)
                      or args.duration_supplied or args.post_entry_observer):
         raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
+    # Declaring an explained historical order is a live-only act: a paper
+    # ledger has no such history, and the declaration needs the live run whose
+    # account it explains. Silence is never reinterpreted as a declaration.
+    if args.predict_reconciled_order:
+        if unsigned:
+            raise Refused("CONTROLLED_MODE", "args", "LIVE_OPTION_REFUSED")
+        if not new_live:
+            raise Refused("CONTROLLED_MODE", "args", "LIVE_CONTEXT")
     paper72 = args.duration_hours == 72
     if paper72 and not unsigned:
         raise Refused("CONTROLLED_MODE", "args", "DURATION_REFUSED")

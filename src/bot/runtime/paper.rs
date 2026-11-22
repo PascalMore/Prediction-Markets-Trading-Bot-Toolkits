@@ -686,8 +686,17 @@ impl super::Broker {
     pub(super) async fn wait_controlled_stop(&self) {
         loop {
             let notified = self.control_changed.notified();
-            if self.entry_stop_reason().is_some()
-                || self.state.lock().live.controlled.as_ref().is_some_and(|run| !run.may_add_risk())
+            let live_stopped = {
+                let mut state = self.state.lock();
+                // Poll existing exposure, not valuation/completeness: an accepted
+                // in-flight partial read below the cap retains its original policy.
+                if let Some(now) = state.live.controlled.as_ref()
+                    .and_then(|run| run.phase1.clock.now().ok()) {
+                    super::live_control::refresh_live_exposure(&mut state, now.utc);
+                }
+                state.live.controlled.as_ref().is_some_and(|run| !run.may_add_risk())
+            };
+            if self.entry_stop_reason().is_some() || live_stopped
             {
                 return;
             }

@@ -114,6 +114,10 @@ pub struct ControlledLiveState {
     pub output_failed: Arc<AtomicBool>,
     /// Latest complete official read tied to the ledger version it reconciled.
     pub account_read: Option<LiveAccountRead>,
+    /// Cash the opening account read already held as claimed payouts. The
+    /// declared budget stays the pre-claim C0, so the opening projection adds
+    /// exactly this verified credit instead of hiding it.
+    pub opening_claim_cash: U256,
     /// Receipt times of valid original-mid marks, invalidated on a bad book.
     pub mark_receipts: HashMap<String, crate::service::observation::CheckTime>,
     /// Monotone within this risk window; a recovered valuation cannot clear it.
@@ -292,6 +296,22 @@ enum PermitState {
     Consumed,
 }
 
+/// What a frozen input that no longer stands means at one check.
+///
+/// The same refusal is produced where the attempt is still `Prepared` and
+/// `NotSubmitted` and the send permission is still held — nothing can have
+/// left the process, so it ends this candidate only — and under the send
+/// permission, where the transport seam may already own the order: there the
+/// same change must stop the window. The recorded reason token is the same
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrozenInput {
+    /// This candidate is refused; its cash is released and the run goes on.
+    Candidate,
+    /// The window stops; the transport seam may already own the order.
+    Window,
+}
+
 impl LiveCandidateGuard {
     /// Build the guard of one attempt.
     pub fn new(
@@ -344,7 +364,9 @@ impl LiveCandidateGuard {
     }
 
     /// Recheck the actual core and original ledger without holding a lock over IO.
-    fn check_locked(&self, state: &mut State, bound: &SignedExecutionBound) -> Result<crate::bot::arbitrage::phase1::DecisionDiagnostic> {
+    fn check_locked(&self, state: &mut State, bound: &SignedExecutionBound,
+        frozen: FrozenInput,
+    ) -> Result<crate::bot::arbitrage::phase1::DecisionDiagnostic> {
         use super::live_accounting as accounting;
         use crate::service::venue::{AttemptPhase, Submission};
         use crate::bot::arbitrage::phase1::{recheck_diagnostic, Phase};
@@ -386,9 +408,10 @@ impl LiveCandidateGuard {
         let (cost, reserved) = risk.markets.get(&bound.market_id).copied().unwrap_or_default();
         let total = risk.cost.checked_add(risk.reserved).ok_or_else(|| anyhow::anyhow!("FACT_CONFLICT"))?;
         let market = cost.checked_add(reserved).ok_or_else(|| anyhow::anyhow!("FACT_CONFLICT"))?;
-        if record.r0 < U256::from(accounting::ONE) || record.r0 > accounting::max_order_atoms()
-            || market > accounting::max_market_atoms() || total > accounting::max_total_atoms()
-            || risk.reserved > accounting::budget_c0_atoms().checked_sub(risk.cost).unwrap_or(U256::ZERO)
+        let params = run.options.params;
+        if record.r0 < U256::from(accounting::MIN_ORDER_ATOMS) || record.r0 > params.order
+            || market > params.market || total > params.total
+            || risk.reserved > params.budget.checked_sub(risk.cost).unwrap_or(U256::ZERO)
             || read.snapshot.collateral_atoms.is_none_or(|cash| risk.reserved > cash)
         { bail!("SIGNED_BOUND_UNPROVEN"); }
         let gas = read.snapshot.gas_atoms.zip(state.live.baseline.as_ref().and_then(|snapshot| snapshot.gas_atoms))
@@ -399,7 +422,17 @@ impl LiveCandidateGuard {
         { bail!("GAS_UNAVAILABLE"); }
         let (diagnostic, checked) = recheck_diagnostic(candidate, now, Phase::FinalSend,
             run.phase1.min_edge, run.phase1.min_secs_left);
-        if checked.is_none() { bail!("INPUT_CHANGED"); }
+        if checked.is_none() {
+            // The frozen decision's own inputs (the book's and the spot's age,
+            // the edge, the round's remaining time) no longer stand. Before the
+            // send permission this is a refusal of this candidate only: the
+            // attempt is still `Prepared`/`NotSubmitted`, so the venue proved
+            // nothing was sent. Under the permission it stops the window.
+            return match frozen {
+                FrozenInput::Candidate => Err(crate::service::venue::CandidateRefused.into()),
+                FrozenInput::Window => bail!("INPUT_CHANGED"),
+            };
+        }
         let value = accounting::exact_floor_mul(bound.min_net_shares_atoms, candidate.fair())
             .ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN"))?;
         let edge = crate::service::predict_fun::controlled::cash_at_limit_atoms(
@@ -500,7 +533,10 @@ impl ControlledSendGuard for LiveCandidateGuard {
     fn check_facts(&self, bound: &SignedExecutionBound) -> anyhow::Result<()> {
         if let Some(binding) = &self.binding {
             let mut state = binding.state.lock();
-            self.check_locked(&mut state, bound)?;
+            // Nothing has been emitted for this order and no acknowledgement
+            // slot is waiting yet: a frozen input that no longer stands here is
+            // this candidate's refusal, and the transport never saw a byte.
+            self.check_locked(&mut state, bound, FrozenInput::Candidate)?;
             let mut prepared = self.bound.lock();
             if prepared.is_some() { bail!("INPUT_CHANGED"); }
             self.expect_hash(&bound.signed_hash);
@@ -556,7 +592,9 @@ impl ControlledSendGuard for LiveCandidateGuard {
             use super::live_events::{self, LivePayload, OrderPayload};
             let (event, channel) = {
                 let mut state = binding.state.lock();
-                self.check_locked(&mut state, bound)?;
+                // Still before the acknowledgement slot: a frozen input that
+                // no longer stands ends this candidate, not the window.
+                self.check_locked(&mut state, bound, FrozenInput::Candidate)?;
                 if self.bound.lock().as_ref() != Some(bound) { bail!("INPUT_CHANGED"); }
                 let run = state.live.controlled.as_ref().unwrap();
                 let now = run.phase1.clock.now()?;
@@ -579,7 +617,9 @@ impl ControlledSendGuard for LiveCandidateGuard {
             let started = std::time::Instant::now();
             loop {
                 let mut state = binding.state.lock();
-                self.check_locked(&mut state, bound)?;
+                // The acknowledgement slot is already waiting: nothing may be
+                // left dangling, so this change stops the window.
+                self.check_locked(&mut state, bound, FrozenInput::Window)?;
                 if channel.is_confirmed(seq, &bound.signed_hash) {
                     self.acked.store(true, Ordering::SeqCst);
                     break;
@@ -632,7 +672,7 @@ impl ControlledSendGuard for LiveCandidateGuard {
             if !Arc::ptr_eq(handle, &binding.handle) || !self.is_acked() { bail!("AUDIT_UNAVAILABLE"); }
             let bound = self.bound.lock().clone().ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN"))?;
             let mut state = binding.state.lock();
-            self.check_locked(&mut state, &bound)?;
+            self.check_locked(&mut state, &bound, FrozenInput::Window)?;
             // State remains locked while waiting for the account gate. Capture
             // accounting here (it reads attempt handles), but defer the core
             // clock/diagnostic to the callback inside the gate, before first poll.
@@ -777,6 +817,7 @@ impl ControlledLiveState {
             event_seq,
             output_failed,
             account_read: None,
+            opening_claim_cash: U256::ZERO,
             mark_receipts: HashMap::new(),
             loss_latched: false,
             loss_trigger: None,
@@ -817,6 +858,97 @@ impl ControlledLiveState {
 /// Capture the controlled clock at the official account response, before later awaits.
 pub(super) fn account_receipt(state: &State) -> Result<Option<crate::service::observation::CheckTime>> {
     state.live.controlled.as_ref().map(|run| run.phase1.clock.now()).transpose()
+}
+
+/// Credit one authoritative claimed payout and release the wait it caused.
+///
+/// The account read proves the claimed atoms arrived; this is the one place a
+/// claimed payout becomes ledger cash. But a claim is only cash when it pays
+/// exactly what the confirmed official result owes this ledger: the attempt's
+/// own net inventory and the payout the settlement recorded, atom for atom.
+/// The judgment comes first: a claim that is one atom off, an attempt whose
+/// result is not confirmed, or any other mismatch is not booked as cash at
+/// all — it waits for the official result, and the run stays stopped.
+///
+/// Returns the claim that became ledger cash, and whether this credit
+/// cleared a `CASH_PENDING` wait.
+pub(super) fn credit_claim(
+    state: &mut State, id: u64, inventory: U256, cash: U256,
+) -> (Option<(U256, U256)>, bool) {
+    use crate::bot::runtime::live_events::reason;
+    // The judgment gate: only a confirmed official result that owes exactly
+    // this claim may turn the claim into ledger cash.
+    let exact = state.live.controlled.as_ref().is_some_and(|run| {
+        run.attempt_outcomes.get(&id).is_some_and(|outcome| {
+            outcome.position_net_atoms == inventory && outcome.claim_value_atoms == Some(cash)
+        })
+    });
+    if !exact {
+        // Not cash yet: keep the proven claim apart from the ledger's cash.
+        state.live.pending_claims.insert(id, (inventory, cash));
+        return (None, false);
+    }
+    state.live.pending_claims.remove(&id);
+    state.live.claims.insert(id, (inventory, cash));
+    let Some(run) = state.live.controlled.as_mut() else { return (None, false); };
+    if let Some(outcome) = run.attempt_outcomes.get_mut(&id) {
+        outcome.cash_confirmed = true;
+    }
+    // Every holding with inventory must be settled by its own official result:
+    // a zero write-off, or this exact claimed cash. A holding without a
+    // confirmed result, or with a claim that doesn't pay it exactly, keeps the
+    // wait open whatever else landed.
+    let settled = {
+        let run = state.live.controlled.as_ref().unwrap();
+        state.live.net_inventory.iter().all(|(attempt, shares)| {
+            shares.is_zero() || run.attempt_outcomes.get(attempt).is_some_and(|outcome| {
+                outcome.position_net_atoms == *shares && match outcome.claim_value_atoms {
+                    Some(claim) if claim.is_zero() => true,
+                    Some(claim) => state.live.claims.get(attempt)
+                        .is_some_and(|(held, paid)| *held == *shares && *paid == claim),
+                    None => false,
+                }
+            })
+        })
+    };
+    if !settled { return (Some((inventory, cash)), false); }
+    let run = state.live.controlled.as_mut().unwrap();
+    let mut control = run.control.lock();
+    let open_wait = control.state == LiveRunState::WaitCash
+        && control.stop.as_ref().is_some_and(|stop| stop.reason == reason::CASH_PENDING);
+    if !open_wait { return (Some((inventory, cash)), false); }
+    control.state = LiveRunState::Ready;
+    control.stop = None;
+    drop(control);
+    // The wait is over, so a later stop of the same run is its own fact.
+    run.stop_event_emitted = false;
+    (Some((inventory, cash)), true)
+}
+
+/// Book a proven claim as ledger cash once the official result confirms it.
+///
+/// The account read proved the venue paid this claim. It becomes cash only
+/// when the confirmed official result owes exactly this amount; a claim one
+/// atom off stays unbooked and keeps the run waiting for the cash it is owed.
+///
+/// Returns `true` when this claim was booked.
+pub(super) fn promote_pending_claim(state: &mut State, id: u64, inventory: U256, cash: U256) -> bool {
+    if !state
+        .live
+        .pending_claims
+        .get(&id)
+        .is_some_and(|(held, paid)| *held == inventory && *paid == cash)
+    {
+        return false;
+    }
+    state.live.pending_claims.remove(&id);
+    state.live.claims.insert(id, (inventory, cash));
+    if let Some(run) = state.live.controlled.as_mut() {
+        if let Some(outcome) = run.attempt_outcomes.get_mut(&id) {
+            outcome.cash_confirmed = true;
+        }
+    }
+    true
 }
 
 /// Bind a complete reconciled account response to the same locked ledger version.
@@ -892,6 +1024,19 @@ pub(super) fn refresh_live_risk(state: &mut State) {
         run.stop("FACT_CONFLICT", true, now.utc);
     } else if accounting.status != AccountingStatus::Complete {
         run.stop("DATA_UNAVAILABLE", true, now.utc);
+    }
+    refresh_live_exposure(state, now.utc);
+}
+
+/// Check existing exposure only, without reclassifying an in-flight partial read.
+pub(super) fn refresh_live_exposure(state: &mut State, at: DateTime<Utc>) {
+    let Some(params) = state.live.controlled.as_ref().map(|run| run.options.params) else { return; };
+    // Proposed next orders are not part of the original ledger's risk.
+    if super::live_accounting::risk_exposure(&state.live).is_some_and(|risk|
+        risk.cost.saturating_add(risk.reserved) >= params.total)
+    {
+        state.live.controlled.as_mut().unwrap()
+            .stop_with_detail("MANUAL_STOP", "TOTAL_CAP", true, at);
     }
 }
 
@@ -1092,6 +1237,7 @@ mod tests {
             authorization_ref: "auth-1".into(),
             deadline_at: Utc::now() + chrono::Duration::seconds(3600),
             budget_secs: 3600,
+            params: crate::config::RunParameters::legacy(),
             gas_policy: GasPolicy {
                 payer_address: "0x1111111111111111111111111111111111111111".into(),
                 minimum_balance_atoms: U256::ZERO,

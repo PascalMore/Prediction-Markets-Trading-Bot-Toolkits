@@ -11,7 +11,7 @@
 //! candidate's identity and the guard that the venue must pass.
 
 use crate::bot::arbitrage::phase1::CandidateContext;
-use crate::bot::runtime::live::LiveState;
+use crate::bot::runtime::live::{self, LiveState};
 use crate::bot::runtime::live_control::{
     LiveCandidateGuard, LiveRunState, PendingLiveCandidate, RunControl,
 };
@@ -94,19 +94,63 @@ impl Broker {
         }
         let _completion = PendingCandidateCompletion { broker: self, candidate };
         let result = self.submit_live_candidate(market, _yes_book, candidate).await;
-        let stop_reason = match &result {
-            Err(error) => Some(preparation_reason(error)),
-            Ok(outcome) if outcome.attempt_id.is_none() => Some("FACT_INCOMPLETE"),
-            _ => None,
-        };
-        if let Some(reason) = stop_reason {
-            super::live_events::stop_on_lane(self, reason).map_err(anyhow::Error::msg)?;
+        match &result {
+            Err(error) => {
+                super::live_events::stop_on_lane(self, preparation_reason(error))
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(outcome) if outcome.attempt_id.is_none() => {
+                // Nothing was created, so nothing new may be at the venue: the
+                // block alone proves no unproven submission. Only an earlier
+                // accepted order whose facts have not arrived yet can still be
+                // unknown, and it is re-read here, bounded.
+                self.resolve_blocked_candidate(
+                    live::UNREAD_FACTS_BUDGET,
+                    live::UNREAD_FACTS_INTERVAL,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+            }
+            _ => {}
         }
         result
     }
 
+    /// Resolve a candidate that was blocked before any attempt existed.
+    ///
+    /// The one fact that can still be unproven is an order this window already
+    /// got accepted whose execution facts have not become visible. That order
+    /// is re-read through its existing execution read, bounded in time. When no
+    /// such order waits, or when the bound expires with the facts still
+    /// invisible, the run keeps its existing stop.
+    pub(super) async fn resolve_blocked_candidate(
+        &self,
+        budget: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> Result<(), String> {
+        if matches!(
+            live::re_read_unread_facts(self, budget, interval).await,
+            live::UnreadFacts::Resolved
+        ) {
+            return Ok(());
+        }
+        super::live_events::stop_on_lane(self, "FACT_INCOMPLETE")
+    }
+
     /// The submission body runs only with this run's lane and candidate completion held.
     async fn submit_live_candidate(
+        &self, market: &TradableMarket, _yes_book: &crate::models::BookSnapshot,
+        candidate: &CandidateContext,
+    ) -> anyhow::Result<LiveTakeOutcome> {
+        // One measured window per submission: inert unless YQUANT_TIMING=1.
+        super::timing::begin();
+        let result = self.submit_live_candidate_inner(market, _yes_book, candidate).await;
+        super::timing::finish();
+        result
+    }
+
+    /// The measured submission: reserve, prove, sign, acknowledge, send.
+    async fn submit_live_candidate_inner(
         &self, market: &TradableMarket, _yes_book: &crate::models::BookSnapshot,
         candidate: &CandidateContext,
     ) -> anyhow::Result<LiveTakeOutcome> {
@@ -121,6 +165,7 @@ impl Broker {
             return Ok(LiveTakeOutcome { result: TakeResult::Blocked(Blocked::DataIncomplete),
                 guard: None, attempt_id: None });
         }
+        super::timing::mark("pre_submit");
 
         // The reservation and the attempt are made under the broker's own
         // lock, exactly as the ordinary path does. No lock is held across the
@@ -212,6 +257,7 @@ impl Broker {
             run.traded.entry(market.id).or_insert_with(|| market.clone());
             (handle, attempt_id, reservation, intent_key)
         };
+        super::timing::mark("reserved");
         let reserve_event = {
             use super::live_events::{self, LivePayload, ReservationPayload};
             let state = self.state.lock();
@@ -224,6 +270,7 @@ impl Broker {
                 }))
         };
         reserve_event.and_then(|event| event.flush()).map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?;
+        super::timing::mark("reserve_event");
 
         // The guard is built from the run's own control block, so the stop
         // flag and the permission are the same state the broker reads.
@@ -267,12 +314,13 @@ impl Broker {
             Ok(ticket) => ticket,
             Err(error) => {
                 let event_reason = preparation_reason(&error);
-                // A candidate the venue refused before it could leave, and
-                // only because the fresh book no longer supports the frozen
-                // decision, ends this candidate — not the run. Its cash is
-                // released, the refusal is recorded and the window stays open;
-                // the pending candidate is cleared by the completion guard, so
-                // the same decision can never be taken twice.
+                // A candidate the venue refused while the request provably
+                // never left — the fresh book no longer supports the frozen
+                // decision, or those frozen inputs aged out at the last check —
+                // ends this candidate, not the run. Its cash is released, the
+                // refusal is recorded and the window stays open; the pending
+                // candidate is cleared by the completion guard, so the same
+                // decision can never be taken twice.
                 if error.downcast_ref::<crate::service::venue::CandidateRefused>().is_some() {
                     // Only a request that provably never left releases cash.
                     // The original hash/tombstone and any unknown risk survive.
@@ -348,7 +396,7 @@ impl Broker {
         market_id: u64,
         reservation: U256,
     ) -> Option<Blocked> {
-        use crate::bot::runtime::live_accounting::{budget_c0_atoms, check_caps, risk_exposure};
+        use crate::bot::runtime::live_accounting::{check_caps, risk_exposure};
         crate::bot::runtime::live_control::refresh_live_risk(state);
         // Only the lifecycle part of ordinary check_entry applies here. Its
         // float minimum/caps cannot validate an atom-denominated live budget.
@@ -387,15 +435,16 @@ impl Broker {
         }
         let Some(exposure) = risk_exposure(&state.live) else { return Some(Blocked::DataIncomplete); };
         let Some(official_cash) = read.snapshot.collateral_atoms else { return Some(Blocked::DataIncomplete); };
+        let params = controlled.options.params;
         let applied_cash = state.live.net_cash.values().try_fold(U256::ZERO, |total, cash| total.checked_add(*cash));
-        let available = applied_cash.and_then(|spent| budget_c0_atoms().checked_sub(spent))
+        let available = applied_cash.and_then(|spent| params.budget.checked_sub(spent))
             .and_then(|cash| cash.checked_sub(exposure.reserved))
             .zip(official_cash.checked_sub(exposure.reserved))
             .map(|(budget, official)| budget.min(official));
         let (cost, reserved) = exposure.markets.get(&market_id).copied().unwrap_or_default();
-        let caps = check_caps(reservation, cost, reserved, exposure.cost, exposure.reserved,
+        let caps = check_caps(&params, reservation, cost, reserved, exposure.cost, exposure.reserved,
             available.unwrap_or(U256::ZERO));
-        if reservation < U256::from(crate::bot::runtime::live_accounting::ONE) {
+        if reservation < U256::from(crate::bot::runtime::live_accounting::MIN_ORDER_ATOMS) {
             Some(Blocked::BelowMinimum)
         } else if !caps.order_ok { Some(Blocked::OrderCap)
         } else if !caps.market_ok { Some(Blocked::MarketCap)

@@ -234,14 +234,15 @@ async fn main() -> Result<()> {
     for hash in &cli.predict_reconciled_order {
         predict_fun::account::validate_order_hash(hash)?;
     }
-    let run_context = predict_fun::account::RunContext {
+    let mut run_context = predict_fun::account::RunContext {
         confirmation,
         reconciled_orders: cli.predict_reconciled_order,
         rpc_url,
+        budget_atoms: None,
     };
 
-    let mut cfg = match &controlled {
-        Some(run) => {
+    let mut cfg = match controlled.clone() {
+        Some(mut run) => {
             // Only the fixed strategy may run in a controlled mode, and only
             // with the controlled configuration.
             if !matches!(
@@ -283,6 +284,22 @@ async fn main() -> Result<()> {
                 anyhow::bail!("CONTROLLED_MODE: LIVE_OPTION_REFUSED");
             }
             let mut cfg = AppConfig::load_controlled(&cli.config, run.mode)?;
+            // A parameterized live run binds its frozen money and duration from
+            // the same public file the checks above read. Legacy files keep the
+            // historical values, exactly as before.
+            if let Some(options) = run.live.as_mut() {
+                use polymarket_toolkits::config::RunParameters;
+                let raw = std::fs::read_to_string(&cli.config)
+                    .map_err(|_| anyhow::anyhow!("PUBLIC_CONFIG"))?;
+                if let Some(settings) = RunParameters::declared_settings(&raw)? {
+                    if settings.duration_seconds != options.budget_secs as u64
+                        || settings.operations_mode != options.operations_mode.as_str()
+                    {
+                        anyhow::bail!("CONTROLLED_MODE: LIVE_CONTEXT");
+                    }
+                    options.params = RunParameters::from_raw(&raw)?;
+                }
+            }
             cfg.controlled_live = run.live.clone();
             cfg.controlled = Some(run.clone());
             cfg
@@ -292,6 +309,13 @@ async fn main() -> Result<()> {
     if let Some(venue) = cli.venue {
         cfg.venue = venue.into();
     }
+    // The declared C0 of a parameterized live run is the pre-claim cash a
+    // claimed payout must explain atom-for-atom. Legacy runs declare none, so a
+    // history-only winner there stays unexplained.
+    run_context.budget_atoms = cfg
+        .controlled_live
+        .as_ref()
+        .map(|options| options.params.budget);
 
     info!(
         venue = ?cfg.venue,

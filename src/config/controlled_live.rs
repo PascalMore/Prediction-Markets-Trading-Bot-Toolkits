@@ -22,8 +22,6 @@ pub const RECOVERY_POLICY: &str = "COLD_START_REFUSE";
 pub const CASH_RECOVERY_POLICY: &str = "MANUAL_PAUSE";
 /// The activation file's schema version.
 pub const ACTIVATION_SCHEMA: &str = "btc5m-live-activation/1";
-/// The longest a controlled live run may be allowed to take.
-pub const LIVE_MAX_SECS: i64 = 21_600;
 
 /// How the run is staffed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +33,15 @@ pub enum OperationsMode {
 }
 
 impl OperationsMode {
+    /// The positive, inclusive authorization window for this staffing mode.
+    pub fn allows_duration(self, duration: chrono::Duration) -> bool {
+        let maximum = match self {
+            Self::Supervised => 21_600,
+            Self::Unattended => 86_400,
+        };
+        duration > chrono::Duration::zero() && duration <= chrono::Duration::seconds(maximum)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             OperationsMode::Supervised => "supervised",
@@ -69,6 +76,9 @@ pub struct ControlledLiveOptions {
     pub authorization_ref: String,
     pub deadline_at: DateTime<Utc>,
     pub budget_secs: i64,
+    /// The public money and duration frozen for this run. Legacy launches keep
+    /// the historical values; a parameterized launch carries its own.
+    pub params: super::RunParameters,
     pub gas_policy: GasPolicy,
 }
 
@@ -137,8 +147,9 @@ impl ControlledLiveOptions {
         }
         let started_at = parse_utc(started_at)?;
         let deadline_at = parse_utc(deadline_at.expect("the deadline is present"))?;
-        let budget_secs = (deadline_at - started_at).num_seconds();
-        if budget_secs <= 0 || budget_secs > LIVE_MAX_SECS {
+        let budget = deadline_at - started_at;
+        let budget_secs = budget.num_seconds();
+        if !operations_mode.allows_duration(budget) {
             bail!("CONTROLLED_MODE: the live budget must be between zero and the maximum");
         }
         Ok(Some(Self {
@@ -149,6 +160,7 @@ impl ControlledLiveOptions {
             authorization_ref: authorization_ref.to_string(),
             deadline_at,
             budget_secs,
+            params: super::RunParameters::legacy(),
             gas_policy: GasPolicy {
                 payer_address: String::new(),
                 minimum_balance_atoms: U256::ZERO,
@@ -381,8 +393,7 @@ impl ControlledRun {
         let started_at = parse_utc(started_at.ok_or_else(|| anyhow::anyhow!("CONTROLLED_MODE: START"))?)?;
         let deadline_at = parse_utc(deadline_at.ok_or_else(|| anyhow::anyhow!("CONTROLLED_MODE: DEADLINE"))?)?;
         let budget = deadline_at.signed_duration_since(started_at);
-        if budget <= chrono::Duration::zero()
-            || budget > chrono::Duration::seconds(LIVE_MAX_SECS)
+        if !options.operations_mode.allows_duration(budget)
             || deadline_at != options.deadline_at
             || budget.num_seconds() != options.budget_secs
         {
@@ -512,12 +523,43 @@ pub(crate) fn check_runtime_config(cfg: &super::AppConfig, strategy: &str) -> Re
     account.check()?;
     if account.trading_address.to_ascii_lowercase() != "0xfc9eb66e6f22f96608058c0a711ed048eed8c2e2"
         || options.contract != LIVE_CONTRACT
-        || options.budget_secs <= 0 || options.budget_secs > LIVE_MAX_SECS
+        || !options.operations_mode.allows_duration(run.deadline_at - run.started_at)
+        || (run.deadline_at - run.started_at).num_seconds() != options.budget_secs
         || options.gas_policy.payer_address != account.signer_address
         || options.gas_policy.minimum_balance_atoms.is_zero()
         || options.gas_policy.maximum_consumption_atoms.is_zero()
     {
         bail!("CONTROLLED_MODE: LIVE_CONTEXT");
+    }
+    // The frozen public money must be exactly what the loaded configuration
+    // states. A swapped configuration is a different live context, never a
+    // reuse of the old activation.
+    use super::run_parameters::{atoms_of_float, atoms_of_token};
+    let limits = &cfg.strategies.limits;
+    let params = options.params;
+    if !params.ordered()
+        || atoms_of_float(cfg.strategies.btc_arb.order_usd)? != params.target
+        || atoms_of_float(limits.max_order_usd)? != params.order
+        || atoms_of_float(limits.max_market_usd)? != params.market
+        || atoms_of_float(limits.max_total_usd)? != params.total
+        || atoms_of_float(limits.max_loss_usd)? != params.loss
+    {
+        bail!("CONTROLLED_MODE: LIVE_CONTEXT");
+    }
+    match cfg.controlled_run.as_ref() {
+        Some(settings) => {
+            if settings.duration_seconds != options.budget_secs as u64
+                || settings.operations_mode != options.operations_mode.as_str()
+                || settings.budget_atoms()? != params.budget
+            {
+                bail!("CONTROLLED_MODE: LIVE_CONTEXT");
+            }
+        }
+        None => {
+            if params != super::RunParameters::legacy() {
+                bail!("CONTROLLED_MODE: LIVE_CONTEXT");
+            }
+        }
     }
     // Select public fields explicitly: never serialize the credentials container.
     super::StrictJson(serde_json::json!({
@@ -663,6 +705,64 @@ mod tests {
             ControlledLiveOptions::from_arguments(None, None, None, None, None, "2026-11-19T04:00:00Z")
                 .unwrap();
         assert!(options.is_none());
+    }
+
+    #[test]
+    fn native_mode_windows_bind_options_run_context_and_runtime_validator() {
+        let start_text = "2026-11-19T04:00:00Z";
+        let start = parse_utc(start_text).unwrap();
+        for (mode, cap) in [(OperationsMode::Unattended, 86_400), (OperationsMode::Supervised, 21_600)] {
+            for millis in [-1000, 0, 1000, 21_600_000, 21_600_001, 21_601_000, 86_400_000, 86_400_001, 86_401_000] {
+                let duration = chrono::Duration::milliseconds(millis);
+                let accepted = millis > 0 && millis <= cap * 1000;
+                let deadline = start + duration;
+                let deadline_text = deadline.to_rfc3339();
+                let options = ControlledLiveOptions::from_arguments(Some(LIVE_CONTRACT), Some(mode.as_str()),
+                    Some("window-1"), Some("auth-1"), Some(&deadline_text), start_text);
+                assert_eq!(options.is_ok(), accepted, "options {mode:?} {millis}");
+                // Independently exercise native run validation with manually supplied options.
+                let (mut run, mut activation, context_raw) = live_fixture();
+                let mut options = run.live.clone().unwrap();
+                options.operations_mode = mode;
+                options.deadline_at = deadline;
+                options.budget_secs = duration.num_seconds();
+                options.account_identity = Some(activation.account_identity.clone());
+                options.gas_policy = activation.gas_policy().unwrap();
+                let constructed = ControlledRun::from_live_arguments(Some("signed-future-live"), Some("run-1"),
+                    Some(start_text), Some(&deadline_text), options.clone());
+                assert_eq!(constructed.is_ok(), accepted, "run {mode:?} {millis}");
+                // Even a forged configuration cannot bypass the last public validator.
+                run.started_at = start;
+                run.deadline_at = deadline;
+                run.live = Some(options.clone());
+                let mut public: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"), "/tools/predictfun/btc5m-controlled-paper.json"))).unwrap();
+                public["bot"]["enable_trading"] = true.into();
+                public["bot"]["mock_trading"] = false.into();
+                public.as_object_mut().unwrap().remove("controlled_paper");
+                let mut cfg: super::super::AppConfig = serde_json::from_value(public).unwrap();
+                cfg.controlled = Some(run.clone());
+                cfg.controlled_live = Some(options);
+                assert_eq!(check_runtime_config(&cfg, "BTC arbitrage").is_ok(), accepted,
+                    "runtime {mode:?} {millis}");
+                if accepted {
+                    let mut raw: serde_json::Value = serde_json::from_str(&activation_json("")).unwrap();
+                    raw["account_identity"]["trading_address"] = activation.account_identity.trading_address.clone().into();
+                    raw["operations_mode"] = mode.as_str().into();
+                    raw["deadline_at"] = deadline_text.clone().into();
+                    activation = LiveActivation::parse(&raw.to_string()).unwrap();
+                    let mut context: serde_json::Value = serde_json::from_str(&context_raw).unwrap();
+                    context["operations_mode"] = mode.as_str().into();
+                    context["deadline_at"] = deadline_text.into();
+                    let parsed = LiveContext::parse(&context.to_string(), &constructed.unwrap(), &activation).unwrap();
+                    assert_eq!(parsed.deadline_at, deadline);
+                }
+            }
+        }
+        assert!(ControlledLiveOptions::from_arguments(Some(LIVE_CONTRACT), Some("unknown"),
+            Some("window-1"), Some("auth-1"), Some("2026-11-19T10:00:00Z"), start_text).is_err());
+        let raw = activation_json("").replace("\"supervised\"", "\"unknown\"");
+        assert!(LiveActivation::parse(&raw).unwrap().operations_mode().is_err());
     }
 
     #[test]

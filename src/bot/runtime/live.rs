@@ -13,6 +13,7 @@ use crate::service::venue::{
 use alloy_primitives::U256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The state the live path keeps, in the broker's lock.
 #[derive(Debug, Default)]
@@ -38,6 +39,19 @@ pub struct LiveState {
     pub net_cash: HashMap<u64, U256>,
     pub net_inventory: HashMap<u64, U256>,
     pub reservations: HashMap<u64, U256>,
+    /// Claimed payouts already received, by attempt id: the claimed inventory
+    /// and the exact cash atoms the venue paid. Written only after a complete
+    /// account read reconciles the increase atom-for-atom and the claim
+    /// matches, atom for atom, what the confirmed official result owes.
+    pub claims: HashMap<u64, (U256, U256)>,
+    /// Claims the account read proved but the official result has not
+    /// confirmed yet, by attempt id: the claimed inventory and the cash atoms
+    /// the venue paid.
+    ///
+    /// A claim here is not ledger cash. It becomes cash only when the
+    /// confirmed official result owes exactly this amount; a claim one atom
+    /// off stays here and keeps the run waiting.
+    pub pending_claims: HashMap<u64, (U256, U256)>,
     /// The conservative cash risk observed for an attempt, by attempt id.
     ///
     /// It only ever rises: once the venue showed a gross cash or a fee above
@@ -182,8 +196,19 @@ pub(super) fn apply_snapshot_detailed(
     if observed > *floor {
         *floor = observed;
     }
-    let old = state.live.watermarks.entry(id).or_default();
-    let Some(watermark) = advance_watermark(old, snapshot)? else {
+    let old = {
+        state.live.watermarks.entry(id).or_default().clone()
+    };
+    // A newer read that cannot state its quantity contradicts nothing: for an
+    // order the venue already accepted, its fills may still be arriving. That
+    // is an incomplete fact, so no watermark advances and nothing is applied.
+    let quantity_unread = snapshot.generation > old.generation && snapshot.gross_q().is_none();
+    let advanced = if quantity_unread {
+        None
+    } else {
+        advance_watermark(&old, snapshot)?
+    };
+    if advanced.is_none() && !quantity_unread {
         // Nothing new: the facts are already in the ledger.
         return Ok(AppliedExecution {
             delta: Delta::default(),
@@ -197,6 +222,13 @@ pub(super) fn apply_snapshot_detailed(
                 .get(&id)
                 .is_some_and(|watermark| watermark.fields.len() == 5),
         });
+    }
+    let old_risk = old.risk_lower_bound();
+    let Some(watermark) = advanced else {
+        let applied = incomplete_reading(state, &record, snapshot, old_risk);
+        drop(record);
+        super::live_control::refresh_live_risk(state);
+        return Ok(applied);
     };
     let q = watermark.gross_q;
     if q > record.request_gross_atoms {
@@ -330,8 +362,8 @@ pub(super) fn apply_snapshot_detailed(
             fields: next,
         },
     );
-    if let Some(run) = state.live.controlled.as_mut() {
-        if !complete { run.stop("FACT_INCOMPLETE", true, snapshot.observed_at); }
+    if !complete {
+        incomplete_decision(state, &record, snapshot);
     }
     drop(record);
     super::live_control::refresh_live_risk(state);
@@ -343,6 +375,251 @@ pub(super) fn apply_snapshot_detailed(
         duplicate: false,
         accounting_complete: complete,
     })
+}
+
+/// The venue's own order id for an attempt the venue has accepted and the
+/// window has not closed yet. Nothing else is in flight: without a proven ACK
+/// and the venue's id there is no order the venue could list.
+fn in_flight_order(record: &AttemptRecord) -> Option<&str> {
+    (record.submission == Submission::Accepted && record.phase != AttemptPhase::Closed)
+        .then(|| record.identity.venue_order_id.as_deref())
+        .flatten()
+}
+
+/// Whether this incomplete reading belongs to an order the venue already
+/// accepted and that may still fill.
+///
+/// A proven ACK (`ACCEPTED` on the attempt, with the venue's own order id) and
+/// a snapshot that is `ACCEPTED` with a closure that is not `FINAL` mean the
+/// order is in flight: its facts are still arriving, so an incomplete reading
+/// is a fact in progress — not an unknown submission and not a run failure.
+/// Anything else (no proven ACK, a refused or unknown submission, or a closure
+/// that proves the order can't fill) stays a real unproven fact.
+fn in_flight(record: &AttemptRecord, snapshot: &ExecutionSnapshot) -> bool {
+    in_flight_order(record).is_some()
+        && snapshot.submission == Submission::Accepted
+        && !matches!(snapshot.closure, Closure::Final { .. })
+}
+
+/// The one order this window is holding in flight, when exactly one attempt is.
+///
+/// More than one in-flight attempt explains nothing: an order list matching one
+/// of them still names an order the other did not place, so the caller keeps
+/// treating the whole list as unexplained.
+fn only_in_flight_order<'a>(
+    records: impl IntoIterator<Item = &'a AttemptRecord>,
+) -> Option<&'a str> {
+    let mut orders = records.into_iter().filter_map(in_flight_order);
+    let only = orders.next()?;
+    orders.next().is_none().then_some(only)
+}
+
+/// How long one order's still-invisible execution facts may be re-read.
+pub(super) const UNREAD_FACTS_BUDGET: Duration = Duration::from_secs(120);
+
+/// The pause between two reads of the same order's facts.
+pub(super) const UNREAD_FACTS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What one bounded re-read of the window's unread attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnreadFacts {
+    /// No attempt of this window waits for facts that have not arrived.
+    NothingToRead,
+    /// The facts arrived, or the read path itself stopped the run.
+    Resolved,
+    /// The bound expired with the facts still invisible.
+    Expired,
+}
+
+/// The one attempt whose accepted facts are still invisible.
+///
+/// Only an order that may already be at the venue qualifies: a proven or
+/// possible submission, not closed yet, with a hash to read back and no
+/// positive cumulative quantity. More than one such attempt explains nothing,
+/// so the caller reads no facts at all rather than guess.
+fn unread_attempt(state: &State) -> Option<(u64, String)> {
+    let mut found = None;
+    for (id, handle) in &state.live.attempts {
+        let record = handle.lock();
+        let waiting = matches!(record.submission, Submission::Accepted | Submission::Unknown)
+            && record.phase != AttemptPhase::Closed;
+        let visible = record.phase == AttemptPhase::Closed
+            || state
+                .live
+                .watermarks
+                .get(id)
+                .is_some_and(|watermark| !watermark.gross_q.is_zero());
+        if !waiting || visible {
+            continue;
+        }
+        let Some(hash) = record.identity.signed_hash.clone() else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some((*id, hash));
+    }
+    found
+}
+
+/// Re-read the one order whose facts have not arrived, bounded in time.
+///
+/// Only this attempt's existing execution read is repeated: no other order is
+/// read, no new request kind is used and nothing is sent. The caller owns the
+/// operation lane. Every stop the read path itself raises keeps its first
+/// reason, so a conflict is never swallowed by the wait.
+pub(super) async fn re_read_unread_facts(
+    broker: &Broker,
+    budget: Duration,
+    interval: Duration,
+) -> UnreadFacts {
+    let Some((attempt_id, _)) = ({ let state = broker.state.lock(); unread_attempt(&state) })
+    else {
+        return UnreadFacts::NothingToRead;
+    };
+    let started = Instant::now();
+    loop {
+        if broker.controlled_stopped() {
+            broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
+            return UnreadFacts::Resolved;
+        }
+        let hash = {
+            let state = broker.state.lock();
+            if let Some(run) = state.live.controlled.as_ref() {
+                if run.control.lock().stop.is_some() {
+                    return UnreadFacts::Resolved;
+                }
+            }
+            unread_attempt(&state).and_then(|(id, hash)| (id == attempt_id).then_some(hash))
+        };
+        let Some(hash) = hash else {
+            return UnreadFacts::Resolved;
+        };
+        if started.elapsed() >= budget {
+            return UnreadFacts::Expired;
+        }
+        let Some(venue) = broker.taker.as_ref() else {
+            return UnreadFacts::Resolved;
+        };
+        let snapshot = match venue.execution_snapshot(&hash).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                let _ = super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE");
+                return UnreadFacts::Resolved;
+            }
+        };
+        if consume_snapshot(broker, &snapshot).is_err() {
+            // The read path stops the run with its own reason, unless the
+            // failure arrives after the facts were applied and before any stop
+            // was written (a lost clock read). That reading is still a failure:
+            // no later observation may continue without a stop.
+            latch_unlatched_read_failure(broker);
+            return UnreadFacts::Resolved;
+        }
+        if {
+            let state = broker.state.lock();
+            unread_attempt(&state).is_none()
+        } {
+            return UnreadFacts::Resolved;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Stop the run when a failed reading recorded no stop of its own.
+///
+/// A reading can fail after it already applied its facts — a lost clock read
+/// is the existing example — without stopping the run. The window may not keep
+/// observing then. The first stop the run already holds keeps its reason, its
+/// detail and its takeover flag; otherwise this failure stops the run with the
+/// same code an unread fact would use.
+fn latch_unlatched_read_failure(broker: &Broker) {
+    let unlatched = {
+        let state = broker.state.lock();
+        state.entry_stop_reason.is_none()
+            && state
+                .live
+                .controlled
+                .as_ref()
+                .is_some_and(|run| run.control.lock().stop.is_none())
+    };
+    if unlatched {
+        // A lost output is already sticky on the emitter, so a failed flush of
+        // this stop needs no second record here.
+        let _ = super::live_events::stop_on_lane(
+            broker,
+            super::live_events::reason::FACT_INCOMPLETE,
+        );
+    }
+}
+
+/// The failure code this run already holds for an incomplete attempt.
+///
+/// An attempt without a proven acceptance may hold an order at the venue: that
+/// is the existing `SUBMISSION_UNKNOWN` code. A proven one is the existing
+/// `FACT_INCOMPLETE` code. No new vocabulary is introduced.
+fn incomplete_code(record: &AttemptRecord) -> &'static str {
+    if record.submission == Submission::Accepted {
+        super::live_events::reason::FACT_INCOMPLETE
+    } else {
+        super::live_events::reason::SUBMISSION_UNKNOWN
+    }
+}
+
+/// Record what an incomplete reading still proves and act on it.
+///
+/// The residual cash risk is kept as before. An order in flight only stops the
+/// run from adding risk: the window keeps observing, and the attempt stays
+/// pending until its facts settle. Any other incomplete reading still stops the
+/// run, now with the failure code this attempt already carries.
+fn incomplete_reading(
+    state: &mut State,
+    record: &AttemptRecord,
+    snapshot: &ExecutionSnapshot,
+    known_risk: U256,
+) -> AppliedExecution {
+    let id = snapshot.identity.local_attempt_id;
+    let residual = if record.identity.side == Side::Sell {
+        U256::ZERO
+    } else {
+        record
+            .r0
+            .max(known_risk)
+            .max(
+                state
+                    .live
+                    .observed_risk_floor
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(U256::ZERO),
+            )
+            .saturating_sub(state.live.net_cash.get(&id).copied().unwrap_or(U256::ZERO))
+    };
+    state.live.reservations.insert(id, residual);
+    incomplete_decision(state, record, snapshot);
+    AppliedExecution::default()
+}
+
+/// Decide what an incomplete reading does to the run.
+///
+/// An order in flight is not a run failure: `consume_snapshot` already stopped
+/// the window from adding risk through `state.halted`, the attempt stays
+/// pending and its accounting stays incomplete until the facts settle, so the
+/// window keeps observing. Any other incomplete reading still stops the run,
+/// with the code it already carries.
+fn incomplete_decision(state: &mut State, record: &AttemptRecord, snapshot: &ExecutionSnapshot) {
+    if in_flight(record, snapshot) {
+        return;
+    }
+    if let Some(run) = state.live.controlled.as_mut() {
+        run.stop_with_detail(
+            super::live_events::reason::FACT_INCOMPLETE,
+            incomplete_code(record),
+            true,
+            snapshot.observed_at,
+        );
+    }
 }
 
 /// Apply and project one venue reading in the same State critical section.
@@ -364,8 +641,12 @@ pub(super) fn consume_snapshot(
         if let Err(error) = &result {
             state.halted = true;
             if let Some(run) = state.live.controlled.as_mut() {
-                run.stop(if snapshot.gross_q().is_none() { "FACT_INCOMPLETE" } else { "FACT_CONFLICT" },
-                    true, snapshot.observed_at);
+                run.stop_with_detail(
+                    if snapshot.gross_q().is_none() { "FACT_INCOMPLETE" } else { "FACT_CONFLICT" },
+                    &existing_code(error),
+                    true,
+                    snapshot.observed_at,
+                );
             }
             if let Some(handle) = state.live.attempts.get(&id) {
                 handle.lock().last_reason = Some(error.clone());
@@ -383,7 +664,8 @@ pub(super) fn consume_snapshot(
             Ok(events) => events,
             Err(error) => {
                 if let Some(run) = state.live.controlled.as_mut() {
-                    run.stop("FACT_CONFLICT", true, snapshot.observed_at);
+                    run.stop_with_detail("FACT_CONFLICT", &existing_code(&error),
+                        true, snapshot.observed_at);
                 }
                 result = Err(error);
                 Vec::new()
@@ -476,9 +758,37 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
         }
         let snapshot = venue.account_snapshot().await?;
         let checked = super::live_control::account_receipt(&broker.state.lock())?;
+        let controlled_budget = broker
+            .state
+            .lock()
+            .live
+            .controlled
+            .as_ref()
+            .map(|run| run.options.params.budget);
+        let startup_budget = controlled_budget.unwrap_or_else(super::live_accounting::budget_c0_atoms);
         crate::service::predict_fun::account::check_snapshot_complete(&snapshot)?;
+        // A claimed payout the opening read explained is exact cash above the
+        // pre-claim C0; the window may account for it, never for any other gap.
+        let claim_cash = if snapshot.positions_explained {
+            super::live_accounting::explained_claim_cash(&snapshot)
+                .ok_or_else(|| anyhow::anyhow!("CASH_CONFLICT"))?
+        } else {
+            U256::ZERO
+        };
+        // A controlled window's C0 is exactly the cash it accounts for. A
+        // different observed balance is refused before any order, so the window
+        // never trades first and then discovers an unclosable identity.
+        if controlled_budget.is_some_and(|budget| {
+            !super::live_accounting::cash_matches_budget_and_claims(
+                budget,
+                snapshot.collateral_atoms,
+                claim_cash,
+            )
+        }) {
+            anyhow::bail!("CASH_BUDGET_MISMATCH");
+        }
         if checked.is_some() && (!snapshot.positions.is_empty()
-            || snapshot.collateral_atoms.is_none_or(|cash| cash < super::live_accounting::budget_c0_atoms()))
+            || !super::live_accounting::startup_funded(startup_budget, snapshot.collateral_atoms))
         {
             anyhow::bail!("RECONCILIATION_REQUIRED:CONTROLLED_STARTUP_BUDGET_OR_POSITIONS");
         }
@@ -527,6 +837,9 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
         }
         super::live_control::record_account_read(&mut state, &snapshot, checked)?;
         state.live.baseline = Some(snapshot.clone());
+        if let Some(run) = state.live.controlled.as_mut() {
+            run.opening_claim_cash = claim_cash;
+        }
         let event = checked.map(|checked| super::live_events::prepare_reconciliation(
             &state, &snapshot, checked.utc, "STARTUP", true, "NONE")).transpose()
             .map_err(anyhow::Error::msg)?.flatten();
@@ -539,9 +852,18 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
         Ok(()) => gate.record_read_success(identity, "startup"),
         Err(_) => gate.record_read_failure(identity, "startup", "STARTUP_UNPROVEN"),
     }
-    if result.is_err() { super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
-        .map_err(anyhow::Error::msg)?; }
-    result
+    if let Err(error) = &result {
+        // The stop this failure takes names the code it actually held, before
+        // it is recorded: the first stop keeps its reason and its code, so this
+        // cannot rewrite a finding an earlier stop already carries.
+        if let Some(run) = broker.state.lock().live.controlled.as_mut() {
+            run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error), true,
+                chrono::Utc::now());
+        }
+        super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
+            .map_err(anyhow::Error::msg)?;
+    }
+    result.map_err(public_account_error)
 }
 
 /// Compare a fresh authoritative account read with the original observation
@@ -551,11 +873,43 @@ pub(crate) fn check_account_delta(
     current: &crate::service::venue::AccountSnapshot,
     changes: impl IntoIterator<Item = (String, Side, U256, U256)>,
 ) -> anyhow::Result<()> {
+    check_account_delta_with_own_order(initial, current, None, changes)
+}
+
+/// The same comparison, naming the one venue order id this window accepted and
+/// has not closed yet.
+///
+/// Only that order may appear in the venue's open-order list: it is the window's
+/// own in-flight fact, not foreign risk. Any other id, a mixed list, or a list
+/// without such an attempt stays `RECONCILIATION_REQUIRED:OPEN_ORDERS`.
+pub(crate) fn check_account_delta_with_own_order(
+    initial: &crate::service::venue::AccountSnapshot,
+    current: &crate::service::venue::AccountSnapshot,
+    own_order: Option<&str>,
+    changes: impl IntoIterator<Item = (String, Side, U256, U256)>,
+) -> anyhow::Result<()> {
+    check_account_delta_with_claims(initial, current, own_order, changes, std::iter::empty())
+}
+
+/// The same comparison plus claimed payouts, as `(token, shares, cash)`.
+///
+/// A claim is the venue's own confirmed official result paying for inventory
+/// this ledger already holds: its shares are gone from the account and its
+/// exact cash atoms arrived. A claim for a token the ledger doesn't hold at
+/// this point is not applied — its cash is part of the baseline, and any other
+/// difference still fails the cash comparison.
+pub(crate) fn check_account_delta_with_claims(
+    initial: &crate::service::venue::AccountSnapshot,
+    current: &crate::service::venue::AccountSnapshot,
+    own_order: Option<&str>,
+    changes: impl IntoIterator<Item = (String, Side, U256, U256)>,
+    claims: impl IntoIterator<Item = (String, U256, U256)>,
+) -> anyhow::Result<()> {
     crate::service::predict_fun::account::check_snapshot_complete(current)?;
     if initial.identity != current.identity {
         anyhow::bail!("ACCOUNT_MISMATCH");
     }
-    if !current.open_orders.is_empty() {
+    if current.open_orders.iter().any(|order| Some(order.as_str()) != own_order) {
         anyhow::bail!("RECONCILIATION_REQUIRED:OPEN_ORDERS");
     }
     use alloy_primitives::U512;
@@ -580,10 +934,6 @@ pub(crate) fn check_account_delta(
             .collateral_atoms
             .ok_or_else(|| anyhow::anyhow!("MISSING_COLLATERAL"))?,
     );
-    let cash = start
-        .checked_add(incoming)
-        .and_then(|value| value.checked_sub(outgoing))
-        .ok_or_else(|| anyhow::anyhow!("CASH_CONFLICT"))?;
     let mut positions: HashMap<_, _> = initial.positions.iter().cloned().collect();
     for (token, (added, removed)) in inventory {
         let held = positions.entry(token).or_default();
@@ -594,6 +944,22 @@ pub(crate) fn check_account_delta(
         *held = U256::from_str_radix(&amount.to_string(), 10)
             .map_err(|_| anyhow::anyhow!("INVENTORY_OVERFLOW"))?;
     }
+    let mut claim_cash = U512::ZERO;
+    for (token, shares, cash) in claims {
+        let Some(held) = positions.get_mut(&token) else { continue; };
+        if *held < shares {
+            anyhow::bail!("RECONCILIATION_REQUIRED:ACCOUNT_LEDGER_MISMATCH");
+        }
+        *held = *held - shares;
+        claim_cash = claim_cash
+            .checked_add(U512::from(cash))
+            .ok_or_else(|| anyhow::anyhow!("CASH_OVERFLOW"))?;
+    }
+    let cash = start
+        .checked_add(incoming)
+        .and_then(|value| value.checked_sub(outgoing))
+        .and_then(|value| value.checked_add(claim_cash))
+        .ok_or_else(|| anyhow::anyhow!("CASH_CONFLICT"))?;
     positions.retain(|_, value| !value.is_zero());
     let observed: HashMap<_, _> = current
         .positions
@@ -607,21 +973,113 @@ pub(crate) fn check_account_delta(
     Ok(())
 }
 
-/// The failure code an account check already carries.
-///
-/// It is the token the run's own error already names: the venue's own reason,
-/// or the code after the fixed reconciliation prefix. Nothing is classified
-/// here; a message that is not one short code becomes `UNKNOWN`, so no free
-/// text, address or URL can reach the terminal record.
+/// Keep typed venue reasons ahead of display contexts. The request/account
+/// boundary projects transport, HTTP and parse failures from types, not text.
+/// Legacy internal short codes are still accepted through context wrappers;
+/// arbitrary messages never become more specific than UNKNOWN.
 fn account_failure_code(error: &anyhow::Error) -> String {
-    let message = match error.downcast_ref::<crate::service::venue::VenueError>() {
-        Some(venue) => venue.reason.clone(),
-        None => error.to_string(),
+    if let Some(venue) = error.downcast_ref::<crate::service::venue::VenueError>() {
+        return existing_code(&venue.reason);
+    }
+    // Textual context is not an error code. Only the original legacy cause
+    // participates in compatibility, after typed request errors were projected.
+    existing_code(&error.root_cause().to_string())
+}
+
+/// Only an existing uppercase token may leave this module; anything else is
+/// `UNKNOWN`, never display text.
+///
+/// A venue/route failure may name its class and its cause as one code
+/// (`FACT_INCOMPLETE:MISSING_TOKEN`). The detail carries the single bounded
+/// cause; exactly one known class prefix is dropped, so no new vocabulary is
+/// introduced and no display text can pass.
+fn existing_code(token: &str) -> String {
+    let token = token.trim_start_matches("RECONCILIATION_REQUIRED:");
+    let token = match token.split_once(':') {
+        Some((class, cause)) if super::live_events::is_known_reason(class) => cause,
+        _ => token,
     };
-    let token = message.trim_start_matches("RECONCILIATION_REQUIRED:");
-    let plain = !token.is_empty() && token.len() <= 64
-        && token.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
-    if plain { token.to_string() } else { "UNKNOWN".to_string() }
+    (!token.is_empty() && token.len() <= 64
+        && token.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+        .then(|| token.to_string())
+        .unwrap_or_else(|| "UNKNOWN".into())
+}
+
+/// Detach raw causes before startup, drive or shutdown can log an account
+/// failure. Keep the typed code and safe tokens, never arbitrary Debug context.
+fn public_account_error(error: anyhow::Error) -> anyhow::Error {
+    let reason = account_failure_code(&error);
+    if let Some(venue) = error.downcast_ref::<crate::service::venue::VenueError>() {
+        let step = if !venue.step.is_empty() && venue.step.len() <= 64
+            && venue.step.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        { &venue.step } else { "ACCOUNT" };
+        return crate::service::venue::VenueError::new(venue.code, step, &reason).into();
+    }
+    anyhow::Error::msg(reason)
+}
+
+/// The claimed payouts this ledger can apply, and the ones it records now.
+///
+/// A fresh claim is attributable only to exactly one local attempt whose closed
+/// inventory it pays in full. A claim whose token the ledger doesn't own is not
+/// this window's delta: its cash is already part of the baseline.
+fn claimed_payouts(
+    state: &crate::bot::runtime::State,
+    snapshot: &crate::service::venue::AccountSnapshot,
+) -> anyhow::Result<(Vec<(String, U256, U256)>, Vec<(u64, U256, U256)>)> {
+    let mut claims = Vec::new();
+    let mut by_token: HashMap<String, (U256, U256)> = HashMap::new();
+    for (id, (inventory, cash)) in &state.live.claims {
+        let token = state
+            .live
+            .attempts
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("RECONCILIATION_REQUIRED:CASH_CONFLICT"))?
+            .lock()
+            .identity
+            .token_id
+            .clone();
+        by_token.insert(token.clone(), (*inventory, *cash));
+        claims.push((token, *inventory, *cash));
+    }
+    let mut fresh = Vec::new();
+    for win in &snapshot.claimed_win {
+        let owners: Vec<u64> = state
+            .live
+            .attempts
+            .iter()
+            .filter(|(_, handle)| handle.lock().identity.token_id == win.token)
+            .map(|(id, _)| *id)
+            .collect();
+        let [id] = owners.as_slice() else { continue };
+        let id = *id;
+        let record = state.live.attempts[&id].lock().clone();
+        let Some(inventory) = state.live.net_inventory.get(&id).copied() else {
+            anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
+        };
+        let reserved = state.live.reservations.get(&id).copied().unwrap_or(U256::ZERO);
+        // The claim must pay this holding in full, and nothing may still be
+        // reserved against the attempt.
+        if inventory != win.inventory_atoms
+            || record.phase != AttemptPhase::Closed
+            || !reserved.is_zero()
+        {
+            anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
+        }
+        match by_token.get(&win.token) {
+            Some((held, cash)) => {
+                if *held != win.inventory_atoms || *cash != win.claim_atoms {
+                    anyhow::bail!("RECONCILIATION_REQUIRED:CASH_CONFLICT");
+                }
+            }
+            None => {
+                by_token.insert(win.token.clone(), (win.inventory_atoms, win.claim_atoms));
+                claims.push((win.token.clone(), win.inventory_atoms, win.claim_atoms));
+                fresh.push((id, win.inventory_atoms, win.claim_atoms));
+            }
+        }
+    }
+    Ok((claims, fresh))
 }
 
 pub(super) async fn check_runtime_account(
@@ -657,14 +1115,12 @@ pub(super) async fn check_runtime_account(
         if version != (state.live.next_attempt_id, state.live.generation.clone()) {
             anyhow::bail!("RECONCILIATION_REQUIRED:ACCOUNT_READ_RACE");
         }
-        snapshot.open_orders.retain(|order_id| {
-            !state.live.attempts.values().any(|handle| {
-                let record = handle.lock();
-                record.phase != AttemptPhase::Closed
-                    && (record.identity.venue_order_id.as_deref() == Some(order_id.as_str())
-                        || record.identity.signed_hash.as_deref() == Some(order_id.as_str()))
-            })
-        });
+        // The window's own accepted, still-open order may legitimately be
+        // listed by the venue. Exactly one attempt can explain the list; every
+        // other id stays unexplained and stops the run.
+        let records: Vec<AttemptRecord> =
+            state.live.attempts.values().map(|handle| handle.lock().clone()).collect();
+        let own_order = only_in_flight_order(records.iter()).map(str::to_string);
         let mut changes = Vec::new();
         for (id, handle) in &state.live.attempts {
             let record = handle.lock();
@@ -682,8 +1138,21 @@ pub(super) async fn check_runtime_account(
                 anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
             }
         }
-        let reconciled = check_account_delta(state.live.baseline.as_ref().unwrap(), &snapshot, changes)
+        let (claims, fresh) = claimed_payouts(&state, &snapshot)?;
+        let mut booked_claims: Vec<(u64, U256, U256)> = Vec::new();
+        let reconciled = check_account_delta_with_claims(
+            state.live.baseline.as_ref().unwrap(), &snapshot, own_order.as_deref(), changes, claims)
             .and_then(|()| {
+                // The account read proves the exact claimed atoms arrived; this
+                // is the one place a claimed payout becomes ledger cash, and the
+                // one place a wait only the missing claim caused can end.
+                for (id, inventory, cash) in fresh {
+                    let (booked, _) =
+                        super::live_control::credit_claim(&mut state, id, inventory, cash);
+                    if let Some((inventory, cash)) = booked {
+                        booked_claims.push((id, inventory, cash));
+                    }
+                }
                 // Adapter history excludes this run's bound orders. Only the
                 // exact baseline + committed atom deltas can explain their
                 // positions here; do not project them as foreign after proof.
@@ -705,6 +1174,14 @@ pub(super) async fn check_runtime_account(
                 if reconciled.is_ok() { "NONE" } else { "RECONCILIATION_REQUIRED" })
                 .map_err(anyhow::Error::msg)?
             { events.push(event); }
+            // A claim that became ledger cash is a wire fact: the reader has to
+            // be able to see that the wait it latched is over.
+            for (id, inventory, cash) in &booked_claims {
+                if let Some(event) = super::live_events::prepare_claim_paid(
+                    &state, *id, *inventory, *cash, checked.utc)
+                    .map_err(anyhow::Error::msg)?
+                { events.push(event); }
+            }
             events.extend(super::live_events::prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?);
         }
         drop(state);
@@ -716,6 +1193,7 @@ pub(super) async fn check_runtime_account(
     // first stop of this run carries it.
     if let Err(error) = &result {
         if let Some(run) = broker.state.lock().live.controlled.as_mut() {
+            run.account_read = None;
             run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error), true,
                 chrono::Utc::now());
         }
@@ -723,21 +1201,14 @@ pub(super) async fn check_runtime_account(
     if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
         match &result {
             Ok(()) => gate.record_read_success(identity, "runtime_account"),
-            Err(error) => {
+            Err(_) => {
                 gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN");
-                if let Some(run) = broker.state.lock().live.controlled.as_mut() {
-                    run.account_read = None;
-                    // Any path that failed before its own stop still names the
-                    // code it held; the first stop keeps it.
-                    run.stop("RECONCILIATION_REQUIRED",
-                        true, chrono::Utc::now());
-                }
             }
         }
     }
     if result.is_err() { super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
         .map_err(anyhow::Error::msg)?; }
-    result
+    result.map_err(public_account_error)
 }
 
 pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
@@ -2212,5 +2683,118 @@ mod tests {
             take_result(&snapshot, 0.5),
             TakeResult::Blocked(Blocked::Halted)
         );
+    }
+
+    fn account(open_orders: &[&str]) -> crate::service::venue::AccountSnapshot {
+        crate::service::venue::AccountSnapshot {
+            identity: identity(1).account,
+            collateral_atoms: Some(U256::from(100u128)),
+            gas_atoms: Some(U256::ZERO),
+            positions: Vec::new(),
+            positions_explained: true,
+            settled_zero: vec![],
+            claimed_win: vec![],
+            open_orders: open_orders.iter().map(|order| order.to_string()).collect(),
+            complete: true,
+        }
+    }
+
+    fn attempt(
+        phase: AttemptPhase,
+        submission: Submission,
+        venue_order_id: Option<&str>,
+    ) -> AttemptRecord {
+        AttemptRecord {
+            identity: OrderIdentity {
+                venue_order_id: venue_order_id.map(str::to_string),
+                ..identity(1)
+            },
+            request_gross_atoms: U256::from(10),
+            r0: U256::from(100),
+            reserved_sell: U256::ZERO,
+            phase,
+            submission,
+            last_reason: None,
+        }
+    }
+
+    type Changes = Vec<(String, Side, U256, U256)>;
+
+    /// The window's own accepted order may be listed as outstanding; every other
+    /// id, and any list without such an attempt, stays unexplained.
+    #[test]
+    fn only_the_own_accepted_open_order_is_explained_in_the_delta_check() {
+        let initial = account(&[]);
+        let cases: [(&[&str], Option<&str>, bool); 6] = [
+            (&["venue-1"], Some("venue-1"), true),
+            (&[], Some("venue-1"), true),
+            (&["venue-1"], None, false),
+            (&["venue-2"], Some("venue-1"), false),
+            (&["venue-1", "venue-2"], Some("venue-1"), false),
+            (&["venue-1", "venue-1"], Some("venue-2"), false),
+        ];
+        for (open_orders, own_order, reconciled) in cases {
+            let result = check_account_delta_with_own_order(
+                &initial,
+                &account(open_orders),
+                own_order,
+                Changes::new(),
+            );
+            assert_eq!(result.is_ok(), reconciled, "{open_orders:?} / {own_order:?}");
+            if let Err(error) = result {
+                assert_eq!(error.to_string(), "RECONCILIATION_REQUIRED:OPEN_ORDERS");
+            }
+        }
+    }
+
+    #[test]
+    fn a_claimed_payout_moves_exactly_its_cash_and_shares() {
+        let initial = account(&[]);
+        // The window bought ten shares for forty; the official result paid the
+        // claim twenty, so the account holds eighty instead of forty.
+        let changes: Changes = vec![("77".into(), Side::Buy, U256::from(40), U256::from(10))];
+        let mut current = account(&[]);
+        current.collateral_atoms = Some(U256::from(80));
+        let claims = vec![("77".to_string(), U256::from(10), U256::from(20))];
+        assert!(check_account_delta_with_claims(
+            &initial, &current, None, changes.clone(), claims.clone()).is_ok());
+        // Without the claim the same read is an unexplained cash and position
+        // difference.
+        assert!(check_account_delta_with_claims(
+            &initial, &current, None, changes.clone(), std::iter::empty()).is_err());
+        // One atom of cash off, or one atom too many shares claimed, still fails.
+        for (shares, cash) in [("10", "19"), ("10", "21"), ("11", "20"), ("9", "20")] {
+            let claims = vec![("77".to_string(), U256::from_str_radix(shares, 10).unwrap(),
+                U256::from_str_radix(cash, 10).unwrap())];
+            assert!(check_account_delta_with_claims(
+                &initial, &current, None, changes.clone(), claims).is_err(),
+                "{shares}/{cash}");
+        }
+        // A claim for a token the ledger doesn't hold is part of the baseline,
+        // not a second credit: the cash comparison still decides.
+        let mut baseline = account(&[]);
+        baseline.collateral_atoms = Some(U256::from(100));
+        let foreign = vec![("99".to_string(), U256::from(10), U256::from(20))];
+        assert!(check_account_delta_with_claims(
+            &baseline, &baseline, None, Changes::new(), foreign).is_ok());
+    }
+
+    /// Only a proven ACK carrying the venue's own id, with the attempt still
+    /// open, names the in-flight order; and then only if it is the sole one.
+    #[test]
+    fn the_in_flight_order_needs_a_proven_ack_an_id_and_an_open_attempt() {
+        let accepted = attempt(AttemptPhase::Submitted, Submission::Accepted, Some("venue-1"));
+        assert_eq!(only_in_flight_order([&accepted]), Some("venue-1"));
+        for record in [
+            attempt(AttemptPhase::Prepared, Submission::NotSubmitted, None),
+            attempt(AttemptPhase::Submitted, Submission::Accepted, None),
+            attempt(AttemptPhase::MayHaveSubmitted, Submission::Unknown, Some("venue-1")),
+            attempt(AttemptPhase::Closed, Submission::Accepted, Some("venue-1")),
+        ] {
+            assert_eq!(only_in_flight_order([&record]), None, "{record:?}");
+        }
+        let second = attempt(AttemptPhase::Submitted, Submission::Accepted, Some("venue-2"));
+        assert_eq!(only_in_flight_order([&accepted, &second]), None);
+        assert_eq!(only_in_flight_order(std::iter::empty::<&AttemptRecord>()), None);
     }
 }

@@ -546,3 +546,31 @@ fn all_ten_payload_shapes_reject_missing_extra_and_invalid_nested_fields() {
         assert!(LiveEventEmitter::validate(&invalid).is_err());
     }
 }
+
+#[test]
+fn a_holding_is_settled_only_by_a_zero_write_off_or_exact_claimed_cash() {
+    use crate::bot::runtime::live_control::LiveOutcome;
+    let inventory = U256::from(5_000_000_000_000_000_000u128);
+    let claimed = |inventory: U256, cash: U256| LiveOutcome {
+        payout_yes: Some(1.0),
+        result_prices: (100.0, 110.0),
+        position_net_atoms: inventory,
+        claim_value_atoms: Some(cash),
+        cash_confirmed: true,
+    };
+    // Claimed cash covering the whole holding is settled, but only when the
+    // confirmed official result owes exactly that amount.
+    let win = claimed(inventory, inventory);
+    assert!(settled_holding(inventory, Some((inventory, inventory)), Some(&win)));
+    // A credit that doesn't cover the holding is still open risk.
+    assert!(!settled_holding(inventory, Some((inventory - U256::from(1), inventory)), Some(&win)));
+    // A claim the confirmed result does not owe exactly is not settled: one
+    // atom short is an unexplained payout, not a closed holding.
+    assert!(!settled_holding(inventory, Some((inventory, inventory - U256::from(1))), Some(&win)));
+    // An unclaimed confirmed win is not cash yet.
+    assert!(!settled_holding(inventory, None, Some(&win)));
+    // A zero write-off is settled; a positive claim is not, without the cash.
+    let zero = claimed(inventory, U256::ZERO);
+    assert!(settled_holding(inventory, None, Some(&zero)));
+    assert!(!settled_holding(inventory, None, None));
+}

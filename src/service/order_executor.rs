@@ -516,6 +516,8 @@ mod tests {
                 gas_atoms: Some(alloy_primitives::U256::from(1)),
                 positions: vec![],
                 positions_explained: true,
+                settled_zero: vec![],
+                claimed_win: vec![],
                 open_orders: vec![],
                 complete: true,
             })

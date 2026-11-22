@@ -63,7 +63,7 @@
     "btc_arb": {
       "min_edge": 0.03,
       "min_secs_left": 30,
-      "order_usd": 2.0,
+      "order_usd": 1.0,
       "round_interval_secs": 300,
       "symbols": [
         "BTCUSDT"
@@ -72,8 +72,8 @@
     },
     "limits": {
       "max_loss_usd": 20.0,
-      "max_market_usd": 2.0,
-      "max_order_usd": 2.0,
+      "max_market_usd": 1.0,
+      "max_order_usd": 1.0,
       "max_total_usd": 10.0
     },
     "poll_secs": 5,

@@ -295,6 +295,26 @@ class GuardTests(unittest.TestCase):
             secret.assert_not_called()
             driver.assert_not_called()
 
+    def test_activation_window_cap_is_mode_bound_and_inclusive(self):
+        """Supervised <=6h, unattended <=24h; invalid modes/durations refuse."""
+        now = dt.datetime.now(dt.timezone.utc)
+        stamp = lambda value: value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        for mode, cap in (("supervised", 21600), ("unattended", 86400), ("unknown", 0)):
+            for seconds in (-1, 0, 1, 21599, 21600, 21601, 86399, 86400, 86401):
+                accepted = mode != "unknown" and 0 < seconds <= cap
+                with self.subTest(mode=mode, seconds=seconds):
+                    activation, context = public_inputs()
+                    start = now
+                    activation["operations_mode"] = context["operations_mode"] = mode
+                    activation["not_before"] = context["started_at"] = stamp(start)
+                    activation["deadline_at"] = context["deadline_at"] = stamp(
+                        start + dt.timedelta(seconds=seconds))
+                    if accepted:
+                        guard.validate_activation(activation, context, now)
+                    else:
+                        with self.assertRaises(guard.GuardRefused):
+                            guard.validate_activation(activation, context, now)
+
     def test_activation_bad_binding_unknown_version_before_credential_or_driver(self):
         mutations = [("schema_version", "unknown"), ("candidate_digest", "b" * 64),
                      ("takeover_ref", "bad/ref"), ("operations_mode", "auto"), ("extra", True)]
