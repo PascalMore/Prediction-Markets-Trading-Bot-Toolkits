@@ -169,10 +169,16 @@ impl ControlChannel {
     }
 
     /// Wait for the actual production expect boundary; timeout is only a test watchdog.
+    ///
+    /// The watchdog must outlast a modelled network (`YQUANT_SYNTH_RTT_MS`):
+    /// a path priced at the production round trip legitimately takes longer
+    /// than three seconds, and the send path's own acknowledgement bound
+    /// already lives in `await_durable_ack`. `wait_pending_until` is the
+    /// unbounded form the readiness tests use.
     #[cfg(test)]
     pub(crate) fn wait_pending(&self) -> PendingAck {
         let (pending, _) = self.pending_ready.wait_timeout_while(
-            self.pending.lock().unwrap(), std::time::Duration::from_secs(3),
+            self.pending.lock().unwrap(), std::time::Duration::from_secs(120),
             |pending| pending.is_none()).unwrap();
         pending.clone().expect("adapter never produced critical order")
     }

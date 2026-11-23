@@ -21,12 +21,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod types;
+pub(crate) mod order;
 pub use self::types::{
     LIVE_SCHEMA_VERSION, LIVE_EVENT_PREFIX, MAX_EVENT_LINE_BYTES, MAX_EVENT_ARRAY_ITEMS,
     reason, REASONS, is_known_reason, EventKind, LiveAccounting, LiveRunIdentity, LiveEvent,
     ENVELOPE_KEYS, ACCOUNTING_KEYS, FACT_KEYS, DELTA_KEYS, payload_keys, is_atoms,
     is_signed_atoms, is_hash, is_order_ref, is_decimal_id, check_exact_keys,
-    LivePayload, DecisionPayload, ReservationPayload, OrderPayload, ExecutionPayload,
+    LivePayload, DecisionPayload, ReservationPayload, OrderPayload, OrderDiagnostic,
+    ExecutionPayload,
     ReconciliationPayload, LossLatchPayload, StopPayload, RecoveryPayload, PayoutPayload,
     FinalPayload, ExecutionFacts, LiveFact, ExecutionDelta, LivePosition, UnresolvedAttempt,
 };
@@ -234,6 +236,7 @@ pub(super) fn prepare_order(
     bound: Option<&crate::service::venue::SignedExecutionBound>,
     metadata: Option<&crate::service::venue::ControlledOrderMetadata>,
     event_reason: &str,
+    diagnostic: Option<OrderDiagnostic>,
 ) -> Result<Option<PreparedLiveEvent>, String> {
     let Some(run) = state.live.controlled.as_ref() else { return Ok(None); };
     let record = state.live.attempts.get(&attempt_id).ok_or("UNBOUND_ATTEMPT")?.lock().clone();
@@ -254,6 +257,7 @@ pub(super) fn prepare_order(
             expires_at: bound.and_then(|bound| DateTime::from_timestamp(bound.expiration, 0)),
             removal_locked_until: metadata.and_then(|metadata| metadata.removal_locked_until),
             reason: event_reason.into(),
+            diagnostic,
         })).map(Some)
 }
 

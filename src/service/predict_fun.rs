@@ -1257,6 +1257,12 @@ pub struct PredictFunTrader {
     generations: RwLock<HashMap<String, u64>>,
     run_context: RwLock<Option<account::RunContext>>,
     bound_orders: RwLock<HashMap<String, fills::BoundOrder>>,
+    /// The contribution of every closed historical order already proven final.
+    ///
+    /// A closed order's own facts never change, so re-reading them every round
+    /// only ages the account read. The history scan still runs every round, so
+    /// a new, undeclared hash is still refused exactly as before.
+    history_proven: RwLock<HashMap<String, account::ProvenHistoryOrder>>,
     /// What the controlled domain recorded about the guarded orders.
     ///
     /// The ordinary path never writes here, and never reads it: only a
@@ -1287,6 +1293,7 @@ impl PredictFunTrader {
             generations: RwLock::new(HashMap::new()),
             run_context: RwLock::new(None),
             bound_orders: RwLock::new(HashMap::new()),
+            history_proven: RwLock::new(HashMap::new()),
             controlled_metadata: RwLock::new(controlled::ControlledMetadataStore::new()),
         };
         if cfg.live_trading_allowed() {

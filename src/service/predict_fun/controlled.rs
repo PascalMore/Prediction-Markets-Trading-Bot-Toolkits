@@ -445,6 +445,9 @@ impl ControlledSyntheticTrace {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod r16_fixture;
+
 /// The single-round fixture of one market.
 #[cfg(test)]
 pub(crate) fn synthetic_controlled_trader(
@@ -996,10 +999,14 @@ mod tests {
 
     struct InspectPrepared {
         seen: parking_lot::Mutex<Option<SignedExecutionBound>>,
+        snapshot: crate::service::venue::AccountSnapshot,
     }
 
     impl ControlledSendGuard for InspectPrepared {
         fn check_preparation(&self) -> Result<()> { Ok(()) }
+        fn account_snapshot(&self) -> Result<crate::service::venue::AccountSnapshot> {
+            Ok(self.snapshot.clone())
+        }
         fn check_book(&self, _book: &crate::models::BookSnapshot) -> Result<()> { Ok(()) }
         fn check_facts(&self, bound: &SignedExecutionBound) -> Result<()> {
             *self.seen.lock() = Some(bound.clone());
@@ -1036,7 +1043,8 @@ mod tests {
         trader.client.remember_market(&market);
         let planned = planned(4.0);
         let handle = tracked(&trader, &planned);
-        let guard = InspectPrepared { seen: Default::default() };
+        let snapshot = trader.account_snapshot().await.unwrap();
+        let guard = InspectPrepared { seen: Default::default(), snapshot };
         let error = trader.place_controlled_tracked(&planned, 0, true, handle.clone(), &guard).await.unwrap_err();
         assert!(error.to_string().contains("INSPECTED_PREPARED_BOUND"), "{error}");
         let bound = guard.seen.lock().clone().unwrap();
@@ -1071,7 +1079,8 @@ mod tests {
                 }
             }
             let before = handle.lock().clone();
-            let guard = InspectPrepared { seen: Default::default() };
+            let snapshot = trader.account_snapshot().await.unwrap();
+            let guard = InspectPrepared { seen: Default::default(), snapshot };
             assert!(trader.place_controlled_tracked(&planned, 0, true, handle.clone(), &guard).await.is_err(), "{fault}");
             assert_eq!(*handle.lock(), before, "{fault}");
             assert!(guard.seen.lock().is_none(), "{fault}");

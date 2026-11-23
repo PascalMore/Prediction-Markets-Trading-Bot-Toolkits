@@ -238,7 +238,10 @@ class EventTests(unittest.TestCase):
     def test_real_drive_logs_and_persisted_protocol_exclude_account_causes(self):
         self.assertNotIn(b"SECRET_SENTINEL", self.drive_output.stdout)
         self.assertNotIn(b"SECRET_SENTINEL", self.drive_output.stderr)
-        self.assertEqual(self.drive_output.stdout.count(b"order state check failed"), 6)
+        # Every fault names a warning of its own; a degraded read keeps retrying
+        # instead of stopping, so the exact count is a lower bound, never a stop.
+        self.assertGreaterEqual(self.drive_output.stdout.count(b"order state check failed"), 6)
+        self.assertNotIn(b"OUTPUT_INVALID", self.drive_output.stdout)
         groups, frames = [], []
         for line in self.drive_output.stdout.splitlines():
             if not line.startswith(live.EVENT_PREFIX):
@@ -248,15 +251,15 @@ class EventTests(unittest.TestCase):
             if live.validate_live_event(frame)["event_kind"] == "final":
                 groups.append(frames)
                 frames = []
-        self.assertFalse(frames)
-        expected = ("POSITIONS_READ_UNAVAILABLE_HTTP_503", "POSITIONS_READ_UNAVAILABLE",
-                    "POSITIONS_FACT_INCOMPLETE", "ACCOUNT_LEDGER_MISMATCH", "RPC_JSON", "UNKNOWN")
-        self.assertEqual(len(groups), len(expected))
-        for frames, detail in zip(groups, expected):
-            store = self.store(frames)
-            for frame in frames:
+        # A fact gap still ends the window with its own code and a final read.
+        expected = ("POSITIONS_FACT_INCOMPLETE", "ACCOUNT_LEDGER_MISMATCH", "UNKNOWN")
+        self.assertEqual([live.validate_live_event(group[-1])["payload"]["stop_detail"]
+                          for group in groups], list(expected))
+        for group, detail in zip(groups, expected):
+            store = self.store(group)
+            for frame in group:
                 store.append(frame)
-            terminal = live.validate_live_event(frames[-1])
+            terminal = live.validate_live_event(group[-1])
             store.finish(ended_from_native(terminal))
             read = live.read_live_run(store.directory)
             self.assertEqual(read["status"], "INCOMPLETE")
@@ -265,6 +268,10 @@ class EventTests(unittest.TestCase):
             self.assertEqual(stop["payload"]["stop_detail"], detail)
             for name in ("events.jsonl", "ended.json"):
                 self.assertNotIn(b"SECRET_SENTINEL", (store.directory / name).read_bytes())
+        # A transient read failure never ends the window: those runs were cut
+        # off while still observing, so their frames carry no stop and no final.
+        for frame in frames:
+            self.assertNotIn(live.validate_live_event(frame)["event_kind"], ("stop", "final"))
 
     def test_native_producer_to_first_write_ack_reader_and_final(self):
         for frames in (self.pending, self.cleanup):
@@ -425,9 +432,10 @@ class EventTests(unittest.TestCase):
         for event in self.schema_cases:
             for path, obj in objects(event):
                 for key in obj:
-                    if (path == ("payload",) and key == "stop_detail"
-                            and event["event_kind"] in ("stop", "final")):
-                        continue  # Only this historical nullable key may be absent.
+                    if (path == ("payload",) and (
+                            key == "stop_detail" and event["event_kind"] in ("stop", "final")
+                            or key == "diagnostic" and event["event_kind"] == "order")):
+                        continue  # Exact historical nullable-key compatibility only.
                     broken = copy.deepcopy(event)
                     target = broken
                     for component in path:
@@ -717,11 +725,20 @@ class EventTests(unittest.TestCase):
                 and event["payload"]["status"] == "CASH_CONFIRMED"]
         self.assertEqual(len(paid), 1, "the paid claim is on the wire")
         self.assertIsNotNone(paid[0]["payload"]["cash_received_atoms"])
-        # The terminal positions of both streams agree with the reconciliation:
-        # a holding the venue no longer lists is not a position any more.
-        for store in (short_store, exact_store):
-            self.assertEqual(store.relations.positions,
-                             store.relations.final["payload"]["positions"])
+        # A failed one-atom proof is not a valid position reconciliation. Its
+        # final retains the actual uncredited execution, with a sticky hard stop.
+        short_events = [live.validate_live_event(frame) for frame in self.short_claim]
+        inventory = next(event["payload"]["facts"]["net_inventory"]["atoms"]
+                         for event in short_events if event["event_kind"] == "execution"
+                         and event["payload"]["facts"]["net_inventory"]["status"] == "KNOWN")
+        self.assertEqual(short_final["payload"]["stop_reason"], "RECONCILIATION_REQUIRED")
+        self.assertTrue(short_final["payload"]["takeover_required"])
+        self.assertEqual(short_final["payload"]["positions"][0]["net_shares_atoms"], inventory)
+        self.assertFalse(any(event["event_kind"] == "payout"
+                             and event["payload"]["status"] == "CASH_CONFIRMED"
+                             for event in short_events))
+        self.assertEqual(exact_store.relations.positions,
+                         exact_store.relations.final["payload"]["positions"])
 
     def test_the_reader_follows_the_run_that_trades_again_after_the_paid_claim(self):
         # The exact claim's CASH_CONFIRMED is the wire fact that revokes the

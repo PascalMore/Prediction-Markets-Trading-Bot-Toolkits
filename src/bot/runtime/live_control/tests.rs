@@ -26,6 +26,9 @@ mod send_timing_bench;
 #[path = "tests/claim_wait.rs"]
 mod claim_wait;
 
+#[path = "tests/degrade_recovery.rs"]
+mod degrade_recovery;
+
 /// Test-only: the preparation checkpoints and the faults injected into them.
 ///
 /// The hooks live with the tests that use them: they are not part of the
@@ -115,7 +118,7 @@ pub(crate) fn preparation_checkpoint(guard: &LiveCandidateGuard) {
     }
 }
 
-fn ctx_fixture(identity: &AccountIdentity) -> crate::config::AppConfig {
+pub(super) fn ctx_fixture(identity: &AccountIdentity) -> crate::config::AppConfig {
     use crate::config::controlled_live::ActivationAccountIdentity;
     let mut cfg: crate::config::AppConfig = serde_json::from_str(
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.json"))).unwrap();
@@ -371,7 +374,7 @@ async fn bare_buy_in_controlled_phase1_live_never_reaches_original_adapter() {
 }
 
 /// Local risk-seam fixture only: no client, signer, transport or second ledger.
-fn risk_fixture() -> (Broker, Arc<crate::service::observation::FixtureClock>) {
+pub(super) fn risk_fixture() -> (Broker, Arc<crate::service::observation::FixtureClock>) {
     use crate::config::{ControlledMode, ControlledRun, StrategyLimits};
     use crate::service::observation::FixtureClock;
     let now = Utc::now();
@@ -722,7 +725,7 @@ fn evaluate_live_round(
     evaluate_live_round_with_core(clock, warm, market_id, &mut core)
 }
 
-fn evaluate_live_round_with_core(
+pub(super) fn evaluate_live_round_with_core(
     clock: &crate::service::observation::FixtureClock, warm: bool, market_id: u64,
     core: &mut crate::bot::arbitrage::DecisionCore,
 ) -> (crate::service::venue::TradableMarket, crate::models::BookSnapshot,
@@ -907,7 +910,7 @@ async fn sending_fixture(fault: &'static str) -> (
     (broker, clock, market, book, candidate, transport)
 }
 
-async fn sending_fixture_with_trace(fault: &'static str) -> (
+pub(super) async fn sending_fixture_with_trace(fault: &'static str) -> (
     Arc<Broker>, Arc<crate::service::observation::FixtureClock>,
     crate::service::venue::TradableMarket, crate::models::BookSnapshot, CandidateContext,
     Arc<crate::service::predict_fun::account::tests::SyntheticRpc>,
@@ -937,7 +940,7 @@ async fn sending_fixture_with_trace(fault: &'static str) -> (
     (Arc::new(broker), clock, market, book, candidate, transport, trace)
 }
 
-fn ack_next(broker: Arc<Broker>, stop_before_ack: bool) -> std::thread::JoinHandle<()> {
+pub(super) fn ack_next(broker: Arc<Broker>, stop_before_ack: bool) -> std::thread::JoinHandle<()> {
     ack_next_with(broker, move |broker| {
         if stop_before_ack { channel::ControlWatcher::parent_lost(broker); }
     })
@@ -1020,6 +1023,9 @@ async fn final_gate_callback_rechecks_the_current_clock_before_first_poll() {
 #[tokio::test]
 async fn original_core_broker_predict_transport_reaches_a_nonzero_fee_post_after_ack() {
     let (broker, _, market, book, candidate, transport) = sending_fixture("terminal").await;
+    // The drive loop reads and reconciles the account (sync_live) before the
+    // tick that submits; the send is bound to that read.
+    live::check_runtime_account(&broker, false).await.unwrap();
     let ack = ack_next(broker.clone(), false);
     let result = broker.take_live_candidate(taker::LiveCandidateRequest {
         market: &market, yes_book: &book, candidate: &candidate }).await;
@@ -1446,6 +1452,7 @@ async fn every_preparation_checkpoint_rechecks_the_run_before_the_order_is_sent(
 #[tokio::test]
 async fn eof_observed_before_ack_closes_the_same_state_before_original_post() {
     let (broker, _, market, book, candidate, transport) = sending_fixture("terminal").await;
+    live::check_runtime_account(&broker, false).await.unwrap();
     let ack = ack_next(broker.clone(), true);
     let result = broker.take_live_candidate(taker::LiveCandidateRequest {
         market: &market, yes_book: &book, candidate: &candidate }).await;
@@ -1596,6 +1603,7 @@ async fn preparation_refusal_closes_only_the_unsent_cash_not_the_candidate_evide
     // was reserved. Nothing was signed or sent, so the attempt's cash and the
     // candidate go away while the window and the attempt's evidence stay.
     let (broker, _, market, book, candidate, transport) = sending_fixture("book_past_limit").await;
+    live::check_runtime_account(&broker, false).await.unwrap();
     let outcome = broker.take_live_candidate(taker::LiveCandidateRequest {
         market: &market, yes_book: &book, candidate: &candidate }).await
         .expect("a moved book refuses the candidate, not the window");
@@ -1694,11 +1702,10 @@ async fn contextual_account_failures_stop_safely_without_disclosing_raw_errors()
         }
     }
     for (fault, expected) in [
-        ("account_http", "POSITIONS_READ_UNAVAILABLE_HTTP_503"),
-        ("account_transport", "POSITIONS_READ_UNAVAILABLE"),
         ("account_parse", "POSITIONS_FACT_INCOMPLETE"),
         ("account_short", "ACCOUNT_LEDGER_MISMATCH"),
-        ("account_venue", "RPC_JSON"),
+        // An untyped failure is not provably a read that could not be made:
+        // it keeps the fail-closed stop, with its existing UNKNOWN detail.
         ("account_unknown", "UNKNOWN"),
     ] {
         let (broker, _, market, _, _, transport) = sending_fixture(fault).await;
@@ -1730,6 +1737,50 @@ async fn contextual_account_failures_stop_safely_without_disclosing_raw_errors()
         assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
         assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
     }
+    // A read that could not be made is not a fact gap: the window degrades,
+    // it adds no risk, and it keeps observing instead of ending at once.
+    for fault in ["account_http", "account_transport", "account_venue"] {
+        let (broker, _, market, _, _, transport) = sending_fixture(fault).await;
+        let mut broker = Arc::try_unwrap(broker).ok().unwrap();
+        let (limit, _) = crate::service::predict_fun::controlled::synthetic_controlled_trader(200, "fixed_account");
+        broker.limit = Some(Arc::new(limit));
+        let broker = Arc::new(broker);
+        let mut cfg = ctx_fixture(broker.identity.as_ref().unwrap());
+        cfg.strategies.poll_secs = 1;
+        let client = crate::service::predict_fun::PredictFunClient::new(&cfg).unwrap();
+        let data = ShutdownData { broker: broker.clone(), market, fault: "unused",
+            reads: Default::default(), dropped_reads: Default::default(), release: Default::default() };
+        let ctx = super::super::Ctx { cfg, client, data: Arc::new(data), broker: broker.clone() };
+        let mut strategy = FaultAfterHealthyTick(transport.clone());
+        // The window keeps observing while it is degraded. If drive returned
+        // early on the unreadable account (the run-016 failure shape) this
+        // bound would not expire, and the window's own deadline is far away.
+        let observing = tokio::time::timeout(std::time::Duration::from_secs(3),
+            super::super::drive(&mut strategy, &ctx)).await;
+        assert!(observing.is_err(), "{fault}: a degraded window keeps observing");
+        {
+            let state = broker.state.lock();
+            let run = state.live.controlled.as_ref().unwrap();
+            assert!(run.degraded(), "{fault}");
+            assert!(run.control.lock().stop.is_none(), "{fault}: a degraded window is not stopped");
+            assert!(!run.may_add_risk(), "{fault}: a degraded window adds no risk");
+            assert!(!run.must_end(), "{fault}: a degraded window is not finished");
+            assert!(run.account_read.is_none());
+        }
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 0);
+        // The facts come back: one successful read restores the window by
+        // itself, without any restart and without its own stop.
+        transport.stage.store(0, Ordering::SeqCst);
+        live::check_runtime_account(&broker, false).await.unwrap();
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(!run.degraded(), "{fault}: a successful read restores the window");
+        assert!(run.control.lock().stop.is_none(), "{fault}: recovery is not a stop");
+        assert!(!run.must_end(), "{fault}: recovery does not end the window");
+        assert!(run.may_add_risk(), "{fault}: a restored window may add risk");
+        assert!(run.account_read.is_some(), "{fault}: the restored read is bound");
+    }
 }
 
 #[test]
@@ -1747,9 +1798,9 @@ fn contextual_account_diagnostics_are_public_on_the_original_output_lane() {
         .filter_map(|line| line.strip_prefix(super::super::live_events::LIVE_EVENT_PREFIX))
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     let stops: Vec<_> = events.iter().filter(|event| event["event_kind"] == "stop").collect();
-    assert_eq!(stops.len(), 6);
+    assert_eq!(stops.len(), 3);
     let finals: Vec<_> = events.iter().filter(|event| event["event_kind"] == "final").collect();
-    assert_eq!(finals.len(), 6);
+    assert_eq!(finals.len(), 3);
     for (stop, terminal) in stops.iter().zip(finals) {
         assert_eq!(stop["payload"]["reason"], "RECONCILIATION_REQUIRED");
         assert_eq!(stop["payload"]["stop_detail"], terminal["payload"]["stop_detail"]);
@@ -2156,7 +2207,7 @@ fn real_producer_streams_include_acceptance_actual_delta_and_unsent_release() {
 }
 
 /// Only the official data boundary is fake; Broker settlement/final are real.
-struct OfficialResultData {
+pub(super) struct OfficialResultData {
     result: Mutex<crate::service::venue::TradableMarket>,
     reads: std::sync::atomic::AtomicUsize,
 }
@@ -2176,7 +2227,7 @@ impl crate::service::venue::MarketData for OfficialResultData {
     }
 }
 
-fn official_result_fixture(payout: f64) -> (Broker, OfficialResultData) {
+pub(super) fn official_result_fixture(payout: f64) -> (Broker, OfficialResultData) {
     let (broker, clock) = risk_fixture();
     let (mut market, _, _) = evaluate_live_fixture(&clock, false);
     market.yes_token = "1".into();
@@ -2298,7 +2349,7 @@ async fn official_result_identity_dispute_and_revision_do_not_rewrite_ledger() {
 async fn incomplete_official_results_preserve_live_risk_and_sticky_reason() {
     use crate::bot::runtime::live_accounting::{project_window, StateFacts};
     for prior in ["READY", "DEADLINE", "CASH_PENDING", "OPEN_ATTEMPT"] {
-        let expected_reason = if ["READY", "OPEN_ATTEMPT"].contains(&prior) { "DATA_UNAVAILABLE" } else { prior };
+        let expected_reason = if ["READY", "OPEN_ATTEMPT", "CASH_PENDING"].contains(&prior) { "DATA_UNAVAILABLE" } else { prior };
         for field in ["yes", "no", "start", "end", "strike", "feed", "empty_feed", "end_price",
             "payout", "facts", "yes_status", "no_status", "all", "open_feed", "open_dispute",
             "open_unknown", "open_terminal", "open_end", "open_payout", "open_won"] {
@@ -2367,7 +2418,7 @@ async fn incomplete_official_results_preserve_live_risk_and_sticky_reason() {
                 let stop = control.stop.as_ref().unwrap();
                 assert_eq!(stop.reason, expected_reason, "{field}");
                 assert!(stop.takeover_required);
-                assert_eq!(control.state, if prior == "CASH_PENDING" { LiveRunState::WaitCash } else { LiveRunState::StopNewRisk });
+                assert_eq!(control.state, LiveRunState::StopNewRisk);
             }
             *data.result.lock() = complete;
             broker.settle_resolved(&data).await.unwrap();
@@ -2427,8 +2478,8 @@ async fn live_known_conflicts_override_missing_without_rewriting_outcomes() {
             let control = run.control.lock();
             if conflict {
                 assert!(!control.may_add_risk());
-                assert_eq!(control.stop.as_ref().unwrap().reason, if applied { "CASH_PENDING" } else { "FACT_CONFLICT" });
-                // Sticky CASH_PENDING must not hide a genuine conflict payout event.
+                assert_eq!(control.stop.as_ref().unwrap().reason, "FACT_CONFLICT");
+                assert_eq!(control.state, LiveRunState::StopNewRisk);
                 let events = run.emitter.last_seq();
                 assert!(events > seq_before, "{fault}/{applied}: conflict must emit even with a sticky stop");
             }
@@ -3024,10 +3075,41 @@ fn missing_mark_stops_without_faking_loss_and_valuation_recovery_cannot_unlock()
     let mut state = broker.state.lock();
     refresh_live_risk(&mut state);
     assert!(!state.live.controlled.as_ref().unwrap().loss_latched);
-    assert_eq!(state.live.controlled.as_ref().unwrap().control.lock().stop.as_ref().unwrap().reason,
-        "DATA_UNAVAILABLE");
-    state.marks.insert("1".into(), 0.9);
+    // A missing mark is a valuation gap, not a fact gap: the window degrades,
+    // it adds no risk, and it keeps observing instead of stopping at once.
+    assert!(state.live.controlled.as_ref().unwrap().degraded());
+    assert!(state.live.controlled.as_ref().unwrap().control.lock().stop.is_none());
     assert!(!state.live.controlled.as_ref().unwrap().may_add_risk());
+    // Only a fresh mark restores the window, so a bare price is not a recovery
+    // and it never unlocks anything: the window stays degraded, never stopped.
+    state.marks.insert("1".into(), 0.9);
+    assert!(state.live.controlled.as_ref().unwrap().degraded());
+    assert!(state.live.controlled.as_ref().unwrap().control.lock().stop.is_none());
+    assert!(!state.live.controlled.as_ref().unwrap().may_add_risk());
+}
+
+#[test]
+fn a_valuation_gap_stops_with_its_existing_code_only_after_the_read_budget() {
+    let (broker, clock) = risk_fixture();
+    apply_risk_fill(&broker, 1, 2 * SCALE, true);
+    clock.advance(10_001);
+    let mut state = broker.state.lock();
+    refresh_live_risk(&mut state);
+    // Before the budget the window observes without risk: no stop, no end.
+    {
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(run.degraded());
+        assert!(run.control.lock().stop.is_none());
+        assert!(!run.may_add_risk());
+        assert!(!run.must_end());
+    }
+    // The gap outlasts the budget: the window is blind and stops with the code
+    // it already carried, exactly as an unread fact would.
+    clock.advance(READ_FAILURE_BUDGET.as_millis() as u64 + 1);
+    refresh_live_risk(&mut state);
+    let run = state.live.controlled.as_ref().unwrap();
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "DATA_UNAVAILABLE");
+    assert!(run.must_end());
 }
 
 #[tokio::test]

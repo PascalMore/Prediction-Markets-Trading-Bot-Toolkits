@@ -18,6 +18,15 @@
 //! `WaitCash`, and neither ever becomes `Ready` again.
 
 pub mod channel;
+pub mod diagnostics;
+pub mod cash_wait;
+
+#[cfg(test)]
+#[path = "live_control/tests/r16_cash_drive.rs"]
+mod r16_cash_drive;
+#[cfg(test)]
+#[path = "live_control/tests/r16_diagnostics.rs"]
+mod r16_diagnostics;
 
 #[cfg(test)]
 #[path = "live_control/tests.rs"]
@@ -85,6 +94,37 @@ pub struct LiveStop {
     pub at: DateTime<Utc>,
 }
 
+/// How long consecutive read failures or valuation gaps may degrade the
+/// window before it stops with its existing reason.
+///
+/// The budget is the one the unread-facts wait already uses: a window that
+/// cannot read for two minutes is not observing any more, it is blind.
+pub(super) const READ_FAILURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Which failure a streak counts.
+///
+/// The kinds are kept apart so that a success in one does not clear the other:
+/// a working account read says nothing about an execution read that keeps
+/// failing, and a fresh mark says nothing about an unread venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureKind {
+    /// A read of the venue's own account or market facts failed.
+    Read,
+    /// A read of one order's execution facts failed.
+    Execution,
+    /// The valuation of a held position could not be made.
+    Valuation,
+}
+
+/// The consecutive failures that keep a window observing without adding risk.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FailureStreak {
+    /// How many failures the streak holds.
+    pub count: u32,
+    /// When the streak started.
+    pub since: DateTime<Utc>,
+}
+
 /// The controlled live run's own metadata.
 ///
 /// It lives inside the broker's state lock, next to the ledger: the pending
@@ -114,6 +154,16 @@ pub struct ControlledLiveState {
     pub output_failed: Arc<AtomicBool>,
     /// Latest complete official read tied to the ledger version it reconciled.
     pub account_read: Option<LiveAccountRead>,
+    /// Cash wait metadata, never a second balance ledger.
+    pub cash_wait: Option<cash_wait::CashWait>,
+    /// The original deadline on the run clock; it never restarts with a wait.
+    pub run_deadline_elapsed_ms: u64,
+    /// When this tick's first account read was issued.
+    ///
+    /// It is the tick's own origin for the send path's measurement: the
+    /// startup seed is not one, and a later read's receipt never overwrites
+    /// it.
+    pub tick_started_elapsed_ms: Option<u64>,
     /// Cash the opening account read already held as claimed payouts. The
     /// declared budget stays the pre-claim C0, so the opening projection adds
     /// exactly this verified credit instead of hiding it.
@@ -122,6 +172,21 @@ pub struct ControlledLiveState {
     pub mark_receipts: HashMap<String, crate::service::observation::CheckTime>,
     /// Monotone within this risk window; a recovered valuation cannot clear it.
     pub loss_latched: bool,
+    /// The consecutive failures that keep this window observing without risk.
+    ///
+    /// A failed read or an unvaluable holding degrades the window instead of
+    /// stopping it: the window keeps watching, adds no risk, and recovers by
+    /// itself when the facts come back.
+    pub(super) read_failures: Option<FailureStreak>,
+    /// The consecutive execution-read failures of this window.
+    pub(super) execution_failures: Option<FailureStreak>,
+    /// The consecutive valuation gaps of this window.
+    pub(super) valuation_failures: Option<FailureStreak>,
+    /// Whether the window is degraded: it observes, but it adds no risk.
+    ///
+    /// The flag is derived from the streaks and kept beside them so that the
+    /// entry checks can read it without taking three locks.
+    pub(super) degraded: bool,
     /// Preserve the first complete triggering value even if later marks recover.
     pub(super) loss_trigger: Option<super::live_accounting::SignedAtoms>,
     pub(super) loss_event_emitted: bool,
@@ -176,19 +241,31 @@ impl RunControl {
         self.state.may_add_risk() && !self.output_failed.load(Ordering::SeqCst)
     }
 
+    /// Whether the run must be finished at once.
+    ///
+    /// Only a stop or a broken output lane ends a window. A window that is
+    /// merely degraded still observes: it may not add risk, but it waits for
+    /// its own facts to come back, so it is not finished.
+    pub fn must_end(&self) -> bool {
+        !matches!(self.state, LiveRunState::Ready | LiveRunState::WaitCash)
+            || self.output_failed.load(Ordering::SeqCst)
+    }
+
     /// Stop adding risk, and say why.
     ///
     /// The stop is sticky: once the run has stopped, it never becomes ready
     /// again, whatever the market does.
     pub fn stop(&mut self, reason: &str, takeover_required: bool, at: DateTime<Utc>) {
-        if self.state == LiveRunState::Ready {
+        let replace_wait = self.state == LiveRunState::WaitCash
+            && reason != crate::bot::runtime::live_events::reason::CASH_PENDING;
+        if self.state == LiveRunState::Ready || replace_wait {
             self.state = if reason == crate::bot::runtime::live_events::reason::CASH_PENDING {
                 LiveRunState::WaitCash
             } else {
                 LiveRunState::StopNewRisk
             };
         }
-        if self.stop.is_none() {
+        if self.stop.is_none() || replace_wait {
             self.stop = Some(LiveStop {
                 reason: reason.to_string(),
                 detail: None,
@@ -204,7 +281,8 @@ impl RunControl {
     /// takeover flag or the code an earlier one recorded.
     pub fn stop_with_detail(&mut self, reason: &str, detail: &str,
                             takeover_required: bool, at: DateTime<Utc>) {
-        let first = self.stop.is_none();
+        let first = self.stop.is_none() || (self.state == LiveRunState::WaitCash
+            && reason != crate::bot::runtime::live_events::reason::CASH_PENDING);
         self.stop(reason, takeover_required, at);
         if first {
             if let Some(stop) = self.stop.as_mut() {
@@ -248,8 +326,68 @@ pub struct LiveOutcome {
 
 impl ControlledLiveState {
     /// Whether the run is in a state where it may add risk.
+    ///
+    /// A degraded window may not add risk: it observes until its facts come
+    /// back. Degradation is not a stop — the run's own state machine still
+    /// says `Ready`, and a success restores trading.
     pub fn may_add_risk(&self) -> bool {
-        self.control.lock().may_add_risk()
+        self.control.lock().may_add_risk() && !self.degraded
+    }
+
+    /// Whether the window must be finished at once.
+    ///
+    /// A degraded window is not finished: it observes until its facts come
+    /// back, and only a stop or a broken output lane ends it.
+    pub fn must_end(&self) -> bool {
+        self.control.lock().must_end() || self.phase1.clock.now().map_or(true, |now| {
+            now.utc >= self.options.deadline_at || now.elapsed_ms >= self.run_deadline_elapsed_ms
+                || self.cash_wait.as_ref().is_some_and(|wait| !wait.may_continue(
+                    now, self.options.deadline_at, self.run_deadline_elapsed_ms))
+        })
+    }
+
+    /// Record one failure of a kind and say whether the window must stop.
+    ///
+    /// A failure inside the budget degrades the window: it keeps observing,
+    /// it adds no risk, and it recovers by itself when the facts come back.
+    /// A streak that outlasts the budget is a blind window, and it stops with
+    /// the reason that failure already carries.
+    pub(super) fn note_failure(
+        &mut self, kind: FailureKind, reason: &str, now: DateTime<Utc>,
+    ) -> bool {
+        let streak = match kind {
+            FailureKind::Read => &mut self.read_failures,
+            FailureKind::Execution => &mut self.execution_failures,
+            FailureKind::Valuation => &mut self.valuation_failures,
+        };
+        let streak = streak.get_or_insert(FailureStreak { count: 0, since: now });
+        streak.count += 1;
+        let since = streak.since;
+        self.degraded = true;
+        if now.signed_duration_since(since) >= chrono::Duration::from_std(READ_FAILURE_BUDGET)
+            .unwrap_or_else(|_| chrono::Duration::zero())
+        {
+            self.stop(reason, true, now);
+            return true;
+        }
+        false
+    }
+
+    /// Clear the streak of a kind: its facts came back.
+    pub(super) fn clear_failure(&mut self, kind: FailureKind) {
+        match kind {
+            FailureKind::Read => self.read_failures = None,
+            FailureKind::Execution => self.execution_failures = None,
+            FailureKind::Valuation => self.valuation_failures = None,
+        }
+        self.degraded = self.read_failures.is_some()
+            || self.execution_failures.is_some()
+            || self.valuation_failures.is_some();
+    }
+
+    /// Whether the window is degraded: it observes, but it adds no risk.
+    pub fn degraded(&self) -> bool {
+        self.degraded
     }
 }
 
@@ -276,6 +414,11 @@ pub struct LiveCandidateGuard {
     emitter: Arc<LiveEventEmitter>,
     binding: Option<GuardBinding>,
     bound: Mutex<Option<SignedExecutionBound>>,
+    /// The measurements this attempt froze: the tick's account receipt and
+    /// the candidate's own book and spot clocks.
+    measurement: Mutex<Option<diagnostics::FrozenMeasurement>>,
+    /// The first send check that failed for this attempt.
+    diagnostic: Mutex<Option<crate::service::venue::SendCheckObservation>>,
 }
 
 struct GuardBinding {
@@ -330,6 +473,8 @@ impl LiveCandidateGuard {
             emitter,
             binding: None,
             bound: Mutex::new(None),
+            measurement: Mutex::new(None),
+            diagnostic: Mutex::new(None),
         }
     }
 
@@ -338,6 +483,13 @@ impl LiveCandidateGuard {
         handle: crate::service::venue::AttemptHandle, route: String,
     ) -> Self {
         self.binding = Some(GuardBinding { state, candidate, handle, route });
+        if let Some(binding) = &self.binding {
+            let state = binding.state.lock();
+            if let Some(run) = &state.live.controlled {
+                self.freeze_measurement(run.account_read.as_ref().map(|read| read.checked),
+                    run.tick_started_elapsed_ms);
+            }
+        }
         self
     }
 
@@ -348,11 +500,12 @@ impl LiveCandidateGuard {
     ) -> Result<()> {
         let binding = self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         let bound = self.bound.lock().clone();
+        let diagnostic = self.diagnostic();
         let events = {
             let mut state = binding.state.lock();
             let mut events = Vec::new();
             if let Some(event) = super::live_events::prepare_order(&state, self.attempt_id,
-                bound.as_ref(), metadata, event_reason).map_err(anyhow::Error::msg)?
+                bound.as_ref(), metadata, event_reason, diagnostic).map_err(anyhow::Error::msg)?
             { events.push(event); }
             if let Some(event) = super::live_events::prepare_release(&state, self.attempt_id,
                 previous_reservation, event_reason).map_err(anyhow::Error::msg)?
@@ -364,33 +517,61 @@ impl LiveCandidateGuard {
     }
 
     /// Recheck the actual core and original ledger without holding a lock over IO.
+    ///
+    /// The stage names the boundary this check belongs to, so the diagnostic
+    /// says where the refusal happened. The original order of the checks is
+    /// unchanged: the attempt binding is proved first, then the identity,
+    /// then the frozen input.
     fn check_locked(&self, state: &mut State, bound: &SignedExecutionBound,
-        frozen: FrozenInput,
+        frozen: FrozenInput, stage: crate::service::venue::SendCheckStage,
     ) -> Result<crate::bot::arbitrage::phase1::DecisionDiagnostic> {
         use super::live_accounting as accounting;
         use crate::service::venue::{AttemptPhase, Submission};
         use crate::bot::arbitrage::phase1::{recheck_diagnostic, Phase};
+        use crate::service::venue::SendCheckDetail;
         let binding = self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         refresh_live_risk(state);
         let run = state.live.controlled.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         let now = run.phase1.clock.now()?;
         let candidate = &binding.candidate;
         let record = binding.handle.lock().clone();
-        let read = run.account_read.as_ref().ok_or_else(|| anyhow::anyhow!("READ_UNAVAILABLE"))?;
+        let read = run.account_read.as_ref().ok_or_else(|| {
+            self.record_check_at(now, stage, SendCheckDetail::ReadUnavailable);
+            anyhow::anyhow!("READ_UNAVAILABLE")
+        })?;
         if state.halted || state.entry_stop_reason.is_some() || !run.may_add_risk()
             || !run.options.in_window(now.utc) || run.loss_latched
-        { bail!("RUN_STOPPED"); }
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::RunStopped);
+            bail!("RUN_STOPPED");
+        }
+        // The attempt this guard belongs to: the emitter, the handle, the
+        // candidate and the pending reservation must all be the same ones.
         if !Arc::ptr_eq(&self.emitter, &run.emitter)
             || !state.live.attempts.get(&self.attempt_id).is_some_and(|handle| Arc::ptr_eq(handle, &binding.handle))
             || run.attempt_candidates.get(&self.attempt_id) != Some(&self.candidate_id)
             || !run.pending_candidate.as_ref().is_some_and(|pending| pending.context.same_candidate(candidate)
                 && pending.worst_cash_atoms == record.r0)
             || record.identity.local_attempt_id != self.attempt_id
-            || record.identity.signed_hash.as_deref() != Some(&bound.signed_hash)
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::AttemptMismatch);
+            bail!("INPUT_CHANGED");
+        }
+        // The identity of the order: hash, account, market, token and side.
+        if record.identity.signed_hash.as_deref() != Some(&bound.signed_hash)
             || record.identity.account != run.identity || bound.account != run.identity
             || record.identity.market_id != candidate.market_id() || bound.market_id != candidate.market_id()
             || record.identity.token_id != candidate.token() || bound.token_id != candidate.token()
-            || record.identity.side != crate::models::Side::Buy || bound.route != binding.route
+            || record.identity.side != crate::models::Side::Buy
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::IdentityMismatch);
+            bail!("INPUT_CHANGED");
+        }
+        // The frozen input itself: route, fee, quantity, bound and phase.
+        if bound.route != binding.route
             || bound.fee_rate_bps != candidate.fee_rate_bps()
             || record.request_gross_atoms != bound.request_gross_atoms
             || bound.request_gross_atoms != crate::service::predict_fun::controlled::quantity_atoms(candidate.gross_shares())?
@@ -399,11 +580,23 @@ impl LiveCandidateGuard {
             || record.phase != AttemptPhase::Prepared || record.submission != Submission::NotSubmitted
             || bound.max_cash_atoms != bound.gross_cash_atoms || bound.max_cash_atoms > record.r0
             || bound.expiration <= now.utc.timestamp()
-        { bail!("INPUT_CHANGED"); }
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::FrozenInput);
+            bail!("INPUT_CHANGED");
+        }
         if !fresh_receipt(read.checked, now) || !read.snapshot.complete
             || read.snapshot.identity != run.identity || read.generations != state.live.generation
             || read.next_attempt_id.checked_add(1) != Some(state.live.next_attempt_id)
-        { bail!("READ_UNAVAILABLE"); }
+        {
+            let detail = if !fresh_receipt(read.checked, now) { SendCheckDetail::AccountStale }
+                else if !read.snapshot.complete { SendCheckDetail::AccountIncomplete }
+                else if read.snapshot.identity != run.identity { SendCheckDetail::IdentityMismatch }
+                else if read.generations != state.live.generation { SendCheckDetail::GenerationMismatch }
+                else { SendCheckDetail::AttemptMismatch };
+            self.record_check_at(now, stage, detail);
+            bail!("READ_UNAVAILABLE");
+        }
         let risk = accounting::risk_exposure(&state.live).ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE"))?;
         let (cost, reserved) = risk.markets.get(&bound.market_id).copied().unwrap_or_default();
         let total = risk.cost.checked_add(risk.reserved).ok_or_else(|| anyhow::anyhow!("FACT_CONFLICT"))?;
@@ -413,7 +606,11 @@ impl LiveCandidateGuard {
             || market > params.market || total > params.total
             || risk.reserved > params.budget.checked_sub(risk.cost).unwrap_or(U256::ZERO)
             || read.snapshot.collateral_atoms.is_none_or(|cash| risk.reserved > cash)
-        { bail!("SIGNED_BOUND_UNPROVEN"); }
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::SignedBoundUnproven);
+            bail!("SIGNED_BOUND_UNPROVEN");
+        }
         let gas = read.snapshot.gas_atoms.zip(state.live.baseline.as_ref().and_then(|snapshot| snapshot.gas_atoms))
             .map(|(balance_atoms, initial_atoms)| accounting::GasReading { balance_atoms, initial_atoms });
         if gas.is_none_or(|gas| gas.balance_atoms > gas.initial_atoms)
@@ -428,6 +625,9 @@ impl LiveCandidateGuard {
             // send permission this is a refusal of this candidate only: the
             // attempt is still `Prepared`/`NotSubmitted`, so the venue proved
             // nothing was sent. Under the permission it stops the window.
+            let detail = diagnostics::detail_of_core_reason(&diagnostic.reason);
+            drop(state);
+            self.record_check_at(now, stage, detail);
             return match frozen {
                 FrozenInput::Candidate => Err(crate::service::venue::CandidateRefused.into()),
                 FrozenInput::Window => bail!("INPUT_CHANGED"),
@@ -439,13 +639,69 @@ impl LiveCandidateGuard {
             bound.request_gross_atoms, run.phase1.min_edge)?;
         if bound.min_net_shares_atoms.is_zero()
             || value.checked_sub(bound.max_cash_atoms).is_none_or(|net| net < edge)
-        { bail!("SIGNED_BOUND_UNPROVEN"); }
+        {
+            drop(state);
+            self.record_check_at(now, stage, SendCheckDetail::EdgeBelowMin);
+            bail!("SIGNED_BOUND_UNPROVEN");
+        }
         Ok(diagnostic)
     }
 
     /// The attempt this guard belongs to.
     pub fn attempt_id(&self) -> u64 {
         self.attempt_id
+    }
+
+    /// Freeze the measurements this attempt's checks report against.
+    ///
+    /// The tick's account receipt and the candidate's own book and spot
+    /// clocks are read once, here, so every later check of the same attempt
+    /// reports the same ages.
+    pub(super) fn freeze_measurement(&self, account_receipt: Option<crate::service::observation::CheckTime>,
+                                    tick_started_elapsed_ms: Option<u64>) {
+        let Some(binding) = self.binding.as_ref() else { return; };
+        let mut measurement = self.measurement.lock();
+        if measurement.is_some() {
+            return;
+        }
+        *measurement = Some(diagnostics::FrozenMeasurement::freeze(
+            &binding.candidate, account_receipt, tick_started_elapsed_ms,
+        ));
+    }
+
+    /// The diagnostic of the first check that failed for this attempt.
+    fn diagnostic(&self) -> Option<super::live_events::OrderDiagnostic> {
+        let observation = self.diagnostic.lock().clone()?;
+        Some(super::live_events::OrderDiagnostic::from_observation(&observation))
+    }
+
+    /// Record a send check's outcome.
+    ///
+    /// The first failure wins: a later success never overwrites the reason
+    /// the order did not go out. The clock is passed in because the caller
+    /// already holds the State lock this guard is bound to.
+    fn record_check_at(&self, now: crate::service::observation::CheckTime,
+                       stage: crate::service::venue::SendCheckStage,
+                       detail: crate::service::venue::SendCheckDetail) {
+        let ages = self.measurement.lock().as_ref()
+            .map(|measurement| measurement.ages(now))
+            .unwrap_or_default();
+        let observation = diagnostics::project(stage, detail, now, ages);
+        let mut diagnostic = self.diagnostic.lock();
+        if diagnostic.as_ref().is_none_or(|prior| prior.detail == crate::service::venue::SendCheckDetail::None) {
+            *diagnostic = Some(observation);
+        }
+    }
+
+    /// The check's own clock, taken from the run the guard belongs to.
+    ///
+    /// Only for the callers that do not hold the State lock: the bound
+    /// state's lock is not re-entrant.
+    fn check_time(&self) -> Option<crate::service::observation::CheckTime> {
+        let binding = self.binding.as_ref()?;
+        let state = binding.state.lock();
+        state.live.controlled.as_ref()
+            .and_then(|run| run.phase1.clock.now().ok())
     }
 
     /// The candidate this guard belongs to.
@@ -487,19 +743,57 @@ impl LiveCandidateGuard {
 }
 
 impl ControlledSendGuard for LiveCandidateGuard {
+    fn note_send_check(&self, stage: crate::service::venue::SendCheckStage,
+        detail: crate::service::venue::SendCheckDetail) {
+        if let Some(now) = self.check_time() { self.record_check_at(now, stage, detail); }
+    }
     fn check_preparation(&self) -> Result<()> {
         let binding = self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         let mut state = binding.state.lock();
         refresh_live_risk(&mut state);
         let run = state.live.controlled.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         let now = run.phase1.clock.now()?;
-        if state.halted || state.entry_stop_reason.is_some() || !run.may_add_risk()
-            || !run.options.in_window(now.utc) || !binding.candidate.inputs_unchanged()
-        { bail!("RUN_STOPPED"); }
+        let stopped = state.halted || state.entry_stop_reason.is_some() || !run.may_add_risk()
+            || !run.options.in_window(now.utc);
+        if stopped || !binding.candidate.inputs_unchanged()
+        {
+            drop(state);
+            self.record_check_at(now,
+                crate::service::venue::SendCheckStage::Prepare,
+                if stopped { crate::service::venue::SendCheckDetail::RunStopped }
+                else { crate::service::venue::SendCheckDetail::FrozenInput },
+            );
+            bail!("RUN_STOPPED");
+        }
         drop(state);
         #[cfg(test)]
         candidate_tests::preparation_checkpoint(self);
         Ok(())
+    }
+
+    /// The receipt-bound account read this attempt prepares from.
+    ///
+    /// It is the tick's own read: `check_locked` proves its completeness,
+    /// identity, ledger generation, attempt binding and ten-second freshness at
+    /// every later check, so the adapter does not age the frozen book with a
+    /// second full account read.
+    fn account_snapshot(&self) -> Result<crate::service::venue::AccountSnapshot> {
+        let binding = self.binding.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
+        let state = binding.state.lock();
+        state
+            .live
+            .controlled
+            .as_ref()
+            .and_then(|run| run.account_read.as_ref())
+            .map(|read| read.snapshot.clone())
+            .ok_or_else(|| {
+                VenueError::new(
+                    VenueErrorCode::ReadUnavailable,
+                    "controlled_send",
+                    "READ_UNAVAILABLE",
+                )
+                .into()
+            })
     }
 
     fn check_book(&self, book: &crate::models::BookSnapshot) -> Result<()> {
@@ -515,6 +809,10 @@ impl ControlledSendGuard for LiveCandidateGuard {
         // A book missing a whole side is missing data, not a refused decision:
         // retrying the same decision against it cannot succeed.
         if book.asks.is_empty() || book.bids.is_empty() {
+            self.note_send_check(
+                crate::service::venue::SendCheckStage::Prepare,
+                crate::service::venue::SendCheckDetail::EmptyBook,
+            );
             return Err(VenueError::new(
                 VenueErrorCode::ReadUnavailable,
                 "controlled_send",
@@ -536,7 +834,8 @@ impl ControlledSendGuard for LiveCandidateGuard {
             // Nothing has been emitted for this order and no acknowledgement
             // slot is waiting yet: a frozen input that no longer stands here is
             // this candidate's refusal, and the transport never saw a byte.
-            self.check_locked(&mut state, bound, FrozenInput::Candidate)?;
+            self.check_locked(&mut state, bound, FrozenInput::Candidate,
+                crate::service::venue::SendCheckStage::Facts)?;
             let mut prepared = self.bound.lock();
             if prepared.is_some() { bail!("INPUT_CHANGED"); }
             self.expect_hash(&bound.signed_hash);
@@ -594,7 +893,8 @@ impl ControlledSendGuard for LiveCandidateGuard {
                 let mut state = binding.state.lock();
                 // Still before the acknowledgement slot: a frozen input that
                 // no longer stands ends this candidate, not the window.
-                self.check_locked(&mut state, bound, FrozenInput::Candidate)?;
+                self.check_locked(&mut state, bound, FrozenInput::Candidate,
+                    crate::service::venue::SendCheckStage::Ack)?;
                 if self.bound.lock().as_ref() != Some(bound) { bail!("INPUT_CHANGED"); }
                 let run = state.live.controlled.as_ref().unwrap();
                 let now = run.phase1.clock.now()?;
@@ -608,6 +908,7 @@ impl ControlledSendGuard for LiveCandidateGuard {
                         min_net_shares_atoms: Some(bound.min_net_shares_atoms.to_string()),
                         expires_at: DateTime::from_timestamp(bound.expiration, 0), removal_locked_until: None,
                         reason: "NONE".into(),
+                        diagnostic: None,
                     })).map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?;
                 let channel = Arc::clone(&run.channel);
                 channel.expect(event.seq, &bound.signed_hash).map_err(|_| anyhow::anyhow!("CONTROL_CHANNEL"))?;
@@ -619,13 +920,20 @@ impl ControlledSendGuard for LiveCandidateGuard {
                 let mut state = binding.state.lock();
                 // The acknowledgement slot is already waiting: nothing may be
                 // left dangling, so this change stops the window.
-                self.check_locked(&mut state, bound, FrozenInput::Window)?;
+                self.check_locked(&mut state, bound, FrozenInput::Window,
+                    crate::service::venue::SendCheckStage::Ack)?;
                 if channel.is_confirmed(seq, &bound.signed_hash) {
                     self.acked.store(true, Ordering::SeqCst);
                     break;
                 }
                 if started.elapsed() >= std::time::Duration::from_secs(15) {
                     state.live.controlled.as_mut().unwrap().stop("AUDIT_UNAVAILABLE", true, Utc::now());
+                    let now = state.live.controlled.as_ref().unwrap().phase1.clock.now()?;
+                    drop(state);
+                    self.record_check_at(now,
+                        crate::service::venue::SendCheckStage::Ack,
+                        crate::service::venue::SendCheckDetail::AckUnavailable,
+                    );
                     bail!("AUDIT_UNAVAILABLE");
                 }
                 drop(state);
@@ -672,7 +980,8 @@ impl ControlledSendGuard for LiveCandidateGuard {
             if !Arc::ptr_eq(handle, &binding.handle) || !self.is_acked() { bail!("AUDIT_UNAVAILABLE"); }
             let bound = self.bound.lock().clone().ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN"))?;
             let mut state = binding.state.lock();
-            self.check_locked(&mut state, &bound, FrozenInput::Window)?;
+            self.check_locked(&mut state, &bound, FrozenInput::Window,
+                crate::service::venue::SendCheckStage::SendPermit)?;
             // State remains locked while waiting for the account gate. Capture
             // accounting here (it reads attempt handles), but defer the core
             // clock/diagnostic to the callback inside the gate, before first poll.
@@ -683,44 +992,85 @@ impl ControlledSendGuard for LiveCandidateGuard {
                 || record.request_gross_atoms != bound.request_gross_atoms
                 || record.identity.account != bound.account || record.identity.market_id != bound.market_id
                 || record.identity.token_id != bound.token_id || record.r0 < bound.max_cash_atoms
-            { bail!("INPUT_CHANGED"); }
+            {
+                drop(record);
+                let now = state.live.controlled.as_ref().unwrap().phase1.clock.now()?;
+                drop(state);
+                self.record_check_at(now,
+                    crate::service::venue::SendCheckStage::SendPermit,
+                    crate::service::venue::SendCheckDetail::IdentityMismatch,
+                );
+                bail!("INPUT_CHANGED");
+            }
             let mut permit = self.permit.lock();
             if *permit != Some(PermitState::Ready) { bail!("SUBMISSION_UNKNOWN"); }
             *permit = Some(PermitState::Consumed);
             // State -> handle -> AccountGate -> first transport poll. No IO,
             // await or post-poll state reconstruction is inserted here.
             let run = state.live.controlled.as_ref().unwrap();
+            let min_edge = run.phase1.min_edge;
+            let min_secs_left = run.phase1.min_secs_left;
+            // The final check's own outcome, kept until the handoff returns:
+            // the callback cannot take the State lock again, so the record
+            // happens once the closure is done with it.
+            let mut permit_detail: Option<crate::service::venue::SendCheckDetail> = None;
+            let mut permit_checked = None;
             let mut last_clock_check = || {
                 use crate::bot::arbitrage::phase1::{recheck_diagnostic, Phase};
                 let now = run.phase1.clock.now()?;
                 let (diagnostic, checked) = recheck_diagnostic(&binding.candidate, now, Phase::FinalSend,
-                    run.phase1.min_edge, run.phase1.min_secs_left);
+                    min_edge, min_secs_left);
+                permit_checked = Some(now);
+                let reason = diagnostic.reason.clone();
                 final_event = Some(self.emitter.prepare(now.utc, Some(bound.market_id.to_string()), None,
                     &accounting, LivePayload::Decision(DecisionPayload { decision: diagnostic }))
                     .map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?);
                 if checked.is_none() || !run.options.in_window(now.utc)
                     || !run.may_add_risk() || bound.expiration <= now.utc.timestamp()
                     || !fresh_receipt(run.account_read.as_ref().unwrap().checked, now)
-                { bail!("INPUT_CHANGED"); }
+                {
+                    // The final check refused: the order was not handed over.
+                    // The core's own reason names the frozen input that aged
+                    // out; it is not replaced by a more precise guess.
+                    let detail = diagnostics::detail_of_core_reason(&reason);
+                    permit_detail = Some(if detail == crate::service::venue::SendCheckDetail::Unknown {
+                        crate::service::venue::SendCheckDetail::FrozenInput
+                    } else { detail });
+                    bail!("INPUT_CHANGED");
+                }
                 Ok(())
             };
             let handoff = first_poll(&mut record, &mut last_clock_check);
             let actual = record.clone();
             drop(permit);
             drop(record);
+            // The final check refused, or it completed: the diagnostic says
+            // which, and it is taken after the State lock is released.
+            let permit_detail = permit_detail.unwrap_or(if handoff.is_ok() {
+                crate::service::venue::SendCheckDetail::None
+            } else {
+                crate::service::venue::SendCheckDetail::SubmissionUnknown
+            });
+            drop(state);
+            if let Some(permit_now) = permit_checked {
+                self.record_check_at(permit_now,
+                    crate::service::venue::SendCheckStage::SendPermit, permit_detail);
+            }
+            let state = binding.state.lock();
             if final_event.is_none() {
                 if handoff.is_ok() { bail!("AUDIT_UNAVAILABLE"); }
                 // A gate refusal can happen without invoking the callback. It
                 // never sent; record a current core diagnostic, not an old pass.
-                let now = run.phase1.clock.now()?;
+                let now = state.live.controlled.as_ref().unwrap().phase1.clock.now()?;
                 let (diagnostic, _) = crate::bot::arbitrage::phase1::recheck_diagnostic(
                     &binding.candidate, now, crate::bot::arbitrage::phase1::Phase::FinalSend,
-                    run.phase1.min_edge, run.phase1.min_secs_left);
+                    min_edge, min_secs_left);
                 final_event = Some(self.emitter.prepare(now.utc, Some(bound.market_id.to_string()), None,
                     &accounting, LivePayload::Decision(DecisionPayload { decision: diagnostic }))
                     .map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?);
             }
-            let order_event = self.emitter.prepare(run.phase1.clock.now()?.utc,
+            let order_event = self.emitter.prepare(
+                state.live.controlled.as_ref().unwrap().phase1.clock.now()?.utc,
                 Some(bound.market_id.to_string()), Some(bound.token_id.clone()),
                 &live_events::state_accounting(&state), LivePayload::Order(live_events::OrderPayload {
                     candidate_id: self.candidate_id.clone(), attempt_id: self.attempt_id.to_string(),
@@ -731,6 +1081,7 @@ impl ControlledSendGuard for LiveCandidateGuard {
                     min_net_shares_atoms: Some(bound.min_net_shares_atoms.to_string()),
                     expires_at: DateTime::from_timestamp(bound.expiration, 0), removal_locked_until: None,
                     reason: if handoff.is_ok() { "NONE" } else { "INPUT_CHANGED" }.into(),
+                    diagnostic: self.diagnostic(),
                 })).map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"));
             drop(state);
             final_event.expect("the final callback or gate refusal supplied the diagnostic")
@@ -805,6 +1156,10 @@ impl ControlledLiveState {
             Arc::clone(&event_seq), Arc::clone(&output_failed),
         ));
         let control = Arc::new(Mutex::new(RunControl::new(Arc::clone(&output_failed))));
+        let run_deadline_elapsed_ms = phase1.clock.now().ok().and_then(|now| {
+            let remaining = (options.deadline_at - now.utc).num_milliseconds();
+            (remaining >= 0).then(|| now.elapsed_ms.saturating_add(remaining as u64))
+        }).unwrap_or(0);
         Self {
             phase1,
             options,
@@ -817,9 +1172,16 @@ impl ControlledLiveState {
             event_seq,
             output_failed,
             account_read: None,
+            cash_wait: None,
+            run_deadline_elapsed_ms,
+            tick_started_elapsed_ms: None,
             opening_claim_cash: U256::ZERO,
             mark_receipts: HashMap::new(),
             loss_latched: false,
+            read_failures: None,
+            execution_failures: None,
+            valuation_failures: None,
+            degraded: false,
             loss_trigger: None,
             loss_event_emitted: false,
             stop_event_emitted: false,
@@ -841,17 +1203,27 @@ impl ControlledLiveState {
     /// The stop is sticky: once the run has stopped, it never becomes ready
     /// again, whatever the market does.
     pub fn stop(&mut self, reason: &str, takeover_required: bool, at: DateTime<Utc>) {
-        self.control
-            .lock()
-            .stop(reason, takeover_required, at);
+        if reason == super::live_events::reason::CASH_PENDING && self.cash_wait.is_none() {
+            match self.phase1.clock.now() {
+                Ok(now) => self.cash_wait = Some(cash_wait::CashWait::begin(now, Vec::new())),
+                Err(_) => { self.stop("DATA_UNAVAILABLE", true, at); return; }
+            }
+        }
+        let mut control = self.control.lock();
+        let waiting = control.state == LiveRunState::WaitCash;
+        control.stop(reason, takeover_required, at);
+        if waiting && control.state != LiveRunState::WaitCash { self.stop_event_emitted = false; }
     }
 
     /// Stop adding risk with the failure code that was already in hand.
     pub fn stop_with_detail(&mut self, reason: &str, detail: &str,
                             takeover_required: bool, at: DateTime<Utc>) {
-        self.control
-            .lock()
-            .stop_with_detail(reason, detail, takeover_required, at);
+        let before = self.control.lock().stop.clone();
+        self.stop(reason, takeover_required, at);
+        let mut control = self.control.lock();
+        if before != control.stop {
+            if let Some(stop) = control.stop.as_mut() { stop.detail = Some(detail.to_string()); }
+        }
     }
 }
 
@@ -876,6 +1248,7 @@ pub(super) fn credit_claim(
     state: &mut State, id: u64, inventory: U256, cash: U256,
 ) -> (Option<(U256, U256)>, bool) {
     use crate::bot::runtime::live_events::reason;
+    if state.live.claims.get(&id) == Some(&(inventory, cash)) { return (None, false); }
     // The judgment gate: only a confirmed official result that owes exactly
     // this claim may turn the claim into ledger cash.
     let exact = state.live.controlled.as_ref().is_some_and(|run| {
@@ -886,6 +1259,11 @@ pub(super) fn credit_claim(
     if !exact {
         // Not cash yet: keep the proven claim apart from the ledger's cash.
         state.live.pending_claims.insert(id, (inventory, cash));
+        if let Some(run) = state.live.controlled.as_mut() {
+            let at = run.phase1.clock.now().map_or_else(|_| chrono::Utc::now(), |now| now.utc);
+            run.stop(reason::CASH_PENDING, true, at);
+            if let Some(wait) = run.cash_wait.as_mut() { wait.add_pending(id); }
+        }
         return (None, false);
     }
     state.live.pending_claims.remove(&id);
@@ -911,8 +1289,13 @@ pub(super) fn credit_claim(
             })
         })
     };
-    if !settled { return (Some((inventory, cash)), false); }
+    if !settled || state.live.attempts.values().any(|handle| handle.lock().phase != crate::service::venue::AttemptPhase::Closed)
+        || state.live.reservations.values().any(|reserved| !reserved.is_zero()) {
+        return (Some((inventory, cash)), false);
+    }
     let run = state.live.controlled.as_mut().unwrap();
+    cash_wait::observe_budget(run);
+    if run.must_end() || run.loss_latched { return (Some((inventory, cash)), false); }
     let mut control = run.control.lock();
     let open_wait = control.state == LiveRunState::WaitCash
         && control.stop.as_ref().is_some_and(|stop| stop.reason == reason::CASH_PENDING);
@@ -922,6 +1305,8 @@ pub(super) fn credit_claim(
     drop(control);
     // The wait is over, so a later stop of the same run is its own fact.
     run.stop_event_emitted = false;
+    run.cash_wait = None;
+    run.pending_candidate = None;
     (Some((inventory, cash)), true)
 }
 
@@ -932,23 +1317,22 @@ pub(super) fn credit_claim(
 /// atom off stays unbooked and keeps the run waiting for the cash it is owed.
 ///
 /// Returns `true` when this claim was booked.
-pub(super) fn promote_pending_claim(state: &mut State, id: u64, inventory: U256, cash: U256) -> bool {
+pub(super) fn promote_pending_claim(state: &mut State, id: u64, inventory: U256, cash: U256)
+    -> (Option<(U256, U256)>, bool) {
     if !state
         .live
         .pending_claims
         .get(&id)
         .is_some_and(|(held, paid)| *held == inventory && *paid == cash)
     {
-        return false;
+        return (None, false);
     }
-    state.live.pending_claims.remove(&id);
-    state.live.claims.insert(id, (inventory, cash));
-    if let Some(run) = state.live.controlled.as_mut() {
-        if let Some(outcome) = run.attempt_outcomes.get_mut(&id) {
-            outcome.cash_confirmed = true;
-        }
-    }
-    true
+    // A tuple alone is not a current-generation account proof. Runtime reads
+    // revalidate the full batch before invoking the single credit path.
+    let current = state.live.controlled.as_ref().and_then(|run| run.account_read.as_ref())
+        .is_some_and(|read| read.next_attempt_id == state.live.next_attempt_id
+            && read.generations == state.live.generation);
+    if current { credit_claim(state, id, inventory, cash) } else { (None, false) }
 }
 
 /// Bind a complete reconciled account response to the same locked ledger version.
@@ -1002,8 +1386,13 @@ pub(super) fn fresh_marks(state: &State) -> super::live_accounting::Marks {
 
 /// Revalue actual net inventory with fresh original-mid marks and latch loss.
 /// Unknown valuation stops risk, but never manufactures a threshold crossing.
+///
+/// A valuation gap and a fact gap are different failures. A missing fresh
+/// mark means the window cannot price what it holds: it stops adding risk and
+/// keeps observing, and a fresh mark restores it. A missing fact means the
+/// window cannot know what it owns: that keeps its existing stop semantics.
 pub(super) fn refresh_live_risk(state: &mut State) {
-    use super::live_accounting::{self, AccountingStatus, StateFacts};
+    use super::live_accounting::{self, AccountingStatus, ProjectionGap, StateFacts};
     let Some(run) = state.live.controlled.as_ref() else { return; };
     let Ok(now) = run.phase1.clock.now() else {
         state.live.controlled.as_mut().unwrap().stop("DATA_UNAVAILABLE", true, Utc::now());
@@ -1014,6 +1403,9 @@ pub(super) fn refresh_live_risk(state: &mut State) {
     let overrun = state.live.attempts.iter().any(|(id, handle)| {
         state.live.observed_risk_floor.get(id).is_some_and(|floor| *floor > handle.lock().r0)
     });
+    // A valuation gap is recoverable: the window keeps observing without
+    // adding risk, and a fresh mark lets it trade again. A fact gap is not.
+    let valuation_gap = accounting.status == AccountingStatus::Incomplete(ProjectionGap::UnknownMark);
     let run = state.live.controlled.as_mut().unwrap();
     if accounting.status == AccountingStatus::Complete && accounting.loss_latched {
         if !run.loss_latched { run.loss_trigger = Some(accounting.net_pnl); }
@@ -1022,8 +1414,18 @@ pub(super) fn refresh_live_risk(state: &mut State) {
     }
     if overrun || accounting.status == AccountingStatus::Conflict {
         run.stop("FACT_CONFLICT", true, now.utc);
+    } else if valuation_gap {
+        // The mark is missing, not the fact: this window keeps watching.
+        // The stop itself, when the budget is out, is recorded on the run;
+        // the stop event travels with the next lifecycle flush.
+        run.note_failure(FailureKind::Valuation, "DATA_UNAVAILABLE", now.utc);
     } else if accounting.status != AccountingStatus::Complete {
+        // A missing cash or gas fact is not a missing mark: the window cannot
+        // know what it owns, and that keeps its existing stop.
+        run.clear_failure(FailureKind::Valuation);
         run.stop("DATA_UNAVAILABLE", true, now.utc);
+    } else {
+        run.clear_failure(FailureKind::Valuation);
     }
     refresh_live_exposure(state, now.utc);
 }
@@ -1122,19 +1524,30 @@ impl Broker {
     pub(super) fn live_pre_submit(&self, candidate: &CandidateContext) -> anyhow::Result<bool> {
         use super::live_events::{self, DecisionPayload, LivePayload};
         use crate::bot::arbitrage::phase1::{self, Phase};
-        let (event, accepted) = {
+        let (events, accepted) = {
             let mut state = self.state.lock();
             refresh_live_risk(&mut state);
             let run = state.live.controlled.as_ref().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
             let now = run.phase1.clock.now()?;
+            // Reuse the tick's authoritative read without dropping its audit
+            // projection or inventing a new receipt for the cached response.
+            let mut events = Vec::new();
+            if let Some(read) = run.account_read.as_ref().filter(|read| read.matches(&state.live, now)) {
+                if let Some(event) = live_events::prepare_reconciliation(&state,
+                    &read.snapshot, read.checked.utc, "RUNTIME", true, "NONE")
+                    .map_err(anyhow::Error::msg)? {
+                    events.push(event);
+                }
+            }
             let (diagnostic, checked) = phase1::recheck_diagnostic(candidate, now, Phase::PreSubmit,
                 run.phase1.min_edge, run.phase1.min_secs_left);
             let accepted = checked.is_some() && run.may_add_risk();
-            let event = run.emitter.prepare(now.utc, Some(candidate.market_id().to_string()), None,
-                &live_events::state_accounting(&state), LivePayload::Decision(DecisionPayload { decision: diagnostic }));
-            (event, accepted)
+            events.push(run.emitter.prepare(now.utc, Some(candidate.market_id().to_string()), None,
+                &live_events::state_accounting(&state), LivePayload::Decision(DecisionPayload { decision: diagnostic }))
+                .map_err(anyhow::Error::msg)?);
+            (events, accepted)
         };
-        event.and_then(|event| event.flush()).map_err(|_| anyhow::anyhow!("OUTPUT_INVALID"))?;
+        live_events::flush_events(events).map_err(anyhow::Error::msg)?;
         Ok(accepted)
     }
 

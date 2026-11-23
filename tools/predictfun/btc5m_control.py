@@ -52,8 +52,8 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-22-btc5m-minimal-remediation/evidence/parameterization/candidate-r13d/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "fcfbdab52a765872d8e363fb3e151f9240800fc29efb6fa4065ced5e9f06d3c8"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-23-btc5m-r16-integrated-validation/evidence/deployment/candidate-r16-f1/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "13a8ef883ec38b63cf2bc64bf26e99ca2b914be4e93dd9cfd1b493fdb405aaeb"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
@@ -74,7 +74,20 @@ LIVE_PATHS = (
     "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs",
     "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py",
     "tools/predictfun/tests/test_btc5m_parameterization.py",
-    "Cargo.toml", "Cargo.lock",
+    # R15/R16 loaded recovery, claim, diagnostics and regression modules.
+    "src/bot/runtime/live/claims.rs", "src/bot/runtime/live_control/cash_wait.rs",
+    "src/bot/runtime/live_control/diagnostics.rs", "src/bot/runtime/live_events/order.rs",
+    "src/bot/runtime/live_control/tests/claim_wait.rs",
+    "src/bot/runtime/live_control/tests/degrade_recovery.rs",
+    "src/bot/runtime/live_control/tests/live012_regression.rs",
+    "src/bot/runtime/live_control/tests/send_timing_bench.rs",
+    "src/bot/runtime/live_control/tests/r16_cash_drive.rs",
+    "src/bot/runtime/live_control/tests/r16_diagnostics.rs",
+    "src/service/predict_fun/account/runtime_claims.rs",
+    "src/service/predict_fun/account/r16_tests.rs",
+    "src/service/predict_fun/controlled/r16_fixture.rs",
+    "tools/predictfun/tests/test_btc5m_r16_integrated.py",
+    "Cargo.toml", "Cargo.lock", "src/bin/btc5m_reconcile.rs",
 )
 CLEANUP_SECONDS = 30
 TAIL_SECONDS = 600
@@ -865,6 +878,8 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
     # itself. It is remembered here, redacted at write time, and written
     # before the run's terminal record; later fragments are its consequences.
     stopped: dict[str, Any] | None = None
+    # How much of this run's own child log is already written.
+    log_budget = [0]
 
     def keep_stopped(stream, raw):
         """Keep the first stopping fragment of a live run, before it is dropped."""
@@ -965,8 +980,16 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                     if not chunk:
                         selector.unregister(stream)
                         if buffers[stream] or stream in dropping:
-                            keep_stopped(stream, buffers[stream])
-                            stop()
+                            residue = bytes(buffers[stream])
+                            buffers[stream].clear()
+                            if live and stream is not process.stdout:
+                                # The child's stderr residue is evidence, not a
+                                # cause: it is kept in this run's own log and
+                                # the run goes on.
+                                append_run_log(evidence.directory, "stderr", residue, log_budget)
+                            else:
+                                keep_stopped(stream, residue)
+                                stop()
                         continue
                     for fragment in chunk.splitlines(keepends=True):
                         if stream not in dropping:
@@ -975,9 +998,16 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                                      and buffers[stream].startswith(EVENT_PREFIX.encode()) else MAX_LINE_BYTES)
                             if len(buffers[stream]) > limit:
                                 dropping.add(stream)
-                                keep_stopped(stream, buffers[stream])
+                                residue = bytes(buffers[stream])
                                 buffers[stream].clear()
-                                stop()
+                                if live and stream is not process.stdout:
+                                    # An oversize stderr line is evidence, not a
+                                    # cause: it is kept in this run's log and the
+                                    # run goes on.
+                                    append_run_log(evidence.directory, "stderr", residue, log_budget)
+                                else:
+                                    keep_stopped(stream, residue)
+                                    stop()
                         if fragment.endswith(b"\n"):
                             if stream in dropping:
                                 dropping.remove(stream)
@@ -986,14 +1016,26 @@ def supervise(process, evidence, started_at, started_boot, observer=None, *, run
                             buffers[stream].clear()
                             if not raw.startswith(EVENT_PREFIX.encode()):
                                 facts["discarded"] += 1
+                                # A non-event line is evidence, not a cause: it
+                                # is kept in this run's own bounded log and the
+                                # run goes on.
+                                if live:
+                                    append_run_log(evidence.directory,
+                                                   "stdout" if stream is process.stdout else "stderr",
+                                                   raw, log_budget)
                                 continue
                             try:
                                 if facts["stop_reason"] == "OUTPUT_INVALID":
                                     raise ValueError("OUTPUT_INVALID")
                                 if live:
                                     if stream is not process.stdout:
-                                        keep_stopped(stream, raw)
-                                        raise ValueError("OUTPUT_INVALID")
+                                        # The child's stderr carries no event.
+                                        # It is evidence for a later diagnosis,
+                                        # not a reason to stop the run.
+                                        append_run_log(evidence.directory, "stderr", raw,
+                                                       log_budget)
+                                        facts["discarded"] += 1
+                                        continue
                                     try:
                                         event = evidence.append(raw, acknowledge)
                                     except LiveInvalid as error:
@@ -1858,6 +1900,35 @@ def write_stop_output(store: Any, fragment: dict[str, Any], facts: dict[str, Any
     import btc5m_live_events as live
     record = stop_output_record(fragment, facts, store.started["run_id"])
     live._create_file(store.directory / "stop-output.json", live.canonical(record) + b"\n")
+
+
+# --- The child's non-event output --------------------------------------------
+# A live child's stderr and the non-event lines of its stdout are evidence for
+# a later diagnosis, not a reason to stop. They are written to this run's own
+# bounded log, redacted, so that a run that ends for another cause can still
+# be explained afterwards.
+RUN_LOG_NAME = "run-log.txt"
+# The whole log of one run stays inside this bound, like the stopped fragment.
+RUN_LOG_LIMIT = 64 * 1024
+
+
+def append_run_log(directory: Path, stream: str, raw: bytes, budget: list[int]) -> None:
+    """Append one redacted, bounded child line to this run's own log.
+
+    A failed write is swallowed: the log is evidence, never a cause, so it may
+    not change the run's own stop.
+    """
+    try:
+        text = redact_output(raw.decode("utf-8", "backslashreplace"))
+        line = f"[{stream}] {text[:STOP_OUTPUT_LIMIT]}\n"
+        size = len(line.encode("utf-8"))
+        if budget[0] + size > RUN_LOG_LIMIT:
+            return
+        with open(directory / RUN_LOG_NAME, "a", encoding="utf-8") as handle:
+            handle.write(line)
+        budget[0] += size
+    except (OSError, ValueError):
+        return
 
 
 def finish_live_evidence(store: Any, facts: dict[str, Any], final: dict[str, Any] | None) -> None:

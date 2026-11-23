@@ -694,7 +694,12 @@ impl super::Broker {
                     .and_then(|run| run.phase1.clock.now().ok()) {
                     super::live_control::refresh_live_exposure(&mut state, now.utc);
                 }
-                state.live.controlled.as_ref().is_some_and(|run| !run.may_add_risk())
+                // A degraded window observes, it does not stop: only a real
+                // stop or a broken output lane ends the wait.
+                if let Some(run) = state.live.controlled.as_mut() {
+                    super::live_control::cash_wait::observe_budget(run);
+                }
+                state.live.controlled.as_ref().is_some_and(|run| run.must_end())
             };
             if self.entry_stop_reason().is_some() || live_stopped
             {

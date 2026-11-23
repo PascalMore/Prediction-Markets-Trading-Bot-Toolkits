@@ -338,8 +338,8 @@ sys.exit(int(sys.argv[2]))
         builder.assert_called_once()
         command = child.call_args.args[0]
         expected = control.BOT.parents[4] / (
-            "data/reports/2026-11-22-btc5m-minimal-remediation/"
-            "evidence/parameterization/candidate-r13d/polymarket-toolkits")
+            "data/reports/2026-11-23-btc5m-r16-integrated-validation/"
+            "evidence/deployment/candidate-r16-f1/polymarket-toolkits")
         self.assertEqual(command[0], str(expected))
         directory = root / args[args.index("--run-id") + 1]
         self.assertEqual(command[command.index("--controlled-live-manifest") + 1],
@@ -353,7 +353,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(started["candidate_identity"], control.public_identity({}, live=True))
         context = json.loads((directory / "live-context.json").read_bytes())
         self.assertEqual(context["candidate_digest"], self.live.candidate_digest(started))
-        self.assertEqual(len(started["candidate_identity"]["files"]), 65)
+        self.assertEqual(len(started["candidate_identity"]["files"]), 80)
         self.assertEqual([call[0] for call in collection.calls], ["insert", "read"])
         self.assertEqual(len(collection.documents), 1)
         with self.assertRaises(control.Refused) as refused:
@@ -501,8 +501,7 @@ sys.exit(int(sys.argv[2]))
         live004_changed = {"src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/tests.rs",
                            "src/bot/runtime/taker.rs", "src/service/predict_fun.rs",
                            "src/service/predict_fun/controlled.rs", "src/service/venue.rs"}
-        # This round's record is the binding the current tree must reproduce; the
-        # live003 and live004 records stay pinned on disk, never recomputed.
+        # Reproduce the current binding; historical live003/live004 records stay pinned.
         stop_diag_root = control.BOT.parents[4] / (
             "data/reports/2026-11-21-btc5m-stop-diagnostics/evidence")
         # The stopped run's own failure code on the wire: live.rs records it, the
@@ -540,9 +539,7 @@ sys.exit(int(sys.argv[2]))
                       "tools/predictfun/btc5m_control.py", "tools/predictfun/btc5m_live_events.py",
                       "tools/predictfun/btc5m_live_guard.py", "tools/predictfun/tests/test_btc5m_control.py",
                       "tools/predictfun/tests/test_btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_guard.py"}
-        # R5 one-order fact re-read: the live runtime re-reads an accepted order's
-        # still-invisible execution facts, bounded; the control files carry the
-        # new binding. Only these manifest members moved.
+        # R5: bounded re-read of accepted orders' invisible facts, plus the binding.
         r5_changed = {"src/bot/runtime/live.rs", "src/bot/runtime/taker.rs",
                       "src/service/predict_fun/controlled.rs",
                       "src/bot/runtime/live_control/tests.rs",
@@ -553,19 +550,21 @@ sys.exit(int(sys.argv[2]))
                       "tools/predictfun/btc5m_control.py", "tools/predictfun/tests/test_btc5m_control.py",
                       "tools/predictfun/tests/test_btc5m_live_events.py"}
         # Parameterization: one public config froze this window's money and readers.
-        parameterization_changed = {"src/config.rs", "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs", "src/config/controlled_live.rs", "src/main.rs", "src/bot/runtime/live_accounting.rs", "src/bot/runtime/live.rs", "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/taker.rs", "tools/predictfun/btc5m_control.py", "tools/predictfun/btc5m_live_events.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/tests/test_btc5m_launch.py", "tools/predictfun/tests/test_btc5m_parameterization.py"}
+        parameterization_changed = {"src/config.rs", "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs", "src/config/controlled_live.rs", "src/main.rs", "src/bot/runtime/live_accounting.rs", "src/bot/runtime/live.rs", "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/taker.rs", "tools/predictfun/btc5m_control.py", "tools/predictfun/btc5m_live_events.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_control.py", "tools/predictfun/tests/test_btc5m_launch.py", "tools/predictfun/tests/test_btc5m_parameterization.py", "tools/predictfun/local_signer.py", "docs/LIVE-TRADING.md"}
         r13_changed = {"src/service/predict_fun/fills.rs", "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/tests.rs"}  # R13 claimed-win evidence
-        # R13c: the claim is judged before it is booked, the reader observes the
-        # cleared wait, and the wire carries the paid claim.
+        # R15 includes the test watchdog pin in channel.rs; R16 includes F1's tail cap.
+        r15_changed = {"src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/channel.rs", "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/taker.rs", "src/service/predict_fun.rs", "src/service/predict_fun/account.rs", "src/service/predict_fun/controlled.rs", "src/service/predict_fun/fills.rs", "src/service/venue.rs"}
+        r16_changed = {"src/bot/runtime.rs", "src/bot/runtime/live.rs", "src/bot/runtime/live_accounting.rs", "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/types.rs", "src/bot/runtime/paper.rs", "src/bot/runtime/timing.rs", "src/service/predict_fun/account.rs", "src/service/venue.rs", "tools/predictfun/btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_events.py"}
+        # R13c: judge the claim before booking; carry the paid claim and cleared wait.
         r13c_changed = {"src/bot/runtime/live.rs", "src/bot/runtime/live_accounting.rs", "src/bot/runtime/live_control.rs",
                         "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/types.rs",
                         "src/bot/runtime/live_events/tests.rs", "tools/predictfun/btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_events.py"}
         for path, expected in repaired_rust.items():
-            if path not in live004_changed | config_a1_changed | settled_zero_changed | send_latency_changed | r13c_changed:
+            if path not in live004_changed | config_a1_changed | settled_zero_changed | send_latency_changed | r13c_changed | r15_changed | r16_changed:
                 self.assertEqual(identity["files"][path], expected, path)
         self.assertEqual({path for path, expected in repaired_rust.items()
                           if identity["files"][path] != expected},
-                         (live004_changed | config_a1_changed | settled_zero_changed | send_latency_changed | r13c_changed)
+                         (live004_changed | config_a1_changed | settled_zero_changed | send_latency_changed | r13c_changed | r15_changed | r16_changed)
                          & set(repaired_rust))
         manifest = control.BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/run3906-final-candidate.tsv"
         self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(),
@@ -582,7 +581,7 @@ sys.exit(int(sys.argv[2]))
         for row in manifest.read_text().splitlines()[1:]:
             path, _lines, digest = row.split("\t")
             upstream[path] = digest
-            if path not in gas_paths | dynamic_paths | repair_changed | live004_changed | stop_diag_changed | config_a1_changed | settled_zero_changed | r2_changed | parameterization_changed | send_latency_changed | r13_changed | r13c_changed:
+            if path not in gas_paths | dynamic_paths | repair_changed | live004_changed | stop_diag_changed | config_a1_changed | settled_zero_changed | r2_changed | parameterization_changed | send_latency_changed | r13_changed | r13c_changed | r15_changed | r16_changed:
                 self.assertEqual(identity["files"][path], expected_rust.get(path, digest), path)
         self.assertEqual(len(upstream), 29)
         self.assertTrue(rust_paths <= upstream.keys())
@@ -596,20 +595,20 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) - set(old_files), added | set(control.LIVE_PATHS) - set(old_files))
         self.assertEqual(set(old_files) - set(identity["files"]), set())
         self.assertEqual(len(old_files), 57)
-        self.assertEqual(len(identity["files"]), 65)
+        self.assertEqual(len(identity["files"]), 80)
         protected = set(old_files) - allowed
         self.assertEqual(len(protected), 48)
-        for path in protected - gas_paths - dynamic_paths - repair_changed - live004_changed - stop_diag_changed - config_a1_changed - settled_zero_changed - r2_changed - parameterization_changed - send_latency_changed - r13_changed - r13c_changed:
+        for path in protected - gas_paths - dynamic_paths - repair_changed - live004_changed - stop_diag_changed - config_a1_changed - settled_zero_changed - r2_changed - parameterization_changed - send_latency_changed - r13_changed - r13c_changed - r15_changed - r16_changed:
             self.assertEqual(identity["files"][path], old_files[path], path)
         changed = {path for path in old_files if identity["files"][path] != old_files[path]} | added
         self.assertEqual(changed, (allowed | gas_paths | dynamic_paths | repair_changed
                                    | live004_changed | stop_diag_changed | config_a1_changed
-                                   | settled_zero_changed | r2_changed | added | send_latency_changed | r13_changed | r13c_changed
+                                   | settled_zero_changed | r2_changed | added | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed) & set(old_files))
                                    | (parameterization_changed & set(old_files))) - {"src/bot/runtime/paper/tests.rs"})
         self.assertEqual(control.PAPER72_BINARY, evidence / "candidate-v2/polymarket-toolkits")
         self.assertEqual(hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest(),
                          "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa")
-        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-22-btc5m-minimal-remediation/evidence/parameterization/candidate-r13d/polymarket-toolkits")
+        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-23-btc5m-r16-integrated-validation/evidence/deployment/candidate-r16-f1/polymarket-toolkits")
         old_live = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-gas-payer-fix/evidence/candidate/polymarket-toolkits"
         self.assertEqual(hashlib.sha256(old_live.read_bytes()).hexdigest(),
                          "f8171a45bc6ca09d5f1bbbe4d3f35bba6fdd31927f86974930e5960dfa624043")
@@ -627,7 +626,7 @@ sys.exit(int(sys.argv[2]))
                           if identity["files"][path] != accepted_files[path]} | added,
                          stage_allowed | gas_paths | dynamic_paths | repair_changed
                          | live004_changed | stop_diag_changed | config_a1_changed
-                         | settled_zero_changed | r2_changed | added | send_latency_changed | r13_changed | r13c_changed | (parameterization_changed & set(accepted_files)))
+                         | settled_zero_changed | r2_changed | added | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(accepted_files)))
         historical = control.BOT.parents[4] / ("data/reports/2026-11-21-btc5m-live002-output-invalid/"
                                                "evidence/fix/candidate-identity.json")
         self.assertEqual(hashlib.sha256(historical.read_bytes()).hexdigest(),
@@ -642,7 +641,7 @@ sys.exit(int(sys.argv[2]))
                          repair_changed | deployment_changed | live004_changed | stop_diag_changed
                          | guard_changed
                          | (config_a1_changed & set(historical_files))
-                         | settled_zero_changed | r2_changed | send_latency_changed | r13_changed | r13c_changed | (parameterization_changed & set(historical_files)))
+                         | settled_zero_changed | r2_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(historical_files)))
         print("M01_PROTECTED_PARTITIONS " + json.dumps({"upstream_total": len(upstream),
               "upstream_protected": len(set(upstream) - rust_paths), "protected": sorted(protected),
               "changed": sorted(changed), "rust_reference": expected_rust}, sort_keys=True))
@@ -688,9 +687,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(live005_public["bot"]["enable_trading"], True)
         self.assertEqual({key: live005_identity[key] for key in historical_public},
                          historical_public)
-        # Pin both historical R6 records to each other, not to a newer tree.
-        # C1 changes only the shared deadline cap and its boundary tests; C2
-        # changes settlement explanation and the native account/event fixtures.
+        # Pin historical R6 records to each other: C1 deadline cap; C2 settlement fixtures.
         c1_changed = {"tools/predictfun/btc5m_control.py", "tools/predictfun/btc5m_live_events.py",
                       "tools/predictfun/btc5m_live_guard.py", "tools/predictfun/tests/test_btc5m_control.py",
                       "tools/predictfun/tests/test_btc5m_live_events.py",
@@ -707,12 +704,12 @@ sys.exit(int(sys.argv[2]))
         live_digest = live.candidate_digest(live_digest_input)
         binding_root = control.BOT.parents[4] / (
             "data/reports/2026-11-22-btc5m-minimal-remediation/evidence")
-        current_path = binding_root / "parameterization/post-binding-identity-r13e.json"  # R13e: the first stop cause wins
+        current_path = binding_root / "parameterization/post-binding-identity-r14b.json"  # R14b: test-only guard rebind
         current = json.loads(current_path.read_bytes())
         c1_bound = json.loads((binding_root / "c1-c2-final/post-binding-identity.json").read_bytes())
         self.assertEqual(c1_bound["candidate_digest"], "617f9f264454bf2fd5c72d153e22c633458b4b88e99201fd2ac867b9f56562d4")
         self.assertEqual({path for path, sha in c1_bound["candidate_identity"]["files"].items()
-                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs"} | send_latency_changed | r13_changed | r13c_changed | (parameterization_changed & set(c1_bound["candidate_identity"]["files"])))
+                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs"} | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(c1_bound["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live003_regression.rs"})
         pre_binding = json.loads((binding_root / "rework-r6/final-candidate-identity.json").read_bytes())
         self.assertEqual(pre_binding["candidate_digest"],
                          "e20da168d8cd2b08203e9128ce23145cc4d72e55d7d04cf7f31c600d69b34d5c")
@@ -743,19 +740,22 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) ^ set(previous["candidate_identity"]["files"]), set(control.LIVE_PATHS) - set(previous["candidate_identity"]["files"]))
         self.assertEqual({path for path, digest in previous["candidate_identity"]["files"].items()
                           if identity["files"][path] != digest},
-                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | (parameterization_changed & set(previous["candidate_identity"]["files"])))
+                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(previous["candidate_identity"]["files"])))
         self.assertNotEqual(current["candidate_digest"], previous["candidate_digest"])
         self.assertNotEqual(live_digest, saved["candidate_digest"])
         self.assertNotEqual(live_digest, "6908dd0072d916494e5e2f5059c34ef143ac2acbebd0f9a7f7a3c8e7f6ebb617")
         self.assertNotEqual(live_digest, candidate_identity["binary_sha256"])
         self.assertEqual(current["candidate_digest"], live.candidate_digest({key: current[key] for key in ("candidate_identity", "public_config_identity")}))
-        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest} - {"tools/predictfun/tests/test_btc5m_control.py"}, set())  # this test pins itself
+        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest}, deployment_changed | r15_changed | r16_changed | {"tools/predictfun/local_signer.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py", "docs/LIVE-TRADING.md"})
         self.assertEqual(set(current["candidate_identity"]["files"]) ^ set(candidate_identity["files"]), set(control.LIVE_PATHS) - set(current["candidate_identity"]["files"]))
         self.assertEqual(current["public_config_identity"], public)
-        self.assertEqual(current["expected_binary_sha256"], final_sha)
-        self.assertEqual(current["binary_sha256"], final_sha)
-        self.assertEqual(current["binary_sha256"], hashlib.sha256(final_binary.read_bytes()).hexdigest())
-        self.assertEqual(current["file_count"], len(candidate_identity["files"]))
+        historical_binary = binding_root / "parameterization/candidate-r14/polymarket-toolkits"
+        self.assertEqual(current["expected_binary_sha256"], "96a7ed059eb13253f36c8dd6bd8abf42a803574b7b8171bfa698b1aad7b1e1b7")
+        self.assertEqual(current["binary_sha256"], current["expected_binary_sha256"])
+        self.assertEqual(current["binary_sha256"], hashlib.sha256(historical_binary.read_bytes()).hexdigest())
+        self.assertEqual(current["file_count"], 65)
+        self.assertEqual(current["file_count"], len(current["candidate_identity"]["files"]))
+        self.assertEqual(final_sha, "13a8ef883ec38b63cf2bc64bf26e99ca2b914be4e93dd9cfd1b493fdb405aaeb")
         self.assertEqual(current["scope"],
                          "deployed and bound; pending independent Validate; not activated or started")
         self.assertEqual({key: current[key] for key in public if key != "sha256"},

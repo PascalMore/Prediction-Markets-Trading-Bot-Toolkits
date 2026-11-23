@@ -409,7 +409,8 @@ pub fn project_window<F: LiveFacts>(
     let mut value: Option<U256> = Some(U256::ZERO);
     let mut applied_total = U256::ZERO;
     let mut released_basis = U256::ZERO;
-    let mut claimed_cash = facts.opening_claim_cash();
+    // Historical income is already in Cb. C0 and this run's earnings exclude it.
+    let mut claimed_cash = U256::ZERO;
     let mut pending_claim_value: Option<U256> = None;
     let mut conflict = false;
 
@@ -614,7 +615,29 @@ impl crate::bot::runtime::Broker {
             self.settle_resolved(data).await
         }).await;
         let cleanup_complete = matches!(cleanup, Ok(Ok(())));
-        if cleanup_complete && self.entry_stop_reason() == Some("DEADLINE") {
+        // Cleanup consumes the same W0 window. Read the original clocks only
+        // now, at tail entry, so neither finish entry point renews that window.
+        let (tail_budget, cash_waiting) = {
+            let state = self.state.lock();
+            let run = state.live.controlled.as_ref().unwrap();
+            let budget = match run.cash_wait.as_ref() {
+                None => tail_budget,
+                Some(wait) => match run.phase1.clock.now() {
+                    Ok(now) if wait.may_continue(now, run.options.deadline_at,
+                        run.run_deadline_elapsed_ms) => {
+                        let wall = (wait.ends_at(run.options.deadline_at) - now.utc)
+                            .to_std().unwrap_or_default();
+                        let elapsed = std::time::Duration::from_millis(
+                            wait.ends_at_elapsed_ms(run.run_deadline_elapsed_ms) - now.elapsed_ms);
+                        tail_budget.min(wall).min(elapsed)
+                    }
+                    _ => std::time::Duration::ZERO,
+                },
+            };
+            (budget, run.cash_wait.is_some())
+        };
+        if cleanup_complete && (!cash_waiting || !tail_budget.is_zero())
+            && self.entry_stop_reason() == Some("DEADLINE") {
             let tail = async {
                 loop {
                     let pending = {
@@ -680,6 +703,11 @@ impl crate::bot::runtime::Broker {
                 }
             };
             super::live_events::flush_events(events).map_err(anyhow::Error::msg)?;
+        }
+        // Cash-first evidence must be re-proved after the official outcome is
+        // published, not promoted from a stored tuple on an older read.
+        if !self.state.lock().live.pending_claims.is_empty() {
+            super::live::check_runtime_account(self, false).await?;
         }
         Ok(())
     }
@@ -760,22 +788,6 @@ fn apply_official_result(
         payloads.push((id, record.identity.token_id,
             if claim.is_zero() { "CONFIRMED" } else { "CASH_PENDING" }, payout, Some(claim)));
     }
-    // Book every claim this result confirms before the run's own borrow: a
-    // proven claim becomes ledger cash exactly when the confirmed result
-    // owes this amount, atom for atom.
-    for (id, _, status, _, claim) in &payloads {
-        if *status == "CONFLICT" { continue; }
-        let Some(claim) = *claim else { continue; };
-        if claim.is_zero() { continue; }
-        let inventory = state.live.net_inventory[id];
-        let credited = state.live.claims.get(id).copied()
-            .is_some_and(|(held, cash)| held == inventory && cash == claim);
-        let proven = state.live.pending_claims.get(id).copied()
-            .is_some_and(|(held, cash)| held == inventory && cash == claim);
-        if !credited && proven {
-            super::live_control::promote_pending_claim(state, *id, inventory, claim);
-        }
-    }
     let run = state.live.controlled.as_mut().unwrap();
     if result == Settlement::Pending && !payloads.iter().any(|(_, _, status, _, _)| *status == "CONFLICT")
         && !(identity == paper::RoundIdentity::Match && normal_unpublished_result(market))
@@ -802,6 +814,7 @@ fn apply_official_result(
             }
         }
     }
+    // Only a subsequent complete runtime read can promote cash-first evidence.
     super::live_control::refresh_live_risk(state);
     let accounting = live_events::state_accounting(state);
     let run = state.live.controlled.as_ref().unwrap();
@@ -1127,9 +1140,13 @@ mod tests {
         }
         let projected = project_window(&Opening, &Marks::default(), None);
         assert_eq!(projected.status, AccountingStatus::Complete);
-        assert_eq!(projected.cash, atoms(11 * ONE));
-        assert_eq!(projected.net_pnl.magnitude(), atoms(ONE));
+        // The opening claim is already inside Cb: this run neither spends it
+        // again nor books it as its own earnings.
+        assert_eq!(projected.cash, atoms(10 * ONE));
+        assert_eq!(projected.net_pnl.magnitude(), U256::ZERO);
         assert!(!projected.net_pnl.is_negative());
+        assert_eq!(projected.realized.magnitude(), U256::ZERO);
+        assert_eq!(projected.nav.magnitude(), atoms(10 * ONE));
     }
 
     #[test]

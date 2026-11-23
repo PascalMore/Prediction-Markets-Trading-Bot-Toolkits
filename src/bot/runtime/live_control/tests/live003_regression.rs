@@ -124,7 +124,9 @@ async fn lowercase_payer_reaches_native_down_send_after_multiple_account_reads()
     let state = broker.state.lock();
     assert_eq!(state.live.attempts.len(), 1);
     assert_eq!(state.live.net_cash[&id], cash);
-    assert!(!state.live.controlled.as_ref().unwrap().may_add_risk());
+    // A refused candidate is not a missing fact: nothing was submitted, so
+    // nothing is unproven, and the window stays open for the next candidate.
+    assert!(state.live.controlled.as_ref().unwrap().may_add_risk());
 }
 
 #[test]

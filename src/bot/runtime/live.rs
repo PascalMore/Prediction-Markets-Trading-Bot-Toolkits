@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod claims;
+
 /// The state the live path keeps, in the broker's lock.
 #[derive(Debug, Default)]
 pub struct LiveState {
@@ -505,7 +507,20 @@ pub(super) async fn re_read_unread_facts(
         let snapshot = match venue.execution_snapshot(&hash).await {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                let _ = super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE");
+                // A transient read failure degrades the window: it keeps
+                // observing and adds no risk, and a later read restores it.
+                // Only a streak that outlasts the budget stops the run.
+                let stopped = {
+                    let mut state = broker.state.lock();
+                    match state.live.controlled.as_mut() {
+                        Some(run) => run.note_failure(super::live_control::FailureKind::Execution,
+                            "READ_UNAVAILABLE", chrono::Utc::now()),
+                        None => true,
+                    }
+                };
+                if stopped {
+                    let _ = super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE");
+                }
                 return UnreadFacts::Resolved;
             }
         };
@@ -905,72 +920,7 @@ pub(crate) fn check_account_delta_with_claims(
     changes: impl IntoIterator<Item = (String, Side, U256, U256)>,
     claims: impl IntoIterator<Item = (String, U256, U256)>,
 ) -> anyhow::Result<()> {
-    crate::service::predict_fun::account::check_snapshot_complete(current)?;
-    if initial.identity != current.identity {
-        anyhow::bail!("ACCOUNT_MISMATCH");
-    }
-    if current.open_orders.iter().any(|order| Some(order.as_str()) != own_order) {
-        anyhow::bail!("RECONCILIATION_REQUIRED:OPEN_ORDERS");
-    }
-    use alloy_primitives::U512;
-    let mut incoming = U512::ZERO;
-    let mut outgoing = U512::ZERO;
-    let mut inventory: HashMap<String, (U512, U512)> = HashMap::new();
-    for (token, side, cash, shares) in changes {
-        let (added, removed) = inventory.entry(token).or_default();
-        let (cash_total, share_total) = match side {
-            Side::Buy => (&mut outgoing, added),
-            Side::Sell => (&mut incoming, removed),
-        };
-        *cash_total = cash_total
-            .checked_add(U512::from(cash))
-            .ok_or_else(|| anyhow::anyhow!("CASH_OVERFLOW"))?;
-        *share_total = share_total
-            .checked_add(U512::from(shares))
-            .ok_or_else(|| anyhow::anyhow!("INVENTORY_OVERFLOW"))?;
-    }
-    let start = U512::from(
-        initial
-            .collateral_atoms
-            .ok_or_else(|| anyhow::anyhow!("MISSING_COLLATERAL"))?,
-    );
-    let mut positions: HashMap<_, _> = initial.positions.iter().cloned().collect();
-    for (token, (added, removed)) in inventory {
-        let held = positions.entry(token).or_default();
-        let amount = U512::from(*held)
-            .checked_add(added)
-            .and_then(|value| value.checked_sub(removed))
-            .ok_or_else(|| anyhow::anyhow!("INVENTORY_CONFLICT"))?;
-        *held = U256::from_str_radix(&amount.to_string(), 10)
-            .map_err(|_| anyhow::anyhow!("INVENTORY_OVERFLOW"))?;
-    }
-    let mut claim_cash = U512::ZERO;
-    for (token, shares, cash) in claims {
-        let Some(held) = positions.get_mut(&token) else { continue; };
-        if *held < shares {
-            anyhow::bail!("RECONCILIATION_REQUIRED:ACCOUNT_LEDGER_MISMATCH");
-        }
-        *held = *held - shares;
-        claim_cash = claim_cash
-            .checked_add(U512::from(cash))
-            .ok_or_else(|| anyhow::anyhow!("CASH_OVERFLOW"))?;
-    }
-    let cash = start
-        .checked_add(incoming)
-        .and_then(|value| value.checked_sub(outgoing))
-        .and_then(|value| value.checked_add(claim_cash))
-        .ok_or_else(|| anyhow::anyhow!("CASH_CONFLICT"))?;
-    positions.retain(|_, value| !value.is_zero());
-    let observed: HashMap<_, _> = current
-        .positions
-        .iter()
-        .filter(|(_, value)| !value.is_zero())
-        .cloned()
-        .collect();
-    if current.collateral_atoms.map(U512::from) != Some(cash) || observed != positions {
-        anyhow::bail!("RECONCILIATION_REQUIRED:ACCOUNT_LEDGER_MISMATCH");
-    }
-    Ok(())
+    claims::check_account_delta_with_claims(initial, current, own_order, changes, claims)
 }
 
 /// Keep typed venue reasons ahead of display contexts. The request/account
@@ -1086,8 +1036,8 @@ pub(super) async fn check_runtime_account(
     broker: &Broker,
     include_pending: bool,
 ) -> anyhow::Result<()> {
-    let version = {
-        let state = broker.state.lock();
+    let (version, closed, controlled) = {
+        let mut state = broker.state.lock();
         if state.live.baseline.is_none()
             || (!include_pending
                 && state
@@ -1098,15 +1048,22 @@ pub(super) async fn check_runtime_account(
         {
             return Ok(());
         }
-        (state.live.next_attempt_id, state.live.generation.clone())
+        if let Some(run) = state.live.controlled.as_mut() {
+            run.tick_started_elapsed_ms = Some(run.phase1.clock.now()?.elapsed_ms);
+        }
+        ((state.live.next_attempt_id, state.live.generation.clone()),
+            claims::closed_inventory(&state), state.live.controlled.is_some())
     };
     let result = async {
-        let mut snapshot = broker
-            .taker
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MISSING_VENUE"))?
-            .account_snapshot()
-            .await?;
+        let venue = broker.taker.as_ref().ok_or_else(|| anyhow::anyhow!("MISSING_VENUE"))?;
+        let observation = if controlled {
+            venue.runtime_account_observation(&closed).await?
+        } else {
+            crate::service::venue::RuntimeAccountObservation {
+                snapshot: venue.account_snapshot().await?, bound_claims: Vec::new(),
+            }
+        };
+        let mut snapshot = observation.snapshot;
         let mut state = broker.state.lock();
         let checked = super::live_control::account_receipt(&state)?;
         let mut observed = snapshot.clone();
@@ -1138,17 +1095,26 @@ pub(super) async fn check_runtime_account(
                 anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
             }
         }
-        let (claims, fresh) = claimed_payouts(&state, &snapshot)?;
+        let (claims, fresh) = if controlled {
+            claims::runtime_payouts(&state, &observation.bound_claims, &snapshot.settled_zero)?
+        } else { claimed_payouts(&state, &snapshot)? };
         let mut booked_claims: Vec<(u64, U256, U256)> = Vec::new();
+        // This flag is an input to the full equality check below, not a
+        // bypass: only the Broker's atom equations may explain bound positions.
+        snapshot.positions_explained = true;
         let reconciled = check_account_delta_with_claims(
             state.live.baseline.as_ref().unwrap(), &snapshot, own_order.as_deref(), changes, claims)
             .and_then(|()| {
+                super::live_control::record_account_read(&mut state, &snapshot, checked)?;
                 // The account read proves the exact claimed atoms arrived; this
                 // is the one place a claimed payout becomes ledger cash, and the
                 // one place a wait only the missing claim caused can end.
                 for (id, inventory, cash) in fresh {
-                    let (booked, _) =
-                        super::live_control::credit_claim(&mut state, id, inventory, cash);
+                    let (booked, _) = if state.live.pending_claims.contains_key(&id) {
+                        super::live_control::promote_pending_claim(&mut state, id, inventory, cash)
+                    } else {
+                        super::live_control::credit_claim(&mut state, id, inventory, cash)
+                    };
                     if let Some((inventory, cash)) = booked {
                         booked_claims.push((id, inventory, cash));
                     }
@@ -1158,7 +1124,7 @@ pub(super) async fn check_runtime_account(
                 // positions here; do not project them as foreign after proof.
                 snapshot.positions_explained = true;
                 observed.positions_explained = true;
-                super::live_control::record_account_read(&mut state, &snapshot, checked)
+                Ok(())
             });
         if let Err(error) = &reconciled {
             if let Some(run) = state.live.controlled.as_mut() {
@@ -1192,23 +1158,60 @@ pub(super) async fn check_runtime_account(
     // A read that failed before its own stop still names the code it held: the
     // first stop of this run carries it.
     if let Err(error) = &result {
-        if let Some(run) = broker.state.lock().live.controlled.as_mut() {
-            run.account_read = None;
-            run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error), true,
-                chrono::Utc::now());
+        let transient = account_failure_reason(error) == "READ_UNAVAILABLE";
+        let stopped = {
+            let mut state = broker.state.lock();
+            match state.live.controlled.as_mut() {
+                Some(run) => {
+                    run.account_read = None;
+                    if transient {
+                        // A transient read failure degrades the window: it
+                        // keeps observing and adds no risk, and a later read
+                        // restores it. Only a streak that outlasts the budget
+                        // stops the run.
+                        run.note_failure(super::live_control::FailureKind::Read,
+                            "READ_UNAVAILABLE", chrono::Utc::now())
+                    } else {
+                        run.stop_with_detail("RECONCILIATION_REQUIRED",
+                            &account_failure_code(error), true, chrono::Utc::now());
+                        true
+                    }
+                }
+                None => false,
+            }
+        };
+        if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
+            gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN");
+        }
+        if stopped {
+            super::live_events::stop_on_lane(broker, account_failure_reason(error))
+                .map_err(anyhow::Error::msg)?
+        }
+    } else {
+        // The account read came back: the window's read streak is over.
+        let mut state = broker.state.lock();
+        if let Some(run) = state.live.controlled.as_mut() {
+            run.clear_failure(super::live_control::FailureKind::Read);
         }
     }
     if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
-        match &result {
-            Ok(()) => gate.record_read_success(identity, "runtime_account"),
-            Err(_) => {
-                gate.record_read_failure(identity, "runtime_account", "ACCOUNT_LEDGER_UNPROVEN");
-            }
+        if result.is_ok() {
+            gate.record_read_success(identity, "runtime_account");
         }
     }
-    if result.is_err() { super::live_events::stop_on_lane(broker, "RECONCILIATION_REQUIRED")
-        .map_err(anyhow::Error::msg)?; }
     result.map_err(public_account_error)
+}
+
+/// The reason a failed account read stops the window with.
+///
+/// A read that could not be made is `READ_UNAVAILABLE`; a read that was made
+/// and disagrees with the ledger is a reconciliation conflict.
+fn account_failure_reason(error: &anyhow::Error) -> &'static str {
+    use crate::service::venue::{VenueError, VenueErrorCode};
+    match error.downcast_ref::<VenueError>().map(|venue| venue.code) {
+        Some(VenueErrorCode::ReadUnavailable) => "READ_UNAVAILABLE",
+        _ => "RECONCILIATION_REQUIRED",
+    }
 }
 
 pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
@@ -1241,10 +1244,31 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
                 if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
                     gate.record_read_failure(identity, "execution", "READ_FAILED");
                 }
-                super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE").map_err(anyhow::Error::msg)?;
+                // A transient execution read failure degrades the window: it
+                // keeps observing and adds no risk, and a later read restores
+                // it. Only a streak that outlasts the budget stops the run.
+                let stopped = {
+                    let mut state = broker.state.lock();
+                    match state.live.controlled.as_mut() {
+                        Some(run) => run.note_failure(super::live_control::FailureKind::Execution,
+                            "READ_UNAVAILABLE", chrono::Utc::now()),
+                        None => true,
+                    }
+                };
+                if stopped {
+                    super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE")
+                        .map_err(anyhow::Error::msg)?
+                }
                 return Err(error);
             }
         };
+        {
+            // The execution read came back: its failure streak is over.
+            let mut state = broker.state.lock();
+            if let Some(run) = state.live.controlled.as_mut() {
+                run.clear_failure(super::live_control::FailureKind::Execution);
+            }
+        }
         let controlled = broker.state.lock().live.controlled.is_some();
         let applied = if controlled {
             consume_snapshot(broker, &snapshot).map(|_| ()).map_err(|error| error.to_string())

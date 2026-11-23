@@ -5,14 +5,35 @@
 //! segment from the reservation to the first transport response. Off by default
 //! and inert without the variable, so production behaviour, event schema and the
 //! ledger are untouched. This is evidence, not a control.
+//!
+//! The segments are an ordered array, never an object: the same stage may
+//! occur twice in one path, and an object would silently drop one of them.
+//! Each entry names its own unit, so a segment is never compared to a
+//! measurement in another unit.
 
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// The revision of this measurement's shape and units.
+///
+/// A report that names its revision can be compared with another report of
+/// the same revision, and only with that one.
+pub const MEASUREMENT_REVISION: &str = "btc5m-send-path.r16.1";
 
 fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| matches!(std::env::var("YQUANT_TIMING").as_deref(), Ok("1")))
+}
+
+/// One measured segment of the path, in path order.
+#[derive(Debug, Clone, Serialize)]
+pub struct Segment {
+    /// The stage this segment ends at.
+    pub stage: String,
+    /// How long the segment took, in microseconds.
+    pub duration_us: u64,
 }
 
 /// One measurement window: the monotonic marks of a single submission.
@@ -66,12 +87,14 @@ pub(crate) fn finish() {
         segments.push(((*stage).to_string(), at.saturating_sub(previous)));
         previous = *at;
     }
-    let body: Vec<String> = segments.iter()
-        .map(|(stage, us)| format!("\"{stage}\":{us}"))
-        .collect();
+    // The segments are an ordered array: a stage may occur twice in one
+    // path, and an object would drop one of them.
+    let body = serde_json::to_string(&segments.iter().map(|(stage, duration_us)| Segment {
+        stage: stage.clone(), duration_us: *duration_us,
+    }).collect::<Vec<_>>()).expect("integer timing segments serialize");
     eprintln!(
-        "YQUANT_TIMING {{\"event\":\"send_path\",\"total_us\":{total_us},\"net_calls\":{},\"segments_us\":{{{}}}}}",
-        window.net_calls, body.join(",")
+        "YQUANT_TIMING {{\"event\":\"send_path\",\"measurement_revision\":\"{MEASUREMENT_REVISION}\",\"total_us\":{total_us},\"net_calls\":{},\"segments\":{body}}}",
+        window.net_calls
     );
     *LAST.lock() = segments;
     LAST_NET_CALLS.store(window.net_calls, Ordering::SeqCst);

@@ -227,6 +227,66 @@ redemptions and payout confirmation have not been performed or authorized.
 The legacy switch-on examples above are not permission to activate this
 candidate, nor evidence of profitability or live-trading readiness.
 
+## BTC5m repeat-window entry (launch-handoff candidate)
+
+The other candidate-status sections in this document are historical. For the R16-F1
+repeat-window handoff, the sole entry is `tools/predictfun/btc5m_launch.py`;
+it calls the existing controller, not another trading runtime. This handoff
+candidate still needs independent Validate. Offline integration does not mean
+the account is currently reconciled, a live window is running or 24h is proven.
+
+Routine restarts are operations, not another build or research cycle. An
+explicitly authorized execution caller uses the same entry each time. The CLI
+is its internal interface; Pascal is not required to assemble these arguments
+or run shell commands himself. The minimal internal invocation is:
+
+```bash
+# ROOT is /home/pascal/workspace/yquant-investment; run from the toolkit directory.
+# APPROVED_AUTH_REF is the caller's record of this specific new-window approval.
+/home/pascal/workspace/yquant-investment/.venv/bin/python -B tools/predictfun/btc5m_launch.py --auto-prepare --authorization-ref "$APPROVED_AUTH_REF"
+```
+
+`--auto-prepare` reuses the existing public BTC5m template (1 USDT order/market,
+10 USDT total, 20 USDT loss, min_edge 0.03, min_secs_left 30), derives a new run
+and risk-window id, and defaults to a fresh 86400-second unattended window.
+It reads the actual ARMED record and matching old activation under the existing
+account lock; no old run ids or old deadline need to be hand-edited. It carries
+forward that run's explicit declarations plus accepted system orders from the
+same account-bound, complete local audit, never unseen remote orders. Legacy
+run-018 declarations are read from its public dispatch evidence, not its script.
+
+The pinned `btc5m_reconcile` is called twice through `local_signer.reconcile_account`.
+It may authenticate and query the account, but cannot order/approve/redeem/transfer.
+The program derives C0 = collateral minus the native reader's included verified
+claims with integer atoms, supplies it to the second native read, and rejects
+cash/claim/position/order drift, incomplete pages, unexplained state or stale
+observations. No manual balance calculation or order-list reconstruction is needed.
+Native order/account/freshness checks still run in the trading child itself.
+
+After all qualification, the entry durably archives the exact old activation
+bytes, atomically publishes the new activation and performs one fully matched
+ARMED compare-and-delete. The original controller then acquires the account lock,
+arms the persistent guard and owns the sole trading child. An absent barrier,
+unknown submission, audit gap, loss latch, unrelated takeover or identity conflict
+is a refusal, not permission to reset or replay. A cash-pending old window can
+proceed only after the fresh native account explanation closes completely.
+
+Each attempt is exclusive at `data/reports/<date>-btc5m-controlled-paper/evidence/launch-attempts/<run>/`;
+the controller's separate `<run>/` directory contains started/events/ended facts.
+Both reconciliation passes and the derived public config remain in the attempt.
+Failed attempts are retained and never automatically retried. A publication or
+storage failure must be inspected; the program never silently deletes a guard or
+rolls back financial facts. `--reconciliation` remains a fully explicit internal
+mode, and cannot be mixed with automatic preparation.
+
+A qualified execution caller must detach the original launcher with completion
+tracking; do not put a 24h run under a short foreground-tool timeout. Stop the
+exact recorded launcher with SIGINT once and inspect its child exit, `ended.json`
+and fresh account facts; do not kill by name or delete a lock/barrier. Normal
+completion or failure never automatically restarts a run. Keyring unlock is
+independent and does not start trading. This engineering change grants no real
+trading authorization and changes no venue/geographical restrictions.
+
 ## BTC5m 07-007 explicit live candidate: offline only
 
 The existing btc5m_control launcher now selects the new domain only with the

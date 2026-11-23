@@ -120,21 +120,26 @@ impl Broker {
     ///
     /// The one fact that can still be unproven is an order this window already
     /// got accepted whose execution facts have not become visible. That order
-    /// is re-read through its existing execution read, bounded in time. When no
-    /// such order waits, or when the bound expires with the facts still
-    /// invisible, the run keeps its existing stop.
+    /// is re-read through its existing execution read, bounded in time.
+    ///
+    /// A refused candidate is not a missing fact: nothing was submitted, so
+    /// nothing can be unproven, and the window keeps its existing stop. Only
+    /// the bound expiring with the facts still invisible stops the window.
     pub(super) async fn resolve_blocked_candidate(
         &self,
         budget: std::time::Duration,
         interval: std::time::Duration,
     ) -> Result<(), String> {
-        if matches!(
-            live::re_read_unread_facts(self, budget, interval).await,
-            live::UnreadFacts::Resolved
-        ) {
-            return Ok(());
+        match live::re_read_unread_facts(self, budget, interval).await {
+            // No order of this window waits for facts: a refused candidate
+            // proves that nothing was submitted, so the window goes on.
+            live::UnreadFacts::NothingToRead | live::UnreadFacts::Resolved => Ok(()),
+            // The facts stayed invisible for the whole bound: the window
+            // cannot prove what it owns, and it stops.
+            live::UnreadFacts::Expired => {
+                super::live_events::stop_on_lane(self, "FACT_INCOMPLETE")
+            }
         }
-        super::live_events::stop_on_lane(self, "FACT_INCOMPLETE")
     }
 
     /// The submission body runs only with this run's lane and candidate completion held.
@@ -160,7 +165,11 @@ impl Broker {
         if !candidate.matches_inputs(market, _yes_book) {
             anyhow::bail!("INPUT_CHANGED");
         }
-        crate::bot::runtime::live::check_runtime_account(self, false).await?;
+        // The tick's own account read (sync_live) is the one this send is
+        // bound to: it ran before the inputs this decision was built from, and
+        // the guard re-proves its receipt, identity, generation, attempt
+        // binding and freshness at every later check. A second full read here
+        // would only age the book the decision is frozen on.
         if !self.live_pre_submit(candidate)? {
             return Ok(LiveTakeOutcome { result: TakeResult::Blocked(Blocked::DataIncomplete),
                 guard: None, attempt_id: None });

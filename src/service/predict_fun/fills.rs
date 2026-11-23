@@ -308,7 +308,12 @@ impl OrderVenue for PredictFunTrader {
             guard.check_preparation()?;
             self.begin_attempt(&handle)?;
             timing::mark("checks");
-            let snapshot = self.read_account_snapshot().await?;
+            // The read that preceded this tick's decision is this attempt's
+            // account proof. The gate re-verifies its completeness, identity,
+            // generation, attempt binding and ten-second freshness at every
+            // later check, so preparing from it does not age the frozen book
+            // with a second full account read.
+            let snapshot = guard.account_snapshot()?;
             guard.check_preparation()?;
             account::check_snapshot_complete(&snapshot)?;
             timing::mark("account_read");
@@ -316,16 +321,35 @@ impl OrderVenue for PredictFunTrader {
             let market = self.client.market_for_token(&planned.token_id)?;
             let quantity = f64_to_wei(planned.shares)?;
             let mirrored = PredictFunClient::is_mirrored(&market, &planned.token_id);
-            let raw_book = self.client.book(market.id).await?;
+            // The book and the pinned chain snapshot are independent reads of
+            // two different facts: issue them together, then use them in the
+            // order the preparation always used.
+            let (raw_book, chain_read) = tokio::join!(
+                self.client.book(market.id),
+                self.chain_read(),
+            );
+            let raw_book = raw_book?;
             guard.check_preparation()?;
             guard.check_book(&super::to_snapshot(&raw_book.asks, &raw_book.bids))?;
             timing::mark("book");
             let book = WeiBook::from_api(&raw_book, mirrored)?;
-            let amounts = market_amounts(&book, planned.side, quantity)?;
-            check_limit(&amounts, planned.side, planned.limit_price)?;
+            let amounts = market_amounts(&book, planned.side, quantity).map_err(|error| {
+                guard.note_send_check(crate::service::venue::SendCheckStage::Prepare,
+                    crate::service::venue::SendCheckDetail::Depth);
+                error
+            })?;
+            check_limit(&amounts, planned.side, planned.limit_price).map_err(|error| {
+                guard.note_send_check(crate::service::venue::SendCheckStage::Prepare,
+                    crate::service::venue::SendCheckDetail::LimitPrice);
+                error
+            })?;
             let expiration = chrono::Utc::now().timestamp() + MARKET_ORDER_TTL_SECS;
             let order = self.build_order(&market, &planned.token_id, planned.side, &amounts, expiration)?;
-            frozen.check_order(&handle, &order, &market, self.trading_address())?;
+            frozen.check_order(&handle, &order, &market, self.trading_address()).map_err(|error| {
+                guard.note_send_check(crate::service::venue::SendCheckStage::SignedBound,
+                    crate::service::venue::SendCheckDetail::FrozenInput);
+                error
+            })?;
 
             // Normalize price*quantity by WEI with U512 and conservative ceil.
             // The signed ratio is checked separately without rounding slack.
@@ -333,10 +357,17 @@ impl OrderVenue for PredictFunTrader {
                 &market, quantity, planned.limit_price,
             )?;
 
-            let read = self.chain_read().await?;
+            let read = chain_read?;
             guard.check_preparation()?;
             timing::mark("chain_read");
-            let (collateral, gas) = read.balances().await?;
+            // The balances and the exchange authorization read the same pinned
+            // block and neither depends on the other's answer: issue them
+            // together, then apply the original checks in the original order.
+            let (balances, authorized) = tokio::join!(
+                read.balances(),
+                read.authorize(&market, order.tokenId, planned.side, amounts.maker_amount),
+            );
+            let (collateral, gas) = balances?;
             guard.check_preparation()?;
             timing::mark("balances");
             let required = amounts.maker_amount;
@@ -348,8 +379,7 @@ impl OrderVenue for PredictFunTrader {
                 )
                 .into());
             }
-            read.authorize(&market, order.tokenId, planned.side, required)
-                .await?;
+            authorized?;
             guard.check_preparation()?;
             timing::mark("authorize");
 
@@ -367,7 +397,11 @@ impl OrderVenue for PredictFunTrader {
                 &order_hash,
                 &market,
                 candidate_limit_atoms,
-            )?;
+            ).map_err(|error| {
+                guard.note_send_check(crate::service::venue::SendCheckStage::SignedBound,
+                    crate::service::venue::SendCheckDetail::SignedBoundUnproven);
+                error
+            })?;
             self.bound_orders.write().insert(
                 order_hash.clone(),
                 BoundOrder {
@@ -413,6 +447,10 @@ impl OrderVenue for PredictFunTrader {
             {
                 Ok(envelope) => envelope.data,
                 Err(error) => {
+                    if handle.lock().phase != AttemptPhase::Prepared {
+                        guard.note_send_check(crate::service::venue::SendCheckStage::Post,
+                            crate::service::venue::SendCheckDetail::SubmissionUnknown);
+                    }
                     let mut record = handle.lock();
                     if record.phase != AttemptPhase::Prepared {
                         record.submission = Submission::Unknown;
@@ -491,6 +529,12 @@ impl OrderVenue for PredictFunTrader {
 
     async fn account_snapshot(&self) -> Result<AccountSnapshot> {
         self.read_account_snapshot().await
+    }
+
+    async fn runtime_account_observation(
+        &self, closed: &[crate::service::venue::RuntimeClaimInventory],
+    ) -> Result<crate::service::venue::RuntimeAccountObservation> {
+        self.read_runtime_account_observation(Some(closed)).await
     }
 }
 
@@ -1830,6 +1874,26 @@ pub(crate) mod tests {
             .iter()
             .filter(|path| **path == format!("/orders/{hash}"))
             .count()
+    }
+
+    /// Test-only: how many requests this venue saw whose path contains `needle`.
+    pub(crate) fn queried_path_count(transport: &Scenario, needle: &str) -> usize {
+        transport
+            .paths
+            .lock()
+            .iter()
+            .filter(|path| path.contains(needle))
+            .count()
+    }
+
+    /// Test-only: the venue's recorded historical order for `hash`.
+    pub(crate) fn history_record(transport: &Scenario, hash: &str) -> Value {
+        transport.history.lock().get(hash).cloned().unwrap()
+    }
+
+    /// Test-only: record one more historical order the venue reports.
+    pub(crate) fn record_history(transport: &Scenario, hash: &str, record: Value) {
+        transport.history.lock().insert(hash.to_string(), record);
     }
 
     fn planned() -> PlannedOrder {

@@ -11,10 +11,71 @@
 
 use super::*;
 
+/// What one proven claim of this fixture is, before it is bound to a generation.
+///
+/// The atoms are the venue's own; the identity and the generation belong to
+/// the ledger, so they are taken from the closed inventory the broker hands
+/// to the read rather than from anything the fixture remembers.
+#[derive(Clone)]
+struct ClaimIntent {
+    /// The market the claim belongs to.
+    market_id: u64,
+    /// The outcome token the claim paid.
+    token: String,
+    /// The complementary outcome token of the same market.
+    other_token: String,
+    /// The inventory the claim consumed, in atoms.
+    inventory: U256,
+    /// The cash the claim delivered, in atoms.
+    cash: U256,
+    /// The official payout of the claim, in millionths of a share.
+    payout_millionths: u32,
+}
+
 /// The venue seam of a runtime account read that now explains a claimed payout.
 /// It answers exactly the one call `check_runtime_account` makes.
 struct ClaimRead {
     snapshot: crate::service::venue::AccountSnapshot,
+    /// The proven claims this read may bind to the ledger's closed attempts.
+    intents: Vec<ClaimIntent>,
+}
+
+impl ClaimRead {
+    /// Bind the proven claims to the closed inventory of this very read.
+    ///
+    /// The generation comes from the ledger, never from the fixture: a claim
+    /// that names a token no closed attempt holds is left unbound, so the read
+    /// refuses it instead of guessing an owner.
+    fn evidence(
+        &self,
+        closed: &[crate::service::venue::RuntimeClaimInventory],
+    ) -> Vec<crate::service::venue::BoundClaimEvidence> {
+        Self::evidence_from(self.intents.clone(), closed)
+    }
+
+    /// Bind proven claims to the closed inventory of one read.
+    fn evidence_from(
+        intents: Vec<ClaimIntent>,
+        closed: &[crate::service::venue::RuntimeClaimInventory],
+    ) -> Vec<crate::service::venue::BoundClaimEvidence> {
+        let mut bound = Vec::new();
+        for intent in &intents {
+            let Some(owner) = closed.iter().find(|owner|
+                owner.identity.token_id == intent.token
+                    && owner.identity.market_id == intent.market_id
+                    && owner.inventory_atoms == intent.inventory) else { continue };
+            bound.push(crate::service::venue::BoundClaimEvidence {
+                identity: owner.identity.clone(),
+                execution_generation: owner.execution_generation,
+                yes_token: intent.token.clone(),
+                no_token: intent.other_token.clone(),
+                inventory_atoms: intent.inventory,
+                claim_atoms: intent.cash,
+                payout_millionths: intent.payout_millionths,
+            });
+        }
+        bound
+    }
 }
 
 #[async_trait::async_trait]
@@ -34,6 +95,20 @@ impl crate::service::venue::OrderVenue for ClaimRead {
 
     async fn account_snapshot(&self) -> anyhow::Result<crate::service::venue::AccountSnapshot> {
         Ok(self.snapshot.clone())
+    }
+
+    /// The typed proof of one claim, from the same account read.
+    ///
+    /// A balance change is never a claim: the evidence names the attempt, its
+    /// generation and the exact atoms the venue paid.
+    async fn runtime_account_observation(
+        &self,
+        closed: &[crate::service::venue::RuntimeClaimInventory],
+    ) -> anyhow::Result<crate::service::venue::RuntimeAccountObservation> {
+        Ok(crate::service::venue::RuntimeAccountObservation {
+            snapshot: self.snapshot.clone(),
+            bound_claims: self.evidence(closed),
+        })
     }
 }
 
@@ -58,6 +133,38 @@ fn claimed_win(
     }
 }
 
+/// The proven claim of one attempt, ready to be bound to the ledger.
+///
+/// The market's own tokens come from the traded market, so a claim for a token
+/// this market never held names the foreign token and stays unbound.
+fn claim_intent(
+    broker: &Broker,
+    id: u64,
+    market_id: u64,
+    win: &crate::service::venue::ClaimedWin,
+) -> ClaimIntent {
+    let state = broker.state.lock();
+    let inventory = *state.live.net_inventory.get(&id).expect("a closed attempt has inventory");
+    let market = state.live.controlled.as_ref().unwrap().traded.get(&market_id)
+        .expect("the fixture traded this market").clone();
+    drop(state);
+    // A claim for a token this market never held keeps its own token, so no
+    // closed attempt owns it and the read leaves it unbound.
+    let other_token = if win.token == market.yes_token {
+        market.no_token.clone()
+    } else {
+        market.yes_token.clone()
+    };
+    ClaimIntent {
+        market_id,
+        token: win.token.clone(),
+        other_token,
+        inventory,
+        cash: win.claim_atoms,
+        payout_millionths: win.payout_millionths,
+    }
+}
+
 /// The account after the venue paid `win`: the window's spend is gone from the
 /// balance, the claimed shares are gone from the positions and the claim's cash
 /// is in. Nothing else about the account moves.
@@ -79,8 +186,16 @@ fn claim_snapshot(broker: &Broker, win: crate::service::venue::ClaimedWin) -> cr
 }
 
 /// The same account, wrapped in the venue seam.
-fn claim_read(broker: &Broker, win: crate::service::venue::ClaimedWin) -> ClaimRead {
-    ClaimRead { snapshot: claim_snapshot(broker, win) }
+///
+/// The typed evidence is what proves the claim; the snapshot only carries the
+/// cash and the retired shares.
+fn claim_read(broker: &Broker, market_id: u64, win: crate::service::venue::ClaimedWin) -> ClaimRead {
+    let id = {
+        let state = broker.state.lock();
+        *state.live.attempts.keys().min().expect("the fixture made an attempt")
+    };
+    let intents = vec![claim_intent(broker, id, market_id, &win)];
+    ClaimRead { snapshot: claim_snapshot(broker, win), intents }
 }
 
 /// The legal cleared flow on the real producer: the wire carries the order's
@@ -127,9 +242,11 @@ async fn the_real_producer_pays_the_claim_and_the_reader_can_follow_it() {
         (inventory, token)
     };
     // The account the venue reports once it paid the claim.
-    let snapshot = claim_snapshot(&broker, claimed_win(inventory, market.id, &token, 1.0));
+    let win = claimed_win(inventory, market.id, &token, 1.0);
+    let intents = vec![claim_intent(&broker, id, market.id, &win)];
+    let snapshot = claim_snapshot(&broker, win);
     let original = Arc::get_mut(&mut broker).unwrap();
-    original.taker = Some(Arc::new(ClaimRead { snapshot }));
+    original.taker = Some(Arc::new(ClaimRead { snapshot, intents }));
     live::check_runtime_account(&broker, false).await.unwrap();
     {
         let state = broker.state.lock();
@@ -221,9 +338,11 @@ async fn the_real_producer_trades_again_after_the_exact_claim_and_the_reader_fol
         let inventory = state.live.net_inventory[&id];
         (inventory, token)
     };
-    let snapshot = claim_snapshot(&broker, claimed_win(inventory, market.id, &token, 1.0));
+    let win = claimed_win(inventory, market.id, &token, 1.0);
+    let intents = vec![claim_intent(&broker, id, market.id, &win)];
+    let snapshot = claim_snapshot(&broker, win);
     let original = Arc::get_mut(&mut broker).unwrap();
-    original.taker = Some(Arc::new(ResumedVenue { trader: trader.clone(), snapshot }));
+    original.taker = Some(Arc::new(ResumedVenue { trader: trader.clone(), snapshot, intents }));
     crate::bot::runtime::live::check_runtime_account(&broker, false).await.unwrap();
     {
         let state = broker.state.lock();
@@ -260,6 +379,8 @@ async fn the_real_producer_trades_again_after_the_exact_claim_and_the_reader_fol
 struct ResumedVenue {
     trader: Arc<crate::service::predict_fun::PredictFunTrader>,
     snapshot: crate::service::venue::AccountSnapshot,
+    /// The proven claims this read may bind to the ledger's closed attempts.
+    intents: Vec<ClaimIntent>,
 }
 
 #[async_trait::async_trait]
@@ -313,6 +434,17 @@ impl crate::service::venue::OrderVenue for ResumedVenue {
     async fn account_snapshot(&self) -> anyhow::Result<crate::service::venue::AccountSnapshot> {
         Ok(self.snapshot.clone())
     }
+
+    /// The typed proof of one claim, from the same account read.
+    async fn runtime_account_observation(
+        &self,
+        closed: &[crate::service::venue::RuntimeClaimInventory],
+    ) -> anyhow::Result<crate::service::venue::RuntimeAccountObservation> {
+        Ok(crate::service::venue::RuntimeAccountObservation {
+            snapshot: self.snapshot.clone(),
+            bound_claims: ClaimRead::evidence_from(self.intents.clone(), closed),
+        })
+    }
 }
 
 /// The fail-closed counter-example on the same real producer: a claim one
@@ -351,18 +483,21 @@ async fn the_real_producer_refuses_a_claim_one_atom_short() {
     // The venue paid one atom less than the confirmed result owes.
     let mut short = claimed_win(inventory, market.id, &token, 1.0);
     short.claim_atoms -= U256::from(1u64);
+    let intents = vec![claim_intent(&broker, id, market.id, &short)];
     let snapshot = claim_snapshot(&broker, short);
     let original = Arc::get_mut(&mut broker).unwrap();
-    original.taker = Some(Arc::new(ClaimRead { snapshot }));
-    live::check_runtime_account(&broker, false).await.unwrap();
+    original.taker = Some(Arc::new(ClaimRead { snapshot, intents }));
+    // A claim one atom short is a mismatch, not a transient read failure: the
+    // read refuses it and the run stops hard.
+    assert!(live::check_runtime_account(&broker, false).await.is_err(),
+        "one atom short is not the cash the result owes");
     {
         let state = broker.state.lock();
         let run = state.live.controlled.as_ref().unwrap();
         let control = run.control.lock();
-        assert_eq!(control.state, LiveRunState::WaitCash,
+        assert_eq!(control.state, LiveRunState::StopNewRisk,
                    "one atom short never closes the cash wait");
-        assert_eq!(control.stop.as_ref().map(|stop| stop.reason.as_str()),
-                   Some("CASH_PENDING"));
+        assert_eq!(control.stop.as_ref().unwrap().reason, "RECONCILIATION_REQUIRED");
         assert!(!state.live.claims.contains_key(&id),
             "a claim one atom short is not ledger cash");
     }
@@ -372,19 +507,23 @@ async fn the_real_producer_refuses_a_claim_one_atom_short() {
 }
 
 /// Ordering a): the claim is credited before the official result is applied.
-/// The claim is proven but not yet cash: it is booked only once the
-/// confirmed official result owes exactly that amount.
+/// The claim is proven but not yet cash: the window waits for its cash, and
+/// the claim becomes cash only once the confirmed official result owes
+/// exactly that amount.
 #[tokio::test]
 async fn a_claim_credited_before_the_official_result_never_stops_the_window() {
     let (mut broker, data) = official_result_fixture(1.0);
     let inventory = broker.state.lock().live.net_inventory[&1];
-    broker.taker = Some(Arc::new(claim_read(&broker, claimed_win(inventory, 1, "1", 1.0))));
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, claimed_win(inventory, 1, "1", 1.0))));
     live::check_runtime_account(&broker, false).await.unwrap();
     {
         let state = broker.state.lock();
         let run = state.live.controlled.as_ref().unwrap();
-        assert_eq!(run.control.lock().state, LiveRunState::Ready);
-        assert!(run.control.lock().stop.is_none(), "the claim is already proven");
+        // Cash evidence before the official result is a wait, not a stop: the
+        // window adds no risk until the result confirms the exact amount.
+        assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
+        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "CASH_PENDING");
+        assert!(!run.may_add_risk(), "a cash wait adds no risk");
         assert!(!state.live.claims.contains_key(&1),
             "an unconfirmed claim is not ledger cash yet");
         assert_eq!(state.live.pending_claims[&1], (inventory, inventory));
@@ -393,7 +532,7 @@ async fn a_claim_credited_before_the_official_result_never_stops_the_window() {
     let state = broker.state.lock();
     let run = state.live.controlled.as_ref().unwrap();
     assert_eq!(run.control.lock().state, LiveRunState::Ready,
-        "a credited claim must not open a cash wait");
+        "the confirmed result ends the cash wait");
     assert!(run.may_add_risk());
     let outcome = &run.attempt_outcomes[&1];
     assert!(outcome.cash_confirmed);
@@ -419,7 +558,7 @@ async fn a_later_exact_claim_clears_the_cash_wait_and_the_final_cash_is_complete
         assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "CASH_PENDING");
         assert!(!run.may_add_risk());
     }
-    broker.taker = Some(Arc::new(claim_read(&broker, claimed_win(inventory, 1, "1", 1.0))));
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, claimed_win(inventory, 1, "1", 1.0))));
     live::check_runtime_account(&broker, false).await.unwrap();
     {
         let state = broker.state.lock();
@@ -464,17 +603,20 @@ async fn a_claim_one_atom_short_is_never_booked_as_cash() {
     let inventory = broker.state.lock().live.net_inventory[&1];
     let mut short = claimed_win(inventory, 1, "1", 1.0);
     short.claim_atoms -= U256::from(1u64);
-    broker.taker = Some(Arc::new(claim_read(&broker, short)));
-    live::check_runtime_account(&broker, false).await.unwrap();
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, short)));
+    // A complete read that does not match is a hard stop, not a wait that
+    // something may clear later.
+    assert!(live::check_runtime_account(&broker, false).await.is_err(),
+        "a claim one atom short is not the cash the result owes");
     {
         let state = broker.state.lock();
         let run = state.live.controlled.as_ref().unwrap();
-        assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
-        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "CASH_PENDING");
+        assert_eq!(run.control.lock().state, LiveRunState::StopNewRisk);
+        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "RECONCILIATION_REQUIRED");
         assert!(!state.live.claims.contains_key(&1),
             "a claim one atom short is not ledger cash");
-        assert!(state.live.pending_claims.contains_key(&1),
-            "the proven claim waits for the official result");
+        assert!(!state.live.pending_claims.contains_key(&1),
+            "a bad proof never becomes a bookable pending claim");
     }
     let events = crate::bot::runtime::live_events::prepare_final(&mut broker.state.lock(), true)
         .unwrap();
@@ -503,14 +645,15 @@ async fn a_late_claim_that_is_not_exact_leaves_the_cash_wait_in_place() {
     let inventory = broker.state.lock().live.net_inventory[&1];
     let mut short = claimed_win(inventory, 1, "1", 1.0);
     short.claim_atoms -= U256::from(1u64);
-    broker.taker = Some(Arc::new(claim_read(&broker, short)));
-    live::check_runtime_account(&broker, false).await.unwrap();
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, short)));
+    // The read refuses the mismatching proof and the run stops hard.
+    assert!(live::check_runtime_account(&broker, false).await.is_err(),
+        "one atom short is not the cash the result owes");
     {
         let state = broker.state.lock();
         let run = state.live.controlled.as_ref().unwrap();
-        assert_eq!(run.control.lock().state, LiveRunState::WaitCash,
-            "one atom short is not the cash the result owes");
-        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "CASH_PENDING");
+        assert_eq!(run.control.lock().state, LiveRunState::StopNewRisk);
+        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "RECONCILIATION_REQUIRED");
         assert!(!run.may_add_risk());
     }
 }
@@ -532,7 +675,7 @@ async fn a_claim_never_clears_a_stop_that_is_not_the_cash_wait() {
         assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "DATA_UNAVAILABLE");
     }
     let inventory = broker.state.lock().live.net_inventory[&1];
-    broker.taker = Some(Arc::new(claim_read(&broker, claimed_win(inventory, 1, "1", 1.0))));
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, claimed_win(inventory, 1, "1", 1.0))));
     live::check_runtime_account(&broker, false).await.unwrap();
     {
         let state = broker.state.lock();
@@ -542,16 +685,17 @@ async fn a_claim_never_clears_a_stop_that_is_not_the_cash_wait() {
         assert!(!run.may_add_risk());
     }
     // A claim for a token this window never held is not this ledger's claim:
-    // the read stays fail-closed and the cash wait stands.
+    // the read refuses it and the run stops hard.
     let (mut broker, data) = official_result_fixture(1.0);
     broker.settle_resolved(&data).await.unwrap();
     let inventory = broker.state.lock().live.net_inventory[&1];
-    broker.taker = Some(Arc::new(claim_read(&broker, claimed_win(inventory, 1, "999", 1.0))));
+    broker.taker = Some(Arc::new(claim_read(&broker, 1, claimed_win(inventory, 1, "999", 1.0))));
     assert!(live::check_runtime_account(&broker, false).await.is_err(),
         "a foreign claim is not this window's cash");
     let state = broker.state.lock();
     let run = state.live.controlled.as_ref().unwrap();
-    assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
-    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "CASH_PENDING");
+    assert_eq!(run.control.lock().state, LiveRunState::StopNewRisk);
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "RECONCILIATION_REQUIRED");
     assert!(!run.may_add_risk());
+    assert!(!state.live.claims.contains_key(&1), "a foreign claim is not ledger cash");
 }

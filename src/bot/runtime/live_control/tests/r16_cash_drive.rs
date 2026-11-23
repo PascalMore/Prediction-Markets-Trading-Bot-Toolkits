@@ -1,0 +1,614 @@
+//! R16 regressions on the existing ledger; transport/drive cases extend this module.
+use super::*;
+use crate::bot::runtime::live;
+use crate::models::VenueId;
+use crate::service::venue::{AccountSnapshot, BoundClaimEvidence, OrderTicket, OrderVenue,
+    RuntimeAccountObservation, RuntimeClaimInventory};
+
+struct ExactAccount {
+    snapshot: AccountSnapshot,
+    proof: BoundClaimEvidence,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl OrderVenue for ExactAccount {
+    fn id(&self) -> VenueId { VenueId::PredictFun }
+    async fn place(&self, _: &crate::models::PlannedOrder, _: u64, _: bool)
+        -> anyhow::Result<OrderTicket> { panic!("read-only fixture cannot send") }
+    async fn account_snapshot(&self) -> anyhow::Result<AccountSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+    async fn runtime_account_observation(&self, _: &[RuntimeClaimInventory])
+        -> anyhow::Result<RuntimeAccountObservation> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(RuntimeAccountObservation {
+            snapshot: self.snapshot.clone(), bound_claims: vec![self.proof.clone()],
+        })
+    }
+}
+
+fn exact_account(broker: &Broker) -> ExactAccount {
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    let record = state.live.attempts[&1].lock();
+    let inventory = state.live.net_inventory[&1];
+    let market = &run.traded[&record.identity.market_id];
+    let mut snapshot = state.live.baseline.clone().unwrap();
+    snapshot.collateral_atoms = Some(snapshot.collateral_atoms.unwrap()
+        - state.live.net_cash[&1] + inventory);
+    snapshot.positions.clear();
+    ExactAccount { snapshot, reads: Default::default(), proof: BoundClaimEvidence {
+        identity: record.identity.clone(), execution_generation: state.live.generation[&1],
+        yes_token: market.yes_token.clone(), no_token: market.no_token.clone(),
+        inventory_atoms: inventory, claim_atoms: inventory, payout_millionths: 1_000_000,
+    }}
+}
+
+#[tokio::test]
+async fn cash_first_requires_a_fresh_read_after_the_result_before_credit_or_resume() {
+    let (mut broker, result) = candidate_tests::official_result_fixture(1.0);
+    let account = exact_account(&broker);
+    let reads = account.reads.clone();
+    broker.taker = Some(Arc::new(account));
+    live::check_runtime_account(&broker, false).await.unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(state.live.claims.is_empty(), "unconsumed official result cannot credit cash");
+        assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
+    }
+    // The settlement lane itself re-reads after publishing the result. Count
+    // actual reads: simply promoting the saved tuple would leave this at one.
+    broker.settle_resolved(&result).await.unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.attempt_outcomes[&1].cash_confirmed);
+    assert_eq!(run.control.lock().state, LiveRunState::Ready);
+    assert!(state.live.pending_claims.is_empty());
+    assert_eq!(state.live.claims.len(), 1);
+}
+
+use crate::service::predict_fun::controlled::r16_fixture;
+use crate::service::venue::{MarketData, MarketQuery, TradableMarket};
+use crate::service::observation::{Clock, FixtureClock};
+
+async fn adapter_fixture() -> (Arc<Broker>, Arc<FixtureClock>,
+    Arc<crate::service::predict_fun::PredictFunTrader>,
+    Arc<crate::service::predict_fun::account::tests::SyntheticRpc>, Arc<r16_fixture::Facts>) {
+    let (mut broker, clock) = candidate_tests::risk_fixture();
+    clock.set_utc(Utc::now() - chrono::Duration::minutes(10));
+    let (trader, transport, _, facts) = r16_fixture::trader();
+    let baseline = trader.account_snapshot().await.unwrap();
+    broker.identity = Some(trader.identity());
+    broker.gate = Some(trader.gate.clone());
+    let trader = Arc::new(trader);
+    broker.taker = Some(trader.clone());
+    broker.limit = Some(trader.clone());
+    {
+        let mut state = broker.state.lock();
+        state.live.baseline = Some(baseline.clone());
+        let run = state.live.controlled.as_mut().unwrap();
+        run.identity = trader.identity();
+        run.options.gas_policy.payer_address = trader.identity().signer_address;
+        let receipt = account_receipt(&state).unwrap();
+        record_account_read(&mut state, &baseline, receipt).unwrap();
+    }
+    (Arc::new(broker), clock, trader, transport, facts)
+}
+
+fn resolved(mut market: TradableMarket, payout: f64) -> TradableMarket {
+    market.open = false;
+    market.end_price = Some(if payout == 1.0 { 101.0 } else if payout == 0.0 { 99.0 } else { 100.0 });
+    market.payout_yes = Some(payout);
+    market.round_facts = Some(crate::service::venue::RoundFacts {
+        oracle_status: Some("RESOLVED".into()), trading_status: Some("CLOSED".into()),
+        yes_status: Some(if payout == 0.5 { "DRAW" } else if payout == 1.0 { "WON" } else { "LOST" }.into()),
+        no_status: Some(if payout == 0.5 { "DRAW" } else if payout == 0.0 { "WON" } else { "LOST" }.into()),
+        decimal_precision: Some(2), price_feed_provider: None,
+    });
+    market
+}
+
+async fn send_round(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16_fixture::Facts,
+    core: &mut crate::bot::arbitrage::DecisionCore, id: u64) -> TradableMarket {
+    let (market, book, evaluation) = candidate_tests::evaluate_live_round_with_core(clock, true, id, core);
+    facts.round(market.clone());
+    let prior: Vec<_> = broker.state.lock().live.controlled.as_ref().unwrap().traded.values().cloned().collect();
+    for held in prior { broker.observe(&held, &book); }
+    live::check_runtime_account(broker, false).await.unwrap();
+    broker.observe(&market, &book);
+    let candidate = evaluation.candidate.unwrap();
+    assert!(broker.emit_phase1_evaluation(&market, &evaluation.diagnostic, Some(&candidate)));
+    let ack = candidate_tests::ack_next(broker.clone(), false);
+    let outcome = broker.take_live_candidate(crate::bot::runtime::taker::LiveCandidateRequest {
+        market: &market, yes_book: &book, candidate: &candidate,
+    }).await.unwrap();
+    ack.join().unwrap();
+    assert!(matches!(outcome.result, crate::bot::runtime::TakeResult::Filled { .. }));
+    live::sync_predict(broker).await.unwrap();
+    market
+}
+
+async fn actual_adapter_two_rounds(cash_first: bool) {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 1.0));
+    if cash_first { facts.pay(77); }
+    if cash_first {
+        live::check_runtime_account(&broker, false).await.unwrap();
+        let state = broker.state.lock();
+        assert!(state.live.claims.is_empty());
+        assert_eq!(state.live.pending_claims.len(), 1);
+    } else {
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    }
+    let started = broker.state.lock().live.controlled.as_ref().unwrap().cash_wait.as_ref().unwrap().started;
+    for _ in 0..2 {
+        live::check_runtime_account(&broker, false).await.unwrap();
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
+        assert!(!run.must_end() && !run.may_add_risk());
+        assert_eq!(run.cash_wait.as_ref().unwrap().started, started);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    }
+    clock.advance(5_407);
+    if cash_first { broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap(); }
+    else { facts.pay(77); live::check_runtime_account(&broker, false).await.unwrap(); }
+    assert_eq!(broker.state.lock().live.controlled.as_ref().unwrap().control.lock().state, LiveRunState::Ready);
+    clock.advance(300_000);
+    let second = send_round(&broker, &clock, &facts, &mut core, 2).await;
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+    facts.round(resolved(second, 1.0));
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    facts.pay(177);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    let state = broker.state.lock();
+    assert_eq!(state.live.claims.len(), 2);
+    assert!(state.live.pending_claims.is_empty());
+    assert!(state.live.controlled.as_ref().unwrap().may_add_risk());
+    drop(state);
+    broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
+    broker.finish_controlled_live_with(r16_fixture::data(&trader).as_ref(),
+        std::time::Duration::from_secs(1), std::time::Duration::ZERO).await;
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished());
+}
+
+#[tokio::test]
+async fn actual_adapter_result_first_cash_then_second_real_post() {
+    actual_adapter_two_rounds(false).await;
+}
+
+#[tokio::test]
+async fn actual_adapter_cash_first_result_then_second_real_post() {
+    actual_adapter_two_rounds(true).await;
+}
+
+struct NextRound {
+    core: crate::bot::arbitrage::DecisionCore,
+    clock: Arc<FixtureClock>,
+    facts: Arc<r16_fixture::Facts>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::bot::runtime::Strategy for NextRound {
+    fn name(&self) -> &'static str { "r16-original-drive" }
+    async fn tick(&mut self, ctx: &crate::bot::runtime::Ctx) -> anyhow::Result<()> {
+        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0,
+            "waiting drive must not run a strategy, and the original deadline ends after round two");
+        self.clock.advance(300_000);
+        let market = send_round(&ctx.broker, &self.clock, &self.facts, &mut self.core, 2).await;
+        self.facts.round(resolved(market, 1.0));
+        ctx.broker.settle_resolved(ctx.data.as_ref()).await?;
+        self.facts.pay(177);
+        live::check_runtime_account(&ctx.broker, false).await?;
+        // Advance the existing controlled clock to its original deadline. The
+        // drive, not this strategy, performs cleanup/final and returns.
+        self.clock.advance(3_600_000);
+        Ok(())
+    }
+}
+
+async fn original_drive_cash_recovery(cash_first: bool) {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 1.0));
+    if cash_first {
+        facts.pay(77);
+        live::check_runtime_account(&broker, false).await.unwrap();
+    } else {
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    }
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut strategy = NextRound { core, clock: clock.clone(), facts: facts.clone(), calls: calls.clone() };
+    let mut cfg = candidate_tests::ctx_fixture(broker.identity.as_ref().unwrap());
+    cfg.strategies.poll_secs = 1;
+    let client = r16_fixture::data(&trader);
+    let ctx = crate::bot::runtime::Ctx { cfg, client: client.clone(), data: client, broker: broker.clone() };
+    let driving = crate::bot::runtime::drive(&mut strategy, &ctx);
+    tokio::pin!(driving);
+    tokio::select! {
+        result = &mut driving => panic!("cash wait prematurely returned: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(2_100)) => (),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert!(!broker.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished());
+    facts.pay(77);
+    clock.advance(5_407);
+    // Cash-first preserves the original 60s settlement cadence. This offline
+    // test waits for that real cadence, not a shortened production constant.
+    tokio::time::timeout(std::time::Duration::from_secs(75), &mut driving)
+        .await.expect("original drive must recover, post the next round, and finish").unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert_eq!(state.live.claims.len(), 2);
+    assert!(run.emitter.is_finished());
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "DEADLINE");
+}
+
+#[tokio::test]
+async fn original_drive_result_first_recovers_and_posts_without_restart() {
+    original_drive_cash_recovery(false).await;
+}
+
+#[tokio::test]
+async fn original_drive_cash_first_recovers_and_posts_without_restart() {
+    original_drive_cash_recovery(true).await;
+}
+
+struct NeverTick;
+#[async_trait::async_trait]
+impl crate::bot::runtime::Strategy for NeverTick {
+    fn name(&self) -> &'static str { "r16-deadline-close" }
+    async fn tick(&mut self, _: &crate::bot::runtime::Ctx) -> anyhow::Result<()> {
+        panic!("the expired original drive must finish before a strategy call")
+    }
+}
+
+async fn close_at_original_deadline(broker: Arc<Broker>, clock: Arc<FixtureClock>,
+    trader: &crate::service::predict_fun::PredictFunTrader) {
+    clock.advance(3_600_000);
+    let cfg = candidate_tests::ctx_fixture(broker.identity.as_ref().unwrap());
+    let client = r16_fixture::data(trader);
+    let ctx = crate::bot::runtime::Ctx { cfg, client:client.clone(), data:client, broker:broker.clone() };
+    tokio::time::timeout(std::time::Duration::from_secs(5),
+        crate::bot::runtime::drive(&mut NeverTick, &ctx)).await.unwrap().unwrap();
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished());
+}
+
+#[tokio::test]
+async fn actual_adapter_two_claims_paid_separately_keep_wait_until_every_owner_closes() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd:1.0, ..Default::default() });
+    let first = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    clock.advance(300_000);
+    let second = send_round(&broker, &clock, &facts, &mut core, 2).await;
+    facts.round(resolved(first, 1.0)); facts.round(resolved(second, 1.0));
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    let started = broker.state.lock().live.controlled.as_ref().unwrap().cash_wait.as_ref().unwrap().started;
+    facts.pay(77);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert_eq!(state.live.claims.len(), 1);
+        assert_eq!(run.control.lock().state, LiveRunState::WaitCash);
+        assert!(!run.may_add_risk());
+        assert_eq!(run.cash_wait.as_ref().unwrap().started, started);
+    }
+    facts.pay(177);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    let cash = crate::bot::runtime::live_events::state_accounting(&broker.state.lock()).cash;
+    live::check_runtime_account(&broker, false).await.unwrap();
+    {
+        let state = broker.state.lock();
+        assert_eq!(state.live.claims.len(), 2);
+        assert_eq!(crate::bot::runtime::live_events::state_accounting(&state).cash, cash);
+        assert!(state.live.controlled.as_ref().unwrap().may_add_risk());
+    }
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+    close_at_original_deadline(broker, clock, &trader).await;
+}
+
+#[tokio::test]
+async fn actual_adapter_zero_payout_removes_inventory_without_inventing_a_cash_claim() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd:1.0, ..Default::default() });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 0.0));
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    facts.pay(77);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    assert!(broker.state.lock().live.claims.is_empty());
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().may_add_risk());
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    close_at_original_deadline(broker, clock, &trader).await;
+}
+
+#[tokio::test]
+async fn actual_adapter_cash_confirmation_cannot_clear_any_first_hard_stop() {
+    for reason in ["DATA_UNAVAILABLE", "FACT_CONFLICT", "DEADLINE", "PARENT_LOST",
+        "AUDIT_UNAVAILABLE", "OUTPUT_INVALID", "LOSS_LATCH"] {
+        for stop_first in [false, true] {
+            let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+            let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+                order_usd:1.0, ..Default::default() });
+            let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+            facts.round(resolved(market, 1.0));
+            let stop = || broker.state.lock().live.controlled.as_mut().unwrap()
+                .stop(reason, true, clock.now().unwrap().utc);
+            if stop_first { stop(); }
+            broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+            if !stop_first { stop(); }
+            facts.pay(77);
+            live::check_runtime_account(&broker, false).await.unwrap();
+            let state = broker.state.lock();
+            let run = state.live.controlled.as_ref().unwrap();
+            assert_eq!(run.control.lock().state, LiveRunState::StopNewRisk, "{reason}/{stop_first}");
+            assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, reason);
+            assert!(!run.may_add_risk() && run.must_end());
+            assert_eq!(state.live.claims.len(), 1, "cash facts remain truthful after a hard stop");
+            assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cash_wait_599999_600000_600001_on_either_clock_never_renews_its_origin() {
+    for delta in [599_999, 600_000, 600_001] {
+        for mode in ["both", "utc", "elapsed"] {
+            let (mut broker, result) = candidate_tests::official_result_fixture(1.0);
+            broker.settle_resolved(&result).await.unwrap();
+            let start = broker.state.lock().live.controlled.as_ref().unwrap().cash_wait.as_ref().unwrap().started;
+            let clock = Arc::new(FixtureClock::new(start.utc));
+            clock.advance(start.elapsed_ms);
+            clock.set_utc(start.utc);
+            if mode != "utc" { clock.advance(delta); }
+            if mode == "elapsed" { clock.set_utc(start.utc); }
+            if mode == "utc" { clock.set_utc(start.utc + chrono::Duration::milliseconds(delta as i64)); }
+            broker.state.lock().live.controlled.as_mut().unwrap().phase1.clock = clock;
+            broker.taker = Some(Arc::new(exact_account(&broker)));
+            live::check_runtime_account(&broker, false).await.unwrap();
+            let state = broker.state.lock();
+            let run = state.live.controlled.as_ref().unwrap();
+            if delta < 600_000 { assert!(run.may_add_risk(), "{delta}/{mode}"); }
+            else {
+                assert!(!run.may_add_risk() && run.must_end(), "{delta}/{mode}");
+                assert_eq!(run.cash_wait.as_ref().unwrap().started, start);
+            }
+        }
+    }
+}
+
+// Keep the production finish consumer pending after cleanup, without waiting
+// for its real 60s poll cadence or enabling Tokio test-util/dependency changes.
+struct FinishClock {
+    inner: Arc<FixtureClock>,
+    fail_after_reads: std::sync::atomic::AtomicUsize,
+}
+impl Clock for FinishClock {
+    fn now(&self) -> anyhow::Result<crate::service::observation::CheckTime> {
+        if self.fail_after_reads.try_update(Ordering::SeqCst, Ordering::SeqCst,
+            |left| left.checked_sub(1)).ok() == Some(1) {
+            anyhow::bail!("fixture clock unavailable");
+        }
+        self.inner.now()
+    }
+}
+
+struct FinishPendingData {
+    market: TradableMarket,
+    clock: Arc<FinishClock>,
+    cleanup_advance_ms: u64,
+    fail_tail_clock: bool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl MarketData for FinishPendingData {
+    async fn markets(&self, _: &MarketQuery) -> anyhow::Result<Vec<TradableMarket>> {
+        panic!("finish must not scan")
+    }
+    async fn market(&self, _: u64) -> anyhow::Result<TradableMarket> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.clock.inner.advance(self.cleanup_advance_ms);
+            // Eight original settlement/risk/lifecycle clock reads precede
+            // the shared finish budget. Fail that next read only; final can
+            // still record truthful facts with the original clock restored.
+            if self.fail_tail_clock { self.clock.fail_after_reads.store(9, Ordering::SeqCst); }
+            Ok(self.market.clone())
+        } else {
+            std::future::pending().await
+        }
+    }
+    async fn with_schedule(&self, _: &TradableMarket) -> anyhow::Result<TradableMarket> {
+        panic!("finish must not reschedule")
+    }
+    async fn books(&self, _: &[u64])
+        -> anyhow::Result<std::collections::HashMap<u64, crate::models::BookSnapshot>> {
+        panic!("finish must not invent a mark")
+    }
+}
+
+#[tokio::test]
+async fn finish_tail_uses_only_the_original_cash_wait_remainder_after_cleanup() {
+    use crate::bot::runtime::live_control::cash_wait::CashWait;
+    use std::time::Duration;
+    // Each positive remainder is tiny on purpose: fake UTC/elapsed advance
+    // independently, while the real consumer's timeout is exercised unchanged.
+    for (case, wall_ms, elapsed_ms, deadline_ms, cleanup_ms, exhausted, explicit, expected_ms) in [
+        ("partial", 599_940, 599_940, 3_600_000, 0, false, false, 60),
+        ("utc_first", 599_960, 599_900, 3_600_000, 0, false, false, 40),
+        ("elapsed_first", 599_900, 599_960, 3_600_000, 0, false, false, 40),
+        ("utc_equal", 600_000, 599_900, 3_600_000, 0, false, false, 0),
+        ("elapsed_equal", 599_900, 600_000, 3_600_000, 0, false, false, 0),
+        ("over", 600_001, 600_001, 3_600_000, 0, false, false, 0),
+        ("deadline_utc", 100, 100, 140, 0, false, false, 40),
+        ("deadline_elapsed", 100, 130, 140, 0, false, false, 10),
+        ("cleanup_partial", 599_900, 599_900, 3_600_000, 60, false, false, 40),
+        ("cleanup_exhausts", 599_980, 599_980, 3_600_000, 30, false, false, 0),
+        ("latched", 0, 0, 3_600_000, 0, true, false, 0),
+        ("utc_rollback", -1, 0, 3_600_000, 0, false, false, 0),
+        ("elapsed_rollback", 0, 0, 3_600_000, 0, false, false, 0),
+        ("clock_error", 599_900, 599_900, 3_600_000, 0, false, false, 0),
+        ("deadline_equal", 100, 100, 100, 0, false, false, 0),
+        ("explicit_cap", 599_900, 599_900, 3_600_000, 0, false, true, 25),
+        ("explicit_exhausted", 600_000, 600_000, 3_600_000, 0, false, true, 0),
+        ("no_wait", 0, 0, 3_600_000, 0, false, true, 25),
+    ] {
+        let (broker, clock, _trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        let started = clock.now().unwrap();
+        {
+            let mut state = broker.state.lock();
+            let run = state.live.controlled.as_mut().unwrap();
+            if case != "no_wait" {
+                let mut wait = CashWait::begin(started, vec![1]);
+                if exhausted { wait.exhaust(); }
+                run.cash_wait = Some(wait);
+            }
+            run.options.deadline_at = started.utc + chrono::Duration::milliseconds(deadline_ms);
+            run.run_deadline_elapsed_ms = started.elapsed_ms + deadline_ms as u64;
+        }
+        clock.advance(elapsed_ms);
+        clock.set_utc(started.utc + chrono::Duration::milliseconds(wall_ms));
+        broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
+        // A later hard stop must not rename the first cause or authorize risk.
+        broker.state.lock().live.controlled.as_mut().unwrap()
+            .stop("FACT_CONFLICT", true, started.utc);
+        let tail_clock = Arc::new(FinishClock { inner: if case == "elapsed_rollback" {
+            Arc::new(FixtureClock::new(started.utc))
+        } else { clock }, fail_after_reads: Default::default() });
+        broker.state.lock().live.controlled.as_mut().unwrap().phase1.clock = tail_clock.clone();
+        let data = FinishPendingData { market, clock: tail_clock, cleanup_advance_ms: cleanup_ms,
+            fail_tail_clock: case == "clock_error", reads: Default::default() };
+        let before = tokio::time::Instant::now();
+        let finish = async {
+            if explicit {
+                broker.finish_controlled_live_with(&data, Duration::from_secs(1),
+                    Duration::from_millis(25)).await;
+            } else {
+                broker.finish_controlled_live(&data).await;
+            }
+        };
+        let watchdog_ms = if expected_ms == 0 { 300 } else { expected_ms + 30 };
+        tokio::time::timeout(Duration::from_millis(watchdog_ms), finish).await
+            .unwrap_or_else(|_| panic!("{case}: finish exceeded the original remainder"));
+        assert!(before.elapsed() >= Duration::from_millis(expected_ms), "{case}: tail was lost");
+        assert_eq!(data.reads.load(Ordering::SeqCst), if expected_ms == 0 { 1 } else { 2 },
+            "{case}: exhausted waits must not even poll a tail read");
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(run.emitter.is_finished(), "{case}");
+        assert!(!run.may_add_risk(), "{case}");
+        assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "DEADLINE", "{case}");
+        if case != "no_wait" {
+            assert_eq!(run.cash_wait.as_ref().unwrap().started, started, "{case}: W0 changed");
+        }
+        assert!(run.attempt_outcomes.is_empty() && state.live.claims.is_empty(), "{case}");
+        assert_eq!(run.control.lock().state, LiveRunState::Handoff, "{case}: cash is not closed");
+        assert!(!state.live.net_inventory[&1].is_zero(), "{case}: uncredited holding lost");
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 1, "{case}: new sign");
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "{case}: new POST");
+    }
+}
+
+#[test]
+fn captured_finish_tail_remainders_keep_every_final_cash_incomplete() {
+    use crate::bot::runtime::live_events::{LiveEventEmitter, LIVE_EVENT_PREFIX};
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "bot::runtime::live_control::r16_cash_drive::finish_tail_uses_only_the_original_cash_wait_remainder_after_cleanup",
+            "--nocapture"]).current_dir(env!("CARGO_MANIFEST_DIR")).output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    let text = std::str::from_utf8(&output.stdout).unwrap();
+    let finals: Vec<_> = text.lines().filter_map(|line| line.split_once(LIVE_EVENT_PREFIX))
+        .map(|(_, json)| LiveEventEmitter::validate_bytes(json.as_bytes()).unwrap())
+        .filter(|event| event["event_kind"] == "final").collect();
+    assert_eq!(finals.len(), 18, "one actual producer final per parameterized boundary");
+    for event in finals {
+        assert_eq!(event["payload"]["cash_complete"], false);
+        assert_eq!(event["payload"]["takeover_required"], true);
+        assert_eq!(event["payload"]["stop_reason"], "DEADLINE");
+        assert_eq!(event["payload"]["positions"].as_array().unwrap().len(), 1);
+    }
+}
+
+struct TamperedObservation {
+    trader: Arc<crate::service::predict_fun::PredictFunTrader>,
+    fault: &'static str,
+}
+#[async_trait::async_trait]
+impl OrderVenue for TamperedObservation {
+    fn id(&self) -> VenueId { VenueId::PredictFun }
+    async fn place(&self, _: &crate::models::PlannedOrder, _: u64, _: bool)
+        -> anyhow::Result<OrderTicket> { panic!("fault injection cannot send") }
+    async fn runtime_account_observation(&self, closed: &[RuntimeClaimInventory])
+        -> anyhow::Result<RuntimeAccountObservation> {
+        let mut read = self.trader.runtime_account_observation(closed).await?;
+        assert_eq!(read.bound_claims.len(), 1);
+        let claim = &mut read.bound_claims[0];
+        match self.fault {
+            "inventory_minus" => claim.inventory_atoms -= U256::from(1),
+            "inventory_plus" => claim.inventory_atoms += U256::from(1),
+            "cash_minus" => claim.claim_atoms -= U256::from(1),
+            "cash_plus" => claim.claim_atoms += U256::from(1),
+            "generation" => claim.execution_generation -= 1,
+            "market" => claim.identity.market_id = 999,
+            "token" => claim.identity.token_id = "999".into(),
+            "side" => claim.identity.side = crate::models::Side::Sell,
+            "pair" => claim.no_token = "999".into(),
+            "owner" => claim.identity.local_attempt_id = 999,
+            "hash" => claim.identity.signed_hash = Some(format!("0x{}", "f".repeat(64))),
+            "extra_cash" => *read.snapshot.collateral_atoms.as_mut().unwrap() += U256::from(1),
+            "inventory_still_present" => read.snapshot.positions.push((claim.identity.token_id.clone(), claim.inventory_atoms)),
+            "open_order" => read.snapshot.open_orders.push("999".into()),
+            "incomplete" => read.snapshot.complete = false,
+            "duplicate_owner" => { let duplicate = claim.clone(); read.bound_claims.push(duplicate); }
+            _ => panic!("unknown test fault"),
+        }
+        Ok(read)
+    }
+}
+
+#[tokio::test]
+async fn actual_adapter_proof_mutations_fail_before_any_partial_credit_or_resume() {
+    for fault in ["inventory_minus", "inventory_plus", "cash_minus", "cash_plus", "generation",
+        "market", "token", "side", "pair", "owner", "hash", "extra_cash", "inventory_still_present",
+        "open_order", "incomplete", "duplicate_owner"] {
+        let (mut broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd:1.0, ..Default::default() });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        facts.round(resolved(market, 1.0));
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+        facts.pay(77);
+        Arc::get_mut(&mut broker).unwrap().taker = Some(Arc::new(TamperedObservation { trader, fault }));
+        assert!(live::check_runtime_account(&broker, false).await.is_err(), "{fault}");
+        let state = broker.state.lock();
+        assert!(state.live.claims.is_empty(), "{fault}");
+        assert!(state.live.pending_claims.is_empty(), "{fault}");
+        assert!(!state.live.controlled.as_ref().unwrap().may_add_risk(), "{fault}");
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "{fault}");
+    }
+}

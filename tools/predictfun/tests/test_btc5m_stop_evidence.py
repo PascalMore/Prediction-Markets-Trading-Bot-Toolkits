@@ -104,33 +104,39 @@ class StopOutputEvidenceTests(unittest.TestCase):
     def frames(self):
         return self.native_stream(813, 827)
 
-    def test_an_unterminated_stderr_residue_is_kept_and_still_ends(self):
+    def test_an_unterminated_stderr_residue_is_kept_and_does_not_end(self):
+        # R14: the child's stderr is evidence, not a cause. A residue is kept
+        # in this run's own log, and the run keeps going.
         residue = b"rust warning: no trailing newline"
         facts, final, read, store = self.consume_bytes(self.frames()[0], residue)
-        self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
-        self.assertEqual(facts["stop_output"], "WRITTEN")
-        self.assertIsNone(final)
-        record = self.record(store)
-        self.assertEqual(record["stream"], "stderr")
-        self.assertEqual(record["bytes"], len(residue))
-        self.assertIs(record["newline_terminated"], False)
-        self.assertIn("no trailing newline", record["text"])
-        self.assertEqual(record["child_returncode"], facts["child_returncode"])
-        self.assertEqual(self.ended(store)["exit_facts"]["stop_reason"], "OUTPUT_INVALID")
+        self.assertIsNone(facts["stop_reason"])
+        self.assertNotIn("stop_output", facts)
+        self.assertFalse((store.directory / "stop-output.json").exists())
+        log = (store.directory / control.RUN_LOG_NAME).read_text(encoding="utf-8")
+        self.assertIn("no trailing newline", log)
+        self.assertIn("[stderr]", log)
         self.assertEqual(read["status"], "INCOMPLETE")
 
-    def test_a_newline_terminated_stderr_line_is_kept_and_still_ends(self):
+    def test_a_newline_terminated_stderr_line_is_kept_and_does_not_end(self):
         line = b'BTC5M_EVENT {"not":"a live event"}\n'
         facts, final, read, store = self.consume_bytes(self.frames()[0], line)
-        self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
-        self.assertEqual(facts["stop_output"], "WRITTEN")
-        self.assertIsNone(final)
-        record = self.record(store)
-        self.assertEqual(record["stream"], "stderr")
-        self.assertEqual(record["bytes"], len(line))
-        self.assertIs(record["newline_terminated"], True)
+        self.assertIsNone(facts["stop_reason"])
+        self.assertFalse((store.directory / "stop-output.json").exists())
+        log = (store.directory / control.RUN_LOG_NAME).read_text(encoding="utf-8")
+        self.assertIn("[stderr]", log)
+        self.assertIn("not", log)
         self.assertIsNone(self.ended(store)["final_event_seq"])
         self.assertEqual(read["status"], "INCOMPLETE")
+
+    def test_no_secret_shaped_token_reaches_the_kept_log(self):
+        # The run log is written like the stopped fragment: redacted, bounded.
+        key = "f" * 64
+        residue = f"PM_API_SECRET={SENTINEL} Authorization: Bearer *** {key}".encode() + b"\n"
+        _facts, _final, _read, store = self.consume_bytes(self.frames()[0], residue)
+        raw = (store.directory / control.RUN_LOG_NAME).read_bytes()
+        self.assertNotIn(SENTINEL.encode(), raw)
+        self.assertNotIn(key.encode(), raw)
+        self.assertIn(b"<REDACTED>", raw)
 
     def test_an_oversize_line_is_kept_and_still_ends(self):
         oversize = b"BTC5M_EVENT " + b"x" * (control.MAX_LINE_BYTES + 4096) + b"\n"
@@ -184,9 +190,11 @@ class StopOutputEvidenceTests(unittest.TestCase):
         self.assertEqual(record["schema_version"], control.STOP_OUTPUT_SCHEMA)
 
     def test_a_failed_fragment_write_never_replaces_the_stop_reason(self):
+        # The stdout stream still stops the run on its own output; only the
+        # child's stderr was reclassified as evidence.
         residue = b"unterminated child warning"
         failed = patch.object(control, "write_stop_output", side_effect=OSError("offline"))
-        facts, final, read, store = self.consume_bytes(self.frames()[0], residue, patched=failed)
+        facts, final, read, store = self.consume_bytes(self.frames()[0] + residue, patched=failed)
         self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
         self.assertEqual(facts["stop_output"], "WRITE_FAILED")
         self.assertEqual(facts["launcher_exit"], 1)
@@ -198,7 +206,7 @@ class StopOutputEvidenceTests(unittest.TestCase):
 
     def test_the_fragment_record_is_created_once_and_never_replaced(self):
         residue = b"unterminated child warning"
-        _facts, _final, _read, store = self.consume_bytes(self.frames()[0], residue)
+        _facts, _final, _read, store = self.consume_bytes(self.frames()[0] + residue)
         first = (store.directory / "stop-output.json").read_bytes()
         second = {"stream": "stdout", "raw": b"second fragment", "newline_terminated": False,
                   "occurred_at": "2026-11-22T00:00:00.000Z"}

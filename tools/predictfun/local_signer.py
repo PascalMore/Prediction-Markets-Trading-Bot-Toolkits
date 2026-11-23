@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,10 @@ from jeepney.bus import get_bus
 from jeepney.io.blocking import DBusConnection, prep_socket
 
 BOT = Path(__file__).resolve().parents[2]
+REPORT_ROOT = BOT.parents[4] / "data/reports"
+RECONCILE_BINARY = (REPORT_ROOT / "2026-11-23-btc5m-launch-handoff/evidence/deployment"
+                    / "btc5m_reconcile")
+RECONCILE_SHA256 = "a142f2deabe43f6e6ad09bad030c6f3302bb3cff0e15f7d823fb3137acf0c1a5"
 SIGNER = "0x5129330159f4E6a99eF873f86901E3cafa7f9A7D"
 TRADING_ADDRESS = "0xfc9eb66e6F22f96608058C0A711Ed048eED8c2E2"
 SERVICE = "org.freedesktop.Secret.Service"
@@ -354,6 +359,65 @@ def build_child_env(key: bytes, environment: Mapping[str, str]) -> dict[str, str
     child.update(PATH="/usr/bin:/bin", RUST_LOG="warn", PM_PRIVATE_KEY=key.decode("ascii"),
                  PM_PREDICT_API_KEY=_api_source(environment), PM_PREDICT_ACCOUNT=TRADING_ADDRESS)
     return child
+
+
+def reconcile_account(config: Path, rpc_url: str, orders: list[str], output: Path,
+                      *, environment: Mapping[str, str]) -> dict:
+    """Run only the pinned read binary; authentication is not order authorization.
+
+    No arbitrary executable, extra argv or output outside the attempt's report
+    directory is accepted. The native reader can authenticate and query, never
+    order, approve, redeem or transfer. Child secrets and raw output are discarded.
+    """
+    from urllib.parse import urlsplit
+    import btc5m_control as control
+
+    _check_environment(environment)
+    _api_source(environment)
+    public, target = Path(config).absolute(), Path(output).absolute()
+    try:
+        rpc = urlsplit(rpc_url)
+        if (rpc.scheme not in {"http", "https"} or not rpc.hostname or rpc.username
+                or rpc.password or rpc.query or rpc.fragment
+                or public.resolve(strict=True) != public
+                or not public.is_relative_to(REPORT_ROOT.resolve())
+                or public.suffix != ".json" or target.parent != public.parent
+                or target.name not in {"reconciliation-pass-1.json", "reconciliation-pass-2.json"}
+                or os.path.lexists(target)
+                or any(type(value) is not str or re.fullmatch(r"0x[0-9a-fA-F]{64}", value) is None
+                       for value in orders)):
+            raise ValueError
+        data = control.read_public_config(public)
+        control.check_fixed_values(data, control.MODE_SIGNED_FUTURE_LIVE)
+        if (RECONCILE_BINARY.is_symlink() or not RECONCILE_BINARY.is_file()
+                or not os.access(RECONCILE_BINARY, os.X_OK)
+                or hashlib.sha256(RECONCILE_BINARY.read_bytes()).hexdigest() != RECONCILE_SHA256):
+            raise ValueError
+    except (OSError, ValueError, TypeError, control.Refused):
+        raise _invalid("RECONCILIATION_INPUT") from None
+    command = [str(RECONCILE_BINARY), "--config", str(public), "--rpc-url", rpc_url,
+               "--output", str(target)]
+    for value in orders:
+        command += ["--predict-reconciled-order", value]
+    key = _read_owned()
+    child = build_child_env(key, environment)
+    try:
+        try:
+            result = subprocess.run(command, cwd=BOT, env=child, shell=False, close_fds=True,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=300, check=False)
+            if result.returncode not in (0, 4) or target.is_symlink():
+                raise ValueError
+            value = json.loads(target.read_text(encoding="utf-8"),
+                               object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+            if value.get("read_only") is not True:
+                raise ValueError
+            return {"exit_code": result.returncode, "projection": value}
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            raise Failure("LAUNCH_FAILED", "reconcile", "READ_FAILED") from None
+    finally:
+        child.clear()
+        del key
 
 
 def enroll() -> None:

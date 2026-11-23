@@ -414,6 +414,18 @@ pub trait ControlledSendGuard: Send + Sync {
             "controlled_send", "EXECUTION_NOT_ENABLED").into())
     }
 
+    /// The receipt-bound account snapshot the controlled send must prepare from.
+    ///
+    /// A controlled send reuses the read that preceded its decision's inputs:
+    /// the gate proves that receipt's completeness, identity, generation,
+    /// attempt binding and ten-second freshness at the final check, so a second
+    /// full account read here would only age the book the decision is frozen
+    /// on. A guard that cannot bind such a read refuses the send.
+    fn account_snapshot(&self) -> Result<AccountSnapshot> {
+        Err(VenueError::new(VenueErrorCode::ExecutionNotEnabled,
+            "controlled_send", "EXECUTION_NOT_ENABLED").into())
+    }
+
     /// Check the prepared facts against the frozen candidate.
     fn check_facts(&self, _bound: &SignedExecutionBound) -> Result<()> {
         Err(VenueError::new(
@@ -452,6 +464,232 @@ pub trait ControlledSendGuard: Send + Sync {
         )
         .into())
     }
+
+    /// Report one send check's outcome without granting anything.
+    ///
+    /// The default does nothing: a guard that does not measure never invents
+    /// a measurement. The notification carries no permission and changes no
+    /// decision; it only records where a check ran and what it found. The
+    /// guard completes the measurement itself, because only it owns the
+    /// clock the check ran on.
+    fn note_send_check(&self, _stage: SendCheckStage, _detail: SendCheckDetail) {}
+}
+
+/// The boundary at which a send check ran.
+///
+/// The stage is where the check happened, never a guess about the last
+/// successful step: it names the original branch that produced the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendCheckStage {
+    Prepare,
+    SignedBound,
+    Facts,
+    Ack,
+    SendPermit,
+    Post,
+}
+
+impl SendCheckStage {
+    /// The wire token of this stage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "PREPARE",
+            Self::SignedBound => "SIGNED_BOUND",
+            Self::Facts => "FACTS",
+            Self::Ack => "ACK",
+            Self::SendPermit => "SEND_PERMIT",
+            Self::Post => "POST",
+        }
+    }
+
+    /// Every stage, in the order the contract lists them.
+    pub const ALL: &'static [SendCheckStage] = &[
+        Self::Prepare,
+        Self::SignedBound,
+        Self::Facts,
+        Self::Ack,
+        Self::SendPermit,
+        Self::Post,
+    ];
+}
+
+/// The closed set of reasons a send check can name.
+///
+/// The tokens are diagnostics only: they never enter the stop reason set and
+/// never change what the original guard decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendCheckDetail {
+    None,
+    Unknown,
+    BookStale,
+    SpotStale,
+    AccountStale,
+    FrozenInput,
+    LimitPrice,
+    Depth,
+    RoundTooLate,
+    EdgeBelowMin,
+    EmptyBook,
+    AccountIncomplete,
+    IdentityMismatch,
+    GenerationMismatch,
+    AttemptMismatch,
+    SignedBoundUnproven,
+    RunStopped,
+    AckUnavailable,
+    ReadUnavailable,
+    VenueRejected,
+    SubmissionUnknown,
+}
+
+impl SendCheckDetail {
+    /// The wire token of this detail.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Unknown => "UNKNOWN",
+            Self::BookStale => "BOOK_STALE",
+            Self::SpotStale => "SPOT_STALE",
+            Self::AccountStale => "ACCOUNT_STALE",
+            Self::FrozenInput => "FROZEN_INPUT",
+            Self::LimitPrice => "LIMIT_PRICE",
+            Self::Depth => "DEPTH",
+            Self::RoundTooLate => "ROUND_TOO_LATE",
+            Self::EdgeBelowMin => "EDGE_BELOW_MIN",
+            Self::EmptyBook => "EMPTY_BOOK",
+            Self::AccountIncomplete => "ACCOUNT_INCOMPLETE",
+            Self::IdentityMismatch => "IDENTITY_MISMATCH",
+            Self::GenerationMismatch => "GENERATION_MISMATCH",
+            Self::AttemptMismatch => "ATTEMPT_MISMATCH",
+            Self::SignedBoundUnproven => "SIGNED_BOUND_UNPROVEN",
+            Self::RunStopped => "RUN_STOPPED",
+            Self::AckUnavailable => "ACK_UNAVAILABLE",
+            Self::ReadUnavailable => "READ_UNAVAILABLE",
+            Self::VenueRejected => "VENUE_REJECTED",
+            Self::SubmissionUnknown => "SUBMISSION_UNKNOWN",
+        }
+    }
+
+    /// Every detail, in the order the contract lists them.
+    pub const ALL: &'static [SendCheckDetail] = &[
+        Self::None,
+        Self::Unknown,
+        Self::BookStale,
+        Self::SpotStale,
+        Self::AccountStale,
+        Self::FrozenInput,
+        Self::LimitPrice,
+        Self::Depth,
+        Self::RoundTooLate,
+        Self::EdgeBelowMin,
+        Self::EmptyBook,
+        Self::AccountIncomplete,
+        Self::IdentityMismatch,
+        Self::GenerationMismatch,
+        Self::AttemptMismatch,
+        Self::SignedBoundUnproven,
+        Self::RunStopped,
+        Self::AckUnavailable,
+        Self::ReadUnavailable,
+        Self::VenueRejected,
+        Self::SubmissionUnknown,
+    ];
+}
+
+/// One measured send check, with the ages it was taken against.
+///
+/// Every field is a number or an enum: no raw error, no HTTP body, no
+/// account detail. A missing measurement is `None`, never a zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendCheckObservation {
+    /// Where the check ran.
+    pub stage: SendCheckStage,
+    /// What the check found.
+    pub detail: SendCheckDetail,
+    /// The check's own wall clock reading.
+    pub checked_at: DateTime<Utc>,
+    /// The check's own elapsed reading, on this run's origin.
+    pub checked_elapsed_ms: u64,
+    /// When this tick's first account read was issued.
+    pub tick_started_elapsed_ms: Option<u64>,
+    /// The age of the book receipt at the check.
+    pub book_receipt_age_ms: Option<u64>,
+    /// The age of the spot receipt at the check.
+    pub spot_receipt_age_ms: Option<u64>,
+    /// The age of the account receipt at the check.
+    pub account_receipt_age_ms: Option<u64>,
+    /// The age of the book's own request at the check.
+    pub book_request_age_ms: Option<u64>,
+    /// The age of the spot's own request at the check.
+    pub spot_request_age_ms: Option<u64>,
+}
+
+impl SendCheckObservation {
+    /// A check whose only known facts are where it ran and what it found.
+    ///
+    /// The clocks and the ages are unknown until a real reading supplies them;
+    /// a diagnostic never invents a measurement.
+    pub fn new(stage: SendCheckStage, detail: SendCheckDetail) -> Self {
+        Self {
+            stage,
+            detail,
+            checked_at: DateTime::<Utc>::UNIX_EPOCH,
+            checked_elapsed_ms: 0,
+            tick_started_elapsed_ms: None,
+            book_receipt_age_ms: None,
+            spot_receipt_age_ms: None,
+            account_receipt_age_ms: None,
+            book_request_age_ms: None,
+            spot_request_age_ms: None,
+        }
+    }
+}
+
+/// The claim inventory of this run's closed attempts, as the broker knows it.
+///
+/// The broker builds this under its own state lock from attempts that are
+/// closed, fully applied and no longer reserved. It carries no cash and no
+/// official result: it names what may still be claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeClaimInventory {
+    /// The attempt this inventory belongs to.
+    pub identity: OrderIdentity,
+    /// The execution generation the attempt's facts were read at.
+    pub execution_generation: u64,
+    /// The net inventory the attempt still holds.
+    pub inventory_atoms: U256,
+}
+
+/// The evidence that one bound order's claim actually arrived.
+///
+/// It is a fact the account's own read proves, not a claim about cash: the
+/// adapter may produce it, but only the broker's own reconciliation can turn
+/// it into ledger cash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundClaimEvidence {
+    /// The attempt this evidence belongs to.
+    pub identity: OrderIdentity,
+    /// The execution generation the read that produced it belongs to.
+    pub execution_generation: u64,
+    /// The outcome token the claim paid.
+    pub yes_token: String,
+    /// The complementary outcome token of the same market.
+    pub no_token: String,
+    /// The inventory the claim consumed, in atoms.
+    pub inventory_atoms: U256,
+    /// The cash the claim delivered, in atoms.
+    pub claim_atoms: U256,
+    /// The official payout of the claim, in millionths of a share.
+    pub payout_millionths: u32,
+}
+
+/// One account read plus the claim evidence the same read proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAccountObservation {
+    /// The account's own facts.
+    pub snapshot: AccountSnapshot,
+    /// The claim evidence the same read proved.
+    pub bound_claims: Vec<BoundClaimEvidence>,
 }
 
 /// What the controlled domain recorded about a signed order.
@@ -566,6 +804,21 @@ pub trait OrderVenue: Send + Sync {
     /// What the controlled domain recorded about a signed order.
     fn controlled_order_metadata(&self, _signed_hash: &str) -> Option<ControlledOrderMetadata> {
         None
+    }
+
+    /// Read the account once and report the claim evidence the same read proved.
+    ///
+    /// The default delegates to the venue's own account read and reports no
+    /// evidence at all: a venue that cannot prove a claim must never let the
+    /// broker treat a balance change as one.
+    async fn runtime_account_observation(
+        &self,
+        _closed: &[RuntimeClaimInventory],
+    ) -> Result<RuntimeAccountObservation> {
+        Ok(RuntimeAccountObservation {
+            snapshot: self.account_snapshot().await?,
+            bound_claims: Vec::new(),
+        })
     }
 
     /// Build and sign `planned`. Transmits it only when `live` is true, so a

@@ -18,14 +18,26 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
-ROOT = Path(__file__).resolve().parents[4]
 BOT = Path(__file__).resolve().parents[2]
+# The project root is four levels above the bot directory. It is not four
+# levels above this file: that would be `auto-trading`, which has neither
+# `skills/.env` nor `data/reports`.
+ROOT = BOT.parents[4]
 TOOLS = Path(__file__).resolve().parent
 MAX_RECONCILIATION_AGE_SECONDS = 900
 MIN_GAS_ATOMS = 2_000_000_000_000_000
+# The operator's own limits. The launcher may only narrow them, never widen
+# them: an order or a market cap above these values is refused, not accepted.
+MAX_ORDER_ATOMS = 1 * 10 ** 18
+MAX_MARKET_ATOMS = 1 * 10 ** 18
+MAX_TOTAL_ATOMS = 10 * 10 ** 18
+MAX_LOSS_ATOMS = 20 * 10 ** 18
+ORDER_HASH = re.compile(r"0x[0-9a-fA-F]{64}", re.ASCII)
 
 
 class Refused(Exception):
@@ -44,13 +56,15 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     """The fixed public interface: where the inputs are, never what they are."""
     parser = _Parser(prog="btc5m_launch", allow_abbrev=False)
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--reconciliation", required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--config", default=str(TOOLS / "btc5m-controlled-paper.json"))
+    parser.add_argument("--auto-prepare", action="store_true",
+                        help="Refresh account facts and prepare a new window using the fixed reader")
+    parser.add_argument("--reconciliation")
+    parser.add_argument("--run-id")
     parser.add_argument("--authorization-ref", required=True)
-    parser.add_argument("--risk-window-id", required=True)
+    parser.add_argument("--risk-window-id")
     parser.add_argument("--operations-mode", choices=("supervised", "unattended"),
-                        required=True)
+                        default="unattended")
     parser.add_argument("--declared-order", action="append", default=None, metavar="HASH")
     parser.add_argument("--rpc-url", default="https://bsc-dataseed.bnbchain.org")
     parser.add_argument("--evidence-root")
@@ -58,9 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--old-risk-window")
     parser.add_argument("--old-authorization-ref")
     parser.add_argument("--old-digest")
-    parser.add_argument("--deployment-id", required=True)
+    parser.add_argument("--deployment-id")
     parser.add_argument("--collection", default="07_trading_btc5m_live_guard")
-    parser.add_argument("--takeover-ref", required=True)
+    parser.add_argument("--takeover-ref")
     return parser
 
 
@@ -77,19 +91,25 @@ def _parse_time(value: Any) -> dt.datetime:
 
 
 def _atoms(value: Any) -> int:
-    if type(value) is not str or not value.isdigit():
+    if type(value) is not str or re.fullmatch(r"[0-9]+", value) is None:
         raise Refused("RECONCILIATION_FACTS")
     return int(value)
 
 
 def preflight(config_path: Path, reconciliation_path: Path, *,
-              now: dt.datetime) -> dict[str, Any]:
+              now: dt.datetime,
+              declared_orders: list[str] | None = None) -> dict[str, Any]:
     """Read-only: the configuration and one fresh reconciliation must agree.
 
     The controlled window's C0 is exactly the cash it accounts for: the observed
     collateral must equal the configured budget atom-for-atom. A different
     balance is never an automatic budget change; it is refused before any order
     so the window cannot trade into an identity it can never close.
+
+    The reconciliation is the account's own read, so it also carries the
+    operator's declared history. The launcher's declaration must be that same
+    list, verbatim and in order: a reconciliation that explained a different
+    history, or none at all, is refused instead of being papered over.
     """
     import btc5m_control as control
 
@@ -98,6 +118,11 @@ def preflight(config_path: Path, reconciliation_path: Path, *,
     params = control.parameters(data)
     if params is None:
         raise Refused("PARAMETERIZED_CONFIG_REQUIRED")
+    # The operator's own limits are a ceiling, not a suggestion: a window that
+    # asks for more is refused, never quietly narrowed.
+    if (params["order"] > MAX_ORDER_ATOMS or params["market"] > MAX_MARKET_ATOMS
+            or params["total"] > MAX_TOTAL_ATOMS or params["loss"] > MAX_LOSS_ATOMS):
+        raise Refused("LIMITS_EXCEEDED")
     try:
         reconciliation = json.loads(Path(reconciliation_path).read_text(encoding="utf-8"))
         observed = _parse_time(reconciliation["finished_at"])
@@ -112,6 +137,8 @@ def preflight(config_path: Path, reconciliation_path: Path, *,
             raise Refused("RECONCILIATION_FACTS")
         if account["open_orders"] != []:
             raise Refused("OPEN_ORDERS_PRESENT")
+        if account.get("positions", []) != []:
+            raise Refused("OPEN_POSITIONS_PRESENT")
         cash = _atoms(account["collateral_atoms"])
         gas = _atoms(account["gas_atoms"])
         # A claimed payout is explained by the reconciler against the declared
@@ -120,6 +147,9 @@ def preflight(config_path: Path, reconciliation_path: Path, *,
         if not isinstance(claims, list):
             raise Refused("RECONCILIATION_FACTS")
         claimed = sum(_atoms(claim["claim_atoms"]) for claim in claims)
+        explained = reconciliation["reconciliation"]["declared_orders"]
+        if not isinstance(explained, list) or any(type(value) is not str for value in explained):
+            raise Refused("RECONCILIATION_FACTS")
     except (OSError, ValueError, KeyError, TypeError):
         raise Refused("RECONCILIATION_FACTS") from None
     age = (now - observed).total_seconds()
@@ -129,7 +159,10 @@ def preflight(config_path: Path, reconciliation_path: Path, *,
         raise Refused("CASH_BUDGET_MISMATCH")
     if gas < MIN_GAS_ATOMS:
         raise Refused("GAS_BELOW_MINIMUM")
-    return {"data": data, "params": params,
+    # One explicit history, in one order, for the reconciliation and the child.
+    if list(declared_orders or ()) != explained:
+        raise Refused("DECLARED_ORDERS_MISMATCH")
+    return {"data": data, "params": params, "declared_orders": explained,
             "reconciliation_sha256": hashlib.sha256(
                 Path(reconciliation_path).read_bytes()).hexdigest()}
 
@@ -201,8 +234,10 @@ def launch(args: argparse.Namespace, *, now: dt.datetime | None = None,
     dispatched. A failure anywhere leaves the following steps untouched.
     """
     now = dt.datetime.now(dt.timezone.utc) if now is None else now
-    checked = preflight(Path(args.config), Path(args.reconciliation), now=now)
+    checked = preflight(Path(args.config), Path(args.reconciliation), now=now,
+                        declared_orders=args.declared_order)
     params = checked["params"]
+    args.params = params
     if args.operations_mode != params["operations_mode"]:
         raise Refused("LIVE_CONTEXT")
     account = fetch_account()
@@ -211,13 +246,14 @@ def launch(args: argparse.Namespace, *, now: dt.datetime | None = None,
     started = now
     windows = identity_windows(args, started)
     data = checked["data"]
+    identity = candidate_identity()
     activation = {"schema_version": "btc5m-live-activation/1",
                   "authorization_ref": windows["authorization_ref"],
                   "risk_window_id": windows["risk_window_id"],
                   "operations_mode": windows["operations_mode"],
                   "account_identity": account,
                   "not_before": windows["started_at"], "deadline_at": windows["deadline_at"],
-                  "candidate_digest": _candidate_digest(candidate_identity(),
+                  "candidate_digest": _candidate_digest(identity,
                                                         public_config_identity(data, params)),
                   "storage_binding": {"deployment_id": args.deployment_id,
                                       "database": "tradingagents", "collection": args.collection,
@@ -252,19 +288,21 @@ def launch(args: argparse.Namespace, *, now: dt.datetime | None = None,
     validate(activation, context, now)
     write_evidence("attempt-reserved.json", {
         "reserved_utc": now.isoformat(), "run_id": args.run_id,
-        "committed_budget_atoms": params["budget"],
+        "committed_budget_atoms": params["budget"], "declared_orders": list(args.declared_order or ()),
         "reconciliation_sha256": checked["reconciliation_sha256"],
         "maximum_controller_invocations": 1, "automatic_retry": False})
     write_activation(activation)
     rotate_barrier(existing)
+    command = controller_arguments(args, Path(args.config), windows, account)
     write_evidence("launch-dispatch.json", {
         "dispatched_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "launcher_pid": os.getpid(), "controller_argv": command,
+        "binary_sha256": identity["binary_sha256"],
         "run_id": windows["run_id"], "deadline_at": windows["deadline_at"],
         "operations_mode": windows["operations_mode"],
         "controller_invocations": 1, "automatic_retry": False})
     environment = read_secret()
-    facts = controller(controller_arguments(args, Path(args.config), windows, account),
-                       environment=environment)
+    facts = controller(command, environment=environment)
     return {"status": "ORIGINAL_CONTROLLER_RETURNED_INSPECT_FINAL", "facts": facts,
             "windows": windows}
 
@@ -278,6 +316,8 @@ def _barrier_collection():
     import btc5m_live_guard as guard
     import pymongo
     from dotenv import dotenv_values
+    import sys
+    sys.path.insert(0, str(ROOT / "skills/data/data-pipeline/scripts"))
     from loaders.mongodb_loader import PortfolioMongoLoader
     from pymongo.read_concern import ReadConcern
     from pymongo.write_concern import WriteConcern
@@ -301,74 +341,423 @@ def _barrier_collection():
                                          "username": values["MONGODB_USERNAME"],
                                          "password": values["MONGODB_PASSWORD"],
                                          "database": values["MONGODB_DATABASE"]})
-    client = loader._get_client()
-    database = client.get_database("tradingagents", read_concern=ReadConcern("majority"))
-    uri = ("mongodb://" + quote(values["MONGODB_USERNAME"], safe="") + ":"
-           + quote(values["MONGODB_PASSWORD"], safe="")
-           + "@" + values["MONGODB_HOST"] + ":" + values["MONGODB_PORT"]
+    if loader.database != "tradingagents":
+        raise Refused("STORAGE_ENV")
+    uri = ("mongodb://" + quote(loader.username, safe="") + ":"
+           + quote(loader.password, safe="")
+           + "@" + loader.host + ":" + str(loader.port)
            + "/tradingagents?authSource=admin&tls=false")
+    # Rotation is a single, potentially ambiguous write, not the shared loader's
+    # retryable data-ingestion client. Keep that loader's other consumers unchanged.
+    client = pymongo.MongoClient(uri, retryWrites=False, connect=False,
+                                serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
+                                socketTimeoutMS=5000)
+    database = client.get_database("tradingagents", read_concern=ReadConcern("majority"))
     return client, uri, database, guard, pymongo, WriteConcern
 
 
-def main(argv: list[str] | None = None) -> int:
-    """The only side-effecting entry point: real storage, controller, no retry."""
-    args = build_parser().parse_args(argv)
+def account_identity() -> dict[str, Any]:
+    """Return the one enrolled Predict Account, not an arbitrary CLI account."""
+    import local_signer
+    return {"venue": "PREDICT_FUN", "chain_id": 56, "account_mode": "predict-account",
+            "trading_address": local_signer.TRADING_ADDRESS.lower(),
+            "signer_address": local_signer.SIGNER.lower()}
+
+
+def _old_activation(path: Path, existing: dict, account: dict) -> bytes:
+    """Match the exact stopped window before touching activation or its barrier."""
+    import btc5m_live_events as live
+    raw = live._read_file(path, live.MAX_LINE_BYTES)
+    value = live.strict_json(raw)
+    if (existing.get("state") != "ARMED" or value.get("account_identity") != account
+            or any(value.get(key) != existing.get(key) for key in
+                   ("authorization_ref", "risk_window_id", "candidate_digest"))):
+        raise Refused("UNEXPECTED_ACTIVATION")
+    return raw
+
+
+def _check_old_guard(existing: dict, account: dict, now: dt.datetime) -> None:
+    """Accept only the existing guard schema and the exact enrolled account scope."""
+    import btc5m_live_events as live
+    import btc5m_live_guard as guard
+    live.exact(existing, "_id schema_version scope state run_id risk_window_id "
+                        "authorization_ref candidate_digest armed_at")
+    scope = existing["scope"]
+    live.exact(scope, live.ACCOUNT_ID_KEYS + " host")
+    live._scalar(scope["host"], "public")
+    live.require({key: value for key, value in scope.items() if key != "host"} == account)
+    live.require(existing["_id"] == guard.scope_id(account)
+                 and existing["schema_version"] == guard.GUARD_SCHEMA
+                 and existing["state"] == "ARMED")
+    for key in ("run_id", "risk_window_id", "authorization_ref"):
+        live._scalar(existing[key], "public")
+    live.require(type(existing["candidate_digest"]) is str
+                 and live.DIGEST.fullmatch(existing["candidate_digest"]) is not None)
+    live.require(live.timestamp(existing["armed_at"]) <= now)
+
+
+def history_for_window(existing: dict, account: dict) -> list[str]:
+    """Carry only the stopped run's declared history and system-accepted orders.
+
+    Remote unknown orders are never added automatically. An unresolved submission
+    or incomplete local audit requires takeover, even if no process remains.
+    """
+    import btc5m_live_events as live
+    run = existing["run_id"]
+    if not isinstance(run, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", run) is None:
+        raise Refused("HISTORY_IDENTITY")
+    reports = ROOT / "data/reports"
+    paths = list(reports.glob(f"*/evidence/{run}/started.json"))
+    if len(paths) != 1:
+        raise Refused("HISTORY_MISSING_OR_AMBIGUOUS")
+    previous = paths[0].parent
+    started = live.strict_json(live._read_file(paths[0], 1024 * 1024))
+    ended = live.strict_json(live._read_file(previous / "ended.json", 1024 * 1024))
+    public = live.strict_json(live._read_file(previous / "public-config.json", 1024 * 1024))
+    context = live.strict_json(live._read_file(previous / "live-context.json", live.MAX_LINE_BYTES))
+    live.check_metadata(started, public, context)
+    if (started.get("run_id") != run or ended.get("run_id") != run
+            or started.get("account_identity") != account
+            or any(started.get(key) != existing.get(key) for key in
+                   ("risk_window_id", "authorization_ref"))
+            or live.candidate_digest(started) != existing["candidate_digest"]
+            or ended.get("audit_complete") is not True):
+        raise Refused("HISTORY_IDENTITY")
+
+    seeds = list(reports.glob(f"*/evidence/launch-attempts/{run}/attempt-reserved.json"))
+    if len(seeds) == 1:
+        seed = live.strict_json(live._read_file(seeds[0], 1024 * 1024))
+        if seed.get("run_id") != run:
+            raise Refused("HISTORY_IDENTITY")
+        orders = seed["declared_orders"]
+    elif not seeds:
+        # Read-only compatibility with the previous approved scratch launch's
+        # public dispatch evidence. Never execute or modify that scratch script.
+        declarations = []
+        for path in reports.glob("*/evidence/unattended-prefly/launch-*/launch-dispatch.json"):
+            value = live.strict_json(live._read_file(path, 1024 * 1024))
+            argv = value.get("controller_argv", [])
+            if "--run-id" in argv and argv[argv.index("--run-id") + 1] == run:
+                declarations.append([argv[index + 1] for index, name in enumerate(argv)
+                                     if name == "--predict-reconciled-order"])
+        if len(declarations) != 1:
+            raise Refused("HISTORY_MISSING_OR_AMBIGUOUS")
+        orders = declarations[0]
+    else:
+        raise Refused("HISTORY_MISSING_OR_AMBIGUOUS")
+    if (not isinstance(orders, list) or any(type(value) is not str
+            or ORDER_HASH.fullmatch(value) is None for value in orders)):
+        raise Refused("HISTORY_HASH")
+    orders = list(dict.fromkeys(orders))
+    latest = {}
+    relations = live.LiveRelations(run, existing["risk_window_id"], started["public_config_identity"])
+    event_path = previous / "events.jsonl"
+    if event_path.resolve(strict=True) != event_path.absolute():
+        raise Refused("HISTORY_IDENTITY")
+    with event_path.open("rb") as stream:
+        while line := stream.readline(64 * 1024 + 1):
+            if len(line) > 64 * 1024:
+                raise Refused("HISTORY_AUDIT")
+            event = live.validate_live_event(
+                live.EVENT_PREFIX + line, started["public_config_identity"])
+            relations = relations.stage(event)
+            if event.get("event_kind") == "order":
+                value = event["payload"]
+                order = value.get("signed_hash")
+                if order is not None:
+                    if type(order) is not str or ORDER_HASH.fullmatch(order) is None:
+                        raise Refused("HISTORY_HASH")
+                    state = value.get("submission")
+                    if state not in {"NOT_SUBMITTED", "REJECTED_FINAL", "ACCEPTED", "UNKNOWN"}:
+                        raise Refused("HISTORY_AUDIT")
+                    latest[order] = state
+    live.check_ended(ended, started, relations)
+    if relations.final is None:
+        raise Refused("HISTORY_AUDIT")
+    final = relations.final["payload"]
+    accounting = ended["final_accounting"]
+    exit_facts = ended["exit_facts"]
+    if (accounting["loss_latched"] or accounting["reserved"] != "0"
+            or not final["audit_complete"] or final["unresolved"] != []
+            or exit_facts["launcher_exit"] != 0 or exit_facts["child_returncode"] != 0
+            or exit_facts["child_signal"] is not None or exit_facts["forced_cleanup"]):
+        raise Refused("HISTORY_REQUIRES_TAKEOVER")
+    healthy = (ended["incomplete_reason"] is None and not final["takeover_required"]
+               and final["execution_complete"] and final["cash_complete"]
+               and accounting["status"] == "COMPLETE" and accounting["reason"] == "NONE")
+    # A fresh reconciliation may close an audited pending payout, not disguise
+    # another exit fault, unresolved submission, loss latch or missing final.
+    cash_pending = (final["stop_reason"] == "CASH_PENDING" and final["stop_detail"] is None
+                    and final["takeover_required"] and not final["cash_complete"]
+                    and ended["incomplete_reason"] == "FACT_INCOMPLETE"
+                    and ended["incomplete_detail"] is None
+                    and accounting["status"] == "INCOMPLETE"
+                    and accounting["reason"] == "FACT_INCOMPLETE"
+                    and _atoms(accounting["pending_claim_value"]) > 0)
+    if not (healthy or cash_pending):
+        raise Refused("HISTORY_REQUIRES_TAKEOVER")
+    if any(state == "UNKNOWN" for state in latest.values()):
+        raise Refused("HISTORY_SUBMISSION_UNKNOWN")
+    for order, state in latest.items():
+        if state == "ACCEPTED" and order not in orders:
+            orders.append(order)
+    return orders
+
+
+def _cash_snapshot(value: dict, orders: list[str], *, require_complete: bool) -> tuple[int, int]:
+    """Validate native read facts before deriving the exact new accounting C0."""
+    identity = {key: item for key, item in account_identity().items() if key != "venue"}
+    if (value.get("read_only") is not True or value.get("account_identity") != identity
+            or value["account"]["pagination_complete"] is not True
+            or value["account"]["open_orders"] != []
+            or value["account"].get("positions", []) != []
+            or value["reconciliation"]["declared_orders"] != orders):
+        raise Refused("RECONCILIATION_FACTS")
+    if require_complete and (value["reconciliation"]["complete"] is not True
+                            or value["reconciliation"]["positions_match_history"] is not True
+                            or value["account"]["positions_explained"] is not True):
+        raise Refused("RECONCILIATION_NOT_COMPLETE")
+    observed = _parse_time(value["observation"]["finished_at"])
+    if not 0 <= (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() <= MAX_RECONCILIATION_AGE_SECONDS:
+        raise Refused("STALE_RECONCILIATION")
+    account = value["account"]
+    cash = _atoms(account["collateral_atoms"])
+    claims = sum(_atoms(claim["claim_atoms"]) for claim in account.get("claimed_win", []))
+    if cash <= claims or _atoms(account["gas_atoms"]) < MIN_GAS_ATOMS:
+        raise Refused("CASH_OR_GAS_UNAVAILABLE")
+    return cash, claims
+
+
+def prepare_account(args: argparse.Namespace, directory: Path, environment: dict) -> None:
+    """Two fixed native reads, exact C0 and one declaration list; no order calls."""
+    import btc5m_control as control
+    import btc5m_live_events as live
+    import btc5m_live_guard as guard
+    data = control.read_public_config(Path(args.config))
+    data["bot"].update(enable_trading=True, mock_trading=False)
+    data.pop("controlled_paper", None)
+    settings = data.pop("controlled_run", {})
+    if settings and settings.get("operations_mode") != args.operations_mode:
+        raise Refused("LIVE_CONTEXT")
+    control.check_fixed_values(data, control.MODE_SIGNED_FUTURE_LIVE)
+    descriptor = guard._directory(directory.parent)
+    os.close(descriptor)
+    directory.mkdir(mode=0o700, exist_ok=False)
+    first_config = directory / "account-read-config.json"
+    live._create_file(first_config, live.canonical(data) + b"\n")
+    first = control.local_signer.reconcile_account(
+        first_config, args.rpc_url, args.declared_order, directory / "reconciliation-pass-1.json",
+        environment=environment)
+    if first["exit_code"] not in (0, 4):
+        raise Refused("RECONCILIATION_NOT_COMPLETE")
+    first_value = first["projection"]
+    cash, claims = _cash_snapshot(first_value, args.declared_order, require_complete=False)
+    baseline = cash - claims
+    whole, fraction = divmod(baseline, 10 ** 18)
+    budget = f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")
+    data["controlled_run"] = {"budget_usdt": budget,
+        "duration_seconds": settings.get("duration_seconds", 86400),
+        "operations_mode": args.operations_mode}
+    config = directory / "public-config.json"
+    live._create_file(config, live.canonical(data) + b"\n")
+    second = control.local_signer.reconcile_account(
+        config, args.rpc_url, args.declared_order, directory / "reconciliation-pass-2.json",
+        environment=environment)
+    value = second["projection"]
+    if second["exit_code"] != 0:
+        raise Refused("RECONCILIATION_NOT_COMPLETE")
+    _cash_snapshot(value, args.declared_order, require_complete=True)
+    # Explanation can change from false to true when C0 is supplied, but the
+    # account facts themselves must not change between the two reads.
+    if ({key: item for key, item in first_value["account"].items() if key != "positions_explained"}
+            != {key: item for key, item in value["account"].items() if key != "positions_explained"}):
+        raise Refused("RECONCILIATION_DRIFT")
+    value = {**value, "finished_at": value["observation"]["finished_at"]}
+    record = directory / "reconciliation.json"
+    live._create_file(record, live.canonical(value) + b"\n")
+    args.config, args.reconciliation = str(config), str(record)
+    preflight(config, record, now=dt.datetime.now(dt.timezone.utc), declared_orders=args.declared_order)
+
+
+def _main(args: argparse.Namespace) -> dict[str, Any]:
+    """Compose the real services once; release no lock until handoff is ready."""
     import btc5m_control as control
     import btc5m_live_events as live
     import btc5m_live_guard as guard
 
-    params = control.parameters(control.read_public_config(Path(args.config)))
-    if params is None:
-        raise Refused("PARAMETERIZED_CONFIG_REQUIRED")
-    args.params = params
-    started = dt.datetime.now(dt.timezone.utc)
-    windows = identity_windows(args, started)
+    if args.auto_prepare:
+        import uuid
+        args.run_id = args.run_id or "btc5m-live-" + uuid.uuid4().hex[:16]
+        args.risk_window_id = args.risk_window_id or args.run_id
+        args.takeover_ref = args.takeover_ref or args.authorization_ref
+        if args.reconciliation is not None:
+            raise Refused("CONFLICTING_PREPARATION")
+    for value in (args.run_id, args.authorization_ref, args.risk_window_id, args.takeover_ref):
+        if not isinstance(value, str) or control.RUN_ID_PATTERN.fullmatch(value) is None:
+            raise Refused("BAD_ARGUMENTS")
+    if args.collection != "07_trading_btc5m_live_guard":
+        raise Refused("STORAGE_BINDING")
+    for value in args.declared_order or ():
+        if ORDER_HASH.fullmatch(value) is None:
+            raise Refused("BAD_ARGUMENTS")
+    if not args.auto_prepare:
+        if args.reconciliation is None:
+            raise Refused("RECONCILIATION_REQUIRED")
+        checked = preflight(Path(args.config), Path(args.reconciliation),
+                            now=dt.datetime.now(dt.timezone.utc), declared_orders=args.declared_order)
+        args.params = checked["params"]
+    else:
+        template = control.read_public_config(Path(args.config))
+        template["bot"].update(enable_trading=True, mock_trading=False)
+        template.pop("controlled_paper", None)
+        control.check_fixed_values(template, control.MODE_SIGNED_FUTURE_LIVE)
+    control.local_signer._check_environment(os.environ)
+    control.public_identity({}, live=True)  # Fail before account credentials on a bad deployment.
+    account = account_identity()
+    if not args.auto_prepare:
+        projection = live.strict_json(live._read_file(Path(args.reconciliation), 1024 * 1024))
+        if projection.get("account_identity") != {key: value for key, value in account.items()
+                                                    if key != "venue"}:
+            raise Refused("RECONCILIATION_ACCOUNT")
+    now = dt.datetime.now(dt.timezone.utc)
+    date = now.astimezone(dt.timezone(dt.timedelta(hours=8))).date()
     root = Path(args.evidence_root) if args.evidence_root else (
-        ROOT / f"data/reports/{started.date().isoformat()}-btc5m-controlled-paper/evidence")
-    directory = root / args.run_id
-    if directory.exists() or directory.is_symlink():
+        ROOT / f"data/reports/{date}-btc5m-controlled-paper/evidence")
+    directory = root / "launch-attempts" / args.run_id
+    if (directory.exists() or directory.is_symlink() or (root / args.run_id).exists()
+            or (root / args.run_id).is_symlink()
+            or any((ROOT / "data/reports").glob(f"*/evidence/{args.run_id}"))
+            or any((ROOT / "data/reports").glob(f"*/evidence/launch-attempts/{args.run_id}"))):
         raise Refused("DUPLICATE_RUN")
-    client, uri, database, guard, pymongo, WriteConcern = _barrier_collection()
-    collection = database[args.collection].with_options(write_concern=WriteConcern(w="majority", j=True))
-    scope = (f"predict_fun:56:{control.local_signer.TRADING_ADDRESS.lower()}:predict-account")
-
-    def rotate(record: dict[str, Any]) -> None:
-        # Exactly one ARMED record, matched on every frozen field.
-        deleted = collection.delete_one({"_id": scope, "state": "ARMED",
-                                         "run_id": record["run_id"],
-                                         "risk_window_id": record["risk_window_id"],
-                                         "authorization_ref": record["authorization_ref"],
-                                         "candidate_digest": record["candidate_digest"]})
-        if deleted.deleted_count != 1 or collection.find_one({"_id": scope}, {"_id": 1}) is not None:
-            raise Refused("BARRIER_ROTATION")
-
-    def write_activation(activation: dict[str, Any]) -> None:
-        guard._uri_matches(uri, activation["storage_binding"])
-        directory.mkdir(parents=True, exist_ok=False)
-        live._create_file(guard.ACTIVATION_PATH, live.canonical(activation) + b"\n")
-
-    result: dict[str, Any] = {"status": "STOPPED_NO_RETRY", "errors": []}
+    client = None
+    lock = guard.AccountLock(account, control.MODE_SIGNED_FUTURE_LIVE).acquire()
+    previous_uri = os.environ.get(guard.CREDENTIAL_ENV)
     try:
-        result = launch(
-            args, now=started,
-            fetch_account=lambda: {"venue": "PREDICT_FUN", "chain_id": 56,
-                                   "account_mode": "predict-account",
-                                   "trading_address": control.local_signer.TRADING_ADDRESS.lower(),
-                                   "signer_address": control.local_signer.SIGNER.lower()},
-            read_barrier=lambda _address: collection.find_one({"_id": scope}),
-            rotate_barrier=rotate,
-            write_activation=write_activation,
-            write_evidence=lambda name, value: live._create_file(
-                directory / name, live.canonical(value) + b"\n"),
-            controller=lambda command, environment: control.run(command, environment=environment),
-            read_secret=lambda: {"PATH": "/usr/bin:/bin"},
-            candidate_identity=lambda: control.public_identity({}, live=True),
-            validate=lambda activation, context, at: guard.validate_activation(
-                activation, context, at))
-    except (Refused, control.Refused) as error:
-        result = {"status": "REFUSED_NO_RETRY", "reason": getattr(error, "reason", None)}
+        client, uri, database, _, pymongo, WriteConcern = _barrier_collection()
+        collection = database[args.collection].with_options(
+            write_concern=WriteConcern(w="majority", j=True))
+        scope = guard.scope_id(account)
+        with pymongo.timeout(20):
+            existing = collection.find_one({"_id": scope})
+        if existing is None:
+            raise Refused("UNEXPECTED_BARRIER")
+        _check_old_guard(existing, account, now)
+        if (args.run_id == existing.get("run_id")
+                or args.authorization_ref == existing.get("authorization_ref")
+                or args.risk_window_id == existing.get("risk_window_id")):
+            raise Refused("DUPLICATE_WINDOW")
+        if args.auto_prepare:
+            for field, key in (("old_run", "run_id"), ("old_risk_window", "risk_window_id"),
+                               ("old_authorization_ref", "authorization_ref"),
+                               ("old_digest", "candidate_digest")):
+                supplied = getattr(args, field)
+                if supplied is not None and supplied != existing.get(key):
+                    raise Refused("UNEXPECTED_BARRIER")
+                setattr(args, field, existing[key])
+        expected = {"run_id": args.old_run, "risk_window_id": args.old_risk_window,
+                    "authorization_ref": args.old_authorization_ref,
+                    "candidate_digest": args.old_digest}
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise Refused("UNEXPECTED_BARRIER")
+        old_bytes = _old_activation(guard.ACTIVATION_PATH, existing, account)
+        binding = live.strict_json(old_bytes)["storage_binding"]
+        guard._uri_matches(uri, binding)
+        if args.deployment_id is not None and args.deployment_id != binding["deployment_id"]:
+            raise Refused("STORAGE_BINDING")
+        if args.auto_prepare:
+            orders = history_for_window(existing, account)
+            if args.declared_order is not None and args.declared_order != orders:
+                raise Refused("DECLARED_ORDERS_MISMATCH")
+            args.declared_order = orders
+            binding = live.strict_json(old_bytes)["storage_binding"]
+            args.deployment_id = args.deployment_id or binding["deployment_id"]
+        environment = {key: os.environ[key] for key in (*control.local_signer.INHERIT_ENV,
+                       "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR") if key in os.environ}
+        api_source = ({control.API_SOURCE_ENV: os.environ[control.API_SOURCE_ENV]}
+                      if control.API_SOURCE_ENV in os.environ else {})
+        environment.update(PATH="/usr/bin:/bin",
+                           YQUANT_PREDICT_FUN_TOKEN=control.check_environment(api_source))
+        os.environ[guard.CREDENTIAL_ENV] = uri
+
+        def evidence(name: str, value: Any) -> None:
+            if not directory.exists():
+                descriptor = guard._directory(directory.parent)
+                os.close(descriptor)
+                directory.mkdir(mode=0o700, exist_ok=False)
+            live._create_file(directory / name, live.canonical(value) + b"\n")
+
+        def activate(value: dict) -> None:
+            guard._uri_matches(uri, value["storage_binding"])
+            if live._read_file(guard.ACTIVATION_PATH, live.MAX_LINE_BYTES) != old_bytes:
+                raise Refused("ACTIVATION_DRIFT")
+            live._create_file(directory / "superseded-activation.json", old_bytes)
+            pending = directory / "next-activation.json"
+            raw = live.canonical(value) + b"\n"
+            live._create_file(pending, raw)
+            if live._read_file(pending, live.MAX_LINE_BYTES) != raw:
+                raise Refused("ACTIVATION_WRITE")
+            # The old bytes are durable before atomic publication; no unlink gap.
+            os.replace(pending, guard.ACTIVATION_PATH)
+            live._sync_directory(guard.ACTIVATION_PATH.parent)
+            live._sync_directory(directory)
+            if live._read_file(guard.ACTIVATION_PATH, live.MAX_LINE_BYTES) != raw:
+                raise Refused("ACTIVATION_WRITE")
+
+        def rotate(record: dict) -> None:
+            evidence("barrier-before-rotation.json", record)
+            with pymongo.timeout(20):
+                deleted = collection.delete_one(record)
+                if deleted.deleted_count != 1 or collection.find_one({"_id": scope}) is not None:
+                    raise Refused("BARRIER_ROTATION")
+            evidence("barrier-rotation.json", {"previous_run_id": record["run_id"],
+                     "new_run_id": args.run_id, "deleted_count": 1, "readback_absent": True})
+
+        def dispatch(command: list[str], *, environment: dict) -> dict:
+            # The controller owns the same cooperative account lock thereafter.
+            # During this handoff, no other launcher can rotate an absent barrier.
+            lock.close()
+            return control.run(command, environment=environment, evidence_root=root)
+
+        def read_barrier(_address: str) -> dict:
+            with pymongo.timeout(20):
+                observed = collection.find_one({"_id": scope})
+            if observed != existing:
+                raise Refused("BARRIER_DRIFT")
+            return observed
+
+        if args.auto_prepare:
+            prepare_account(args, directory, environment)
+        return launch(args, fetch_account=lambda: account,
+                      read_barrier=read_barrier,
+                      rotate_barrier=rotate, write_activation=activate, write_evidence=evidence,
+                      controller=dispatch, read_secret=lambda: environment,
+                      candidate_identity=lambda: control.public_identity({}, live=True),
+                      validate=guard.validate_activation)
     finally:
-        client.close()
+        lock.close()
+        if previous_uri is None:
+            os.environ.pop(guard.CREDENTIAL_ENV, None)
+        else:
+            os.environ[guard.CREDENTIAL_ENV] = previous_uri
+        if client is not None:
+            client.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Public error boundary; never print raw driver, child or credential errors."""
+    import btc5m_control as control
+    import btc5m_live_events as live
+    import btc5m_live_guard as guard
+    try:
+        result = _main(build_parser().parse_args(argv))
+    except (Refused, control.Refused, guard.GuardRefused) as error:
+        result = {"status": "REFUSED_NO_RETRY", "reason": error.reason}
+    except control.local_signer.Failure as error:
+        result = {"status": "REFUSED_NO_RETRY", "reason": error.result["reason"]}
+    except Exception:
+        # Driver exceptions can contain URIs or HTTP bodies. They must never
+        # escape the public CLI boundary, and failure never triggers a retry.
+        result = {"status": "STOPPED_NO_RETRY", "reason": "LAUNCH_PREPARATION_FAILED"}
     print(json.dumps(result, ensure_ascii=False)[:2000])
     return 0 if result.get("facts", {}).get("launcher_exit") == 0 else 1
 

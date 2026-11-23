@@ -203,6 +203,15 @@ ACCOUNTING = (
 OBJECTS = {
     "level": "price:number size:number",
     "side": SIDE, "decision": DECISION, "accounting": ACCOUNTING,
+    "diagnostic": ("stage:PREPARE|SIGNED_BOUND|FACTS|ACK|SEND_PERMIT|POST "
+                   "detail:NONE|UNKNOWN|BOOK_STALE|SPOT_STALE|ACCOUNT_STALE|FROZEN_INPUT|"
+                   "LIMIT_PRICE|DEPTH|ROUND_TOO_LATE|EDGE_BELOW_MIN|EMPTY_BOOK|"
+                   "ACCOUNT_INCOMPLETE|IDENTITY_MISMATCH|GENERATION_MISMATCH|ATTEMPT_MISMATCH|"
+                   "SIGNED_BOUND_UNPROVEN|RUN_STOPPED|ACK_UNAVAILABLE|READ_UNAVAILABLE|"
+                   "VENUE_REJECTED|SUBMISSION_UNKNOWN checked_at:time? checked_elapsed_ms:integer? "
+                   "tick_started_elapsed_ms:integer? book_receipt_age_ms:integer? "
+                   "spot_receipt_age_ms:integer? account_receipt_age_ms:integer? "
+                   "book_request_age_ms:integer? spot_request_age_ms:integer?"),
     "clock": ("source_at:time? source_time_status:MISSING|PRESENT "
               "freshness_basis:RECEIPT_BOUND|SOURCE_AND_RECEIPT request_at:time received_at:time "
               "request_elapsed_ms:integer received_elapsed_ms:integer"),
@@ -219,7 +228,7 @@ PAYLOADS = {
               "attempt_phase:PREPARED|MAY_HAVE_SUBMITTED|SUBMITTED|CLOSED "
               "submission:NOT_SUBMITTED|REJECTED_FINAL|ACCEPTED|UNKNOWN request_gross_atoms:atoms "
               "max_cash_atoms:atoms min_net_shares_atoms:atoms? expires_at:time? "
-              "removal_locked_until:time? reason:reason"),
+              "removal_locked_until:time? reason:reason diagnostic:diagnostic?"),
     "execution": ("attempt_id:id signed_hash:hash venue_order_id:orderref? generation:positive "
                   "observed_at:time pages_complete:bool quantity_class:UNKNOWN|ZERO|PARTIAL|FULL "
                   "gross_q_atoms:atoms? accounting_gross_q_atoms:atoms? closure:" + CLOSURE +
@@ -319,6 +328,10 @@ def validate_live_event(raw: bytes | str | dict,
     # Normalize in memory before exact-key validation, never on disk.
     if kind in ("stop", "final") and type(event["payload"]) is dict:
         event["payload"].setdefault("stop_detail", None)
+    # The order payload's diagnostic was added later. An old order stream
+    # does not carry it; it becomes null in memory and is never written back.
+    if kind == "order" and type(event["payload"]) is dict:
+        event["payload"].setdefault("diagnostic", None)
     fields(event["payload"], PAYLOADS[kind])
     check_accounting(event["accounting"], *frozen_window(public_identity))
     payload = event["payload"]
@@ -384,6 +397,9 @@ class LiveRelations:
         # paid claim is the wire fact that ends it.
         self.stop_reason = None
         self.cash_pending = False
+        self.claims = {}
+        self.reconciled_generations = {}
+        self.reconciled_open_hashes = None
         self.positions = None
         self.previous_accounting = None
         self.previous_cash = None
@@ -485,31 +501,22 @@ class LiveRelations:
         elif kind == "reconciliation":
             if payload["complete"]:
                 self.positions = payload["positions"]
+                self.reconciled_open_hashes = payload["open_hashes"]
+                self.reconciled_generations = {
+                    key: attempt["execution"]["generation"]
+                    for key, attempt in self.attempts.items() if attempt["execution"] is not None
+                }
         elif kind == "payout":
-            require(any(attempt["identity"] == market_token for attempt in self.attempts.values()))
-            if payload["status"] == "CASH_PENDING":
-                self.cash_pending = True
-                # The first cause wins: a settlement's own pending claim does
-                # not rename a stop another cause already recorded.
-                if self.stop_reason in (None, "CASH_PENDING"):
-                    self.stopped = True
-                    self.stop_reason = "CASH_PENDING"
-            if payload["status"] == "CASH_CONFIRMED":
-                # The claim's cash arrived. The wait it caused is over: a
-                # pending claim that was later paid is no longer pending, and a
-                # stop only that wait caused is revoked with it. A stop from
-                # any other cause stays latched.
-                require(payload["cash_received_atoms"] is not None)
-                self.cash_pending = False
-                if self.stop_reason == "CASH_PENDING":
-                    self.stopped = False
-                    self.stop_reason = None
+            self._payout(payload, market_token)
             if payload["cash_received_atoms"] is None and self.seq and accounting["cash"] is not None:
                 # Payout/claim is not a cash receipt. Compare only known audit projections.
                 require(self.previous_cash is None or accounting["cash"] == self.previous_cash)
         elif kind == "stop":
             self.stopped = True
-            self.stop_reason = payload["reason"]
+            if self.stop_reason in (None, "CASH_PENDING"):
+                self.stop_reason = payload["reason"]
+            if payload["reason"] == "CASH_PENDING":
+                self.cash_pending = True
         elif kind == "final":
             unresolved = {item["attempt_id"]: item for item in payload["unresolved"]}
             require(len(unresolved) == len(payload["unresolved"]))
@@ -549,6 +556,65 @@ class LiveRelations:
         attempt = self.attempts.get(payload["attempt_id"])
         require(attempt is not None and attempt["identity"] == identity)
         return attempt
+
+    def _payout(self, payload: dict, identity: tuple) -> None:
+        """Index owner-specific cash facts; never manufacture a balance or proof."""
+        owners = [(key, attempt) for key, attempt in self.attempts.items()
+                  if attempt["identity"] == identity]
+        require(bool(owners))
+        status = payload["status"]
+        if status in ("UNRESOLVED", "CONFLICT"):
+            return  # Conflict facts can precede closure; they cannot release cash.
+        require(len(owners) == 1)
+        key, attempt = owners[0]
+        require(self._closed(attempt) and attempt["execution"] is not None)
+        shares = attempt["applied"]["net_inventory_atoms"]
+        require(int(payload["position_net_atoms"]) == shares)
+        frozen = self.candidates[attempt["candidate"]]["frozen"]
+        require(frozen["up"] is not None and frozen["down"] is not None)
+        payout = payload["payout_yes"]
+        require(payout in (0.0, 0.5, 1.0))
+        rate = int(payout * 1_000_000)
+        if identity[1] == frozen["down"]["token"]:
+            rate = 1_000_000 - rate
+        else:
+            require(identity[1] == frozen["up"]["token"])
+        cash = shares * rate // 1_000_000
+        require(payload["claim_value_atoms"] is not None
+                and int(payload["claim_value_atoms"]) == cash)
+        prior = self.claims.get(key)
+        value = (shares, cash, payout)
+        require(prior is None or prior["value"] == value)
+        confirmed = status == "CASH_CONFIRMED"
+        if confirmed:
+            require(prior is not None and payload["cash_received_atoms"] is not None
+                    and int(payload["cash_received_atoms"]) == cash
+                    and self.reconciled_generations.get(key) == attempt["execution"]["generation"]
+                    and self.positions is not None
+                    and not any(position["token"] == identity[1] for position in self.positions))
+        else:
+            require(payload["cash_received_atoms"] is None)
+            require((status == "CONFIRMED" and cash == 0)
+                    or (status == "CASH_PENDING" and cash > 0))
+        self.claims[key] = {"value": value,
+                            "confirmed": confirmed or bool(prior and prior["confirmed"])}
+        if status == "CASH_PENDING" and not self.claims[key]["confirmed"]:
+            self.cash_pending = True
+            self.stopped = True
+            if self.stop_reason is None:
+                self.stop_reason = "CASH_PENDING"
+        economic_owners = [(owner, item) for owner, item in self.attempts.items()
+                           if item["applied"]["net_inventory_atoms"] > 0]
+        all_settled = economic_owners and all(
+            owner in self.claims and (self.claims[owner]["value"][1] == 0
+                                     or self.claims[owner]["confirmed"])
+            for owner, _ in economic_owners)
+        if (self.cash_pending and all_settled and self.positions == []
+                and self.reconciled_open_hashes == []
+                and all(self._closed(item) for item in self.attempts.values())):
+            self.cash_pending = False
+            if self.stop_reason == "CASH_PENDING":
+                self.stopped, self.stop_reason = False, None
 
     def _bind(self, attempt: dict, payload: dict) -> None:
         for source, target in (("signed_hash", "hash"), ("venue_order_id", "venue")):
@@ -603,6 +669,11 @@ class LiveRelations:
             require(int(facts["net_cash"]["atoms"]) == int(facts["gross_cash"]["atoms"]) + int(facts["collateral_fee"]["atoms"]))
             require(int(facts["net_inventory"]["atoms"]) + int(facts["share_fee"]["atoms"]) == int(payload["gross_q_atoms"]))
         deltas = payload["delta"]
+        if any(deltas[key] not in (None, "0") for key in ("net_cash_atoms", "net_inventory_atoms")):
+            # A pre-trade position read is not a post-trade watermark. Keep the
+            # execution facts, but require a new complete read for cash release.
+            self.positions = None
+            self.reconciled_generations = {}
         if any(value is not None and int(value) > 0 for value in deltas.values()):
             require(complete and all(value is not None for value in deltas.values()))
         for key, value in deltas.items():

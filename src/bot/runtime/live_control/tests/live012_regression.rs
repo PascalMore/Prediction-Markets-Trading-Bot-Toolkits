@@ -112,9 +112,11 @@ async fn signed_but_unsent_frozen_input_change_ends_the_candidate_not_the_window
         *hooks.fault.lock() = None;
     }
     clock.advance(300_000);
-    live::check_runtime_account(&broker, false).await.unwrap();
     let (market2, book2, evaluation2) = evaluate_live_round_with_core(&clock, true, 2, &mut core);
     let candidate2 = evaluation2.candidate.unwrap();
+    // The fixture's warm-up advances the clock by 21 s; the receipt is bound
+    // after it, in the same tick the decision is made (sync_live, then the tick).
+    live::check_runtime_account(&broker, false).await.unwrap();
     assert!(broker.emit_phase1_evaluation(&market2, &evaluation2.diagnostic, Some(&candidate2)));
     let ack = ack_next(broker.clone(), false);
     let second = broker.take_live_candidate(taker::LiveCandidateRequest {

@@ -6,6 +6,8 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use crate::bot::arbitrage::phase1::DecisionDiagnostic;
 
+pub use super::order::{OrderDiagnostic, OrderPayload};
+
 /// The only wire version of this domain.
 pub const LIVE_SCHEMA_VERSION: &str = "btc5m-controlled-live.v1";
 /// The framing prefix of a live event line.
@@ -242,25 +244,8 @@ pub struct ReservationPayload {
     pub reason: String,
 }
 
-/// The original prepared/signed order and its proven execution bound.
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrderPayload {
-    pub candidate_id: String,
-    pub attempt_id: String,
-    pub signed_hash: Option<String>,
-    pub venue_order_id: Option<String>,
-    pub attempt_phase: String,
-    pub submission: String,
-    pub request_gross_atoms: String,
-    pub max_cash_atoms: String,
-    pub min_net_shares_atoms: Option<String>,
-    #[serde(serialize_with = "optional_time")]
-    pub expires_at: Option<DateTime<Utc>>,
-    #[serde(serialize_with = "optional_time")]
-    pub removal_locked_until: Option<DateTime<Utc>>,
-    pub reason: String,
-}
+/// The original prepared/signed order lives in [`order`], together with its
+/// closed diagnostic.
 
 /// One official fact, carrying its own original coverage.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
@@ -488,6 +473,7 @@ pub fn payload_keys(kind: EventKind) -> &'static [&'static str] {
             "expires_at",
             "removal_locked_until",
             "reason",
+            "diagnostic",
         ],
         EventKind::Execution => &[
             "attempt_id",
@@ -795,12 +781,20 @@ pub(super) fn validate_envelope(envelope: &Value) -> Result<(), String> {
         return Err("PAYLOAD_INVALID".into());
     };
     check_time(&accounting["mark_time"], true, "MARK_TIME")?;
+    // An old order stream does not carry the diagnostic key. It is
+    // normalized in memory first, then checked by the same exact rules; the
+    // stream itself is never rewritten.
+    let normalized = if kind == EventKind::Order {
+        super::order::normalized_old_order(payload)
+    } else {
+        std::borrow::Cow::Borrowed(payload)
+    };
+    let payload = normalized.as_ref();
     check_exact_keys(payload, payload_keys(kind))?;
     check_payload(kind, payload)?;
     Ok(())
 }
-
-fn wire_time<S: serde::Serializer>(time: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn wire_time<S: serde::Serializer>(time: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
@@ -948,10 +942,16 @@ fn check_payload(kind: EventKind, payload: &Map<String, Value>) -> Result<(), St
                 &["PREPARED", "MAY_HAVE_SUBMITTED", "SUBMITTED", "CLOSED"], "ATTEMPT_PHASE")?;
             check_enum(&payload["submission"],
                 &["NOT_SUBMITTED", "REJECTED_FINAL", "ACCEPTED", "UNKNOWN"], "SUBMISSION")?;
-            decode_payload::<OrderPayload>(payload)?;
-            if matches!(payload["attempt_phase"].as_str(), Some("MAY_HAVE_SUBMITTED" | "SUBMITTED"))
-                && (payload["signed_hash"].is_null()
-                    || !payload["min_net_shares_atoms"].as_str().is_some_and(|value| is_atoms(value) && value != "0"))
+            // An old order stream does not carry the diagnostic. It is
+            // normalized in memory first, then validated by the same rules.
+            let mut normalized = payload.clone();
+            super::order::normalize_old_order(&mut normalized);
+            super::order::check_diagnostic(&normalized["diagnostic"])?;
+            decode_payload::<OrderPayload>(&normalized)?;
+            if matches!(normalized["attempt_phase"].as_str(), Some("MAY_HAVE_SUBMITTED" | "SUBMITTED"))
+                && (normalized["signed_hash"].is_null()
+                    || !normalized["min_net_shares_atoms"].as_str()
+                        .is_some_and(|value| is_atoms(value) && value != "0"))
             {
                 return Err("SIGNED_BOUND_UNPROVEN".into());
             }
