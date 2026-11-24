@@ -52,8 +52,8 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-23-btc5m-r16-integrated-validation/evidence/deployment/candidate-r16-f1/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "13a8ef883ec38b63cf2bc64bf26e99ca2b914be4e93dd9cfd1b493fdb405aaeb"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/candidate-runtime-wait-fix2/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "a39d725b15d6f5c1450f8eea3e2af108c006767420f4dc3232ac14712859ab5b"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
@@ -73,9 +73,12 @@ LIVE_PATHS = (
     # part of what a live run's frozen identity must bind.
     "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs",
     "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py",
+    "tools/predictfun/tests/test_btc5m_takeover.py",
     "tools/predictfun/tests/test_btc5m_parameterization.py",
     # R15/R16 loaded recovery, claim, diagnostics and regression modules.
     "src/bot/runtime/live/claims.rs", "src/bot/runtime/live_control/cash_wait.rs",
+    "src/bot/runtime/live/order_wait.rs", "src/bot/runtime/live_control/tests/order_wait.rs",
+    "src/service/predict_fun/fills/order_wait_tests.rs",
     "src/bot/runtime/live_control/diagnostics.rs", "src/bot/runtime/live_events/order.rs",
     "src/bot/runtime/live_control/tests/claim_wait.rs",
     "src/bot/runtime/live_control/tests/degrade_recovery.rs",
@@ -410,10 +413,16 @@ def _budget_atoms(value: Any) -> int:
     if not isinstance(value, str):
         return _money_atoms(value)
     whole, dot, fraction = value.partition(".")
-    if (not whole.isdigit() or not whole or len(fraction) > 18
-            or (dot and not fraction.isdigit())):
+    # Only ASCII digits are a decimal budget: `str.isdigit` also accepts other
+    # Unicode digit forms, and `Decimal` would read them as numbers. A budget
+    # is a plain decimal, so anything else is a refusal, never a conversion.
+    if (re.fullmatch(r"[0-9]+", whole) is None or not whole or len(fraction) > 18
+            or (dot and re.fullmatch(r"[0-9]+", fraction) is None)):
         raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
-    amount = Decimal(value)
+    try:
+        amount = Decimal(value)
+    except ArithmeticError:
+        raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION") from None
     if amount <= 0 or amount > Decimal(10) ** 9:
         raise Refused("PUBLIC_CONFIG", "config", "MONEY_PRECISION")
     return int(amount * (Decimal(10) ** 18))

@@ -717,7 +717,26 @@ impl PredictFunTrader {
                 .token_id
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:MISSING_TOKEN"))?;
-            let market = self.client.market_for_token(&token)?;
+            // A declared zero-fill order has neither positions nor matches to seed the cache.
+            let market = match self.client.market_for_token(&token) {
+                Ok(market) => market,
+                Err(_) => self.client.get::<ApiMarket>(&format!("/markets/{}", data.market_id))
+                    .await.map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?
+                    .data,
+            };
+            if market.id != data.market_id || market.outcomes.len() != 2
+                || market.outcomes[0].on_chain_id == market.outcomes[1].on_chain_id
+                || !market.outcomes.iter().any(|outcome| outcome.on_chain_id == token)
+                || self.client.markets.read().values().any(|known|
+                    (known.id == market.id || known.outcomes.iter().any(|old|
+                        market.outcomes.iter().any(|fresh| old.on_chain_id == fresh.on_chain_id)))
+                    && (known.id != market.id || known.outcomes.len() != 2
+                        || known.outcomes.iter().zip(&market.outcomes)
+                            .any(|(old, fresh)| old.on_chain_id != fresh.on_chain_id)))
+            {
+                return Err(mismatch("TOKEN_MISMATCH").into());
+            }
+            self.client.remember_market(&market);
             let side = match contract.side {
                 Some(0) => Side::Buy,
                 Some(1) => Side::Sell,
@@ -938,35 +957,35 @@ impl ChainRead<'_> {
         status: &str,
         q: U256,
     ) -> Result<bool, VenueError> {
-        if status == "FILLED" && q == bound.requested {
-            return Ok(true);
-        }
-        if !matches!(status, "FILLED" | "CANCELLED" | "EXPIRED" | "INVALIDATED") {
-            return Ok(false);
-        }
-        if bound.expiration > 0 && self.timestamp > U256::from(bound.expiration as u64) {
-            return Ok(true);
-        }
-        let hash: B256 = hash.parse().map_err(|_| mismatch("HASH_MISMATCH"))?;
-        let exchange = self
-            .trader
-            .client
-            .deployment
-            .exchange(bound.market.is_neg_risk, bound.market.is_yield_bearing);
-        Ok(self
-            .call(exchange, ExchangeRead::getOrderStatusCall { hash })
-            .await?
-            .isFilledOrCancelled
-            || !self
-                .call(
-                    exchange,
-                    ExchangeRead::isValidNonceCall {
-                        maker: self.trader.trading_address(),
-                        nonce: U256::ZERO,
-                    },
-                )
-                .await?
-                ._0)
+        let result = async {
+            if status == "FILLED" && q == bound.requested { return Ok("FILLED_COMPLETE"); }
+            if !matches!(status, "FILLED" | "CANCELLED" | "EXPIRED" | "INVALIDATED") {
+                return Ok("STATUS_UNPROVEN");
+            }
+            if bound.expiration > 0 && self.timestamp > U256::from(bound.expiration as u64) {
+                return Ok("SIGNED_EXPIRY");
+            }
+            let hash: B256 = hash.parse().map_err(|_| mismatch("HASH_MISMATCH"))?;
+            let exchange = self.trader.client.deployment
+                .exchange(bound.market.is_neg_risk, bound.market.is_yield_bearing);
+            if self.call(exchange, ExchangeRead::getOrderStatusCall { hash }).await?.isFilledOrCancelled {
+                return Ok("CHAIN_CLOSED");
+            }
+            if !self.call(exchange, ExchangeRead::isValidNonceCall {
+                maker: self.trader.trading_address(), nonce: U256::ZERO,
+            }).await?._0 { return Ok("NONCE_INVALID"); }
+            Ok::<_, VenueError>("STILL_EXECUTABLE")
+        }.await;
+        let venue_status = match status {
+            "OPEN" | "FILLED" | "CANCELLED" | "EXPIRED" | "INVALIDATED" => status,
+            _ => "UNRECOGNIZED",
+        };
+        let expiration = (bound.expiration > 0).then(|| bound.expiration.to_string());
+        tracing::info!(venue_status, expiration = %expiration.as_deref().unwrap_or("null"),
+            block_time = %self.timestamp,
+            closure_branch = result.as_ref().copied().unwrap_or("READ_UNAVAILABLE"),
+            "order closure observation");
+        result.map(|branch| !matches!(branch, "STATUS_UNPROVEN" | "STILL_EXECUTABLE"))
     }
 
     /// Associate the exact original order with successful, same-chain receipts.

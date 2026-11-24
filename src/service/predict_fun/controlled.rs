@@ -417,6 +417,7 @@ pub(crate) struct ControlledSyntheticTrace {
     /// Test-only: fills stay invisible to the execution read until this
     /// instant, modelling a venue whose acceptance is ahead of its fills.
     pub hidden_until: std::sync::Mutex<Option<std::time::Instant>>,
+    pub read_script: super::fills::order_wait_tests::ReadScript,
 }
 
 #[cfg(test)]
@@ -528,7 +529,8 @@ impl BookTransport {
     /// Whether the venue reports a fill for the orders it received.
     fn filled(&self) -> bool {
         matches!(self.1, "controlled_fill" | "controlled_partial" | "controlled_missing_fee" | "live003"
-            | "book_bid_moved" | "book_moved_then_frozen" | "book_inside_limit_thin_then_frozen")
+            | "book_bid_moved" | "book_moved_then_frozen" | "book_inside_limit_thin_then_frozen"
+            | "controlled_missing_facts")
     }
 
     /// Whether the venue's fill read still lags behind its acceptance.
@@ -718,6 +720,14 @@ impl super::account::SyntheticTransport for BookTransport {
         fn pending_post(&self) -> bool { self.0.pending_post() }
         fn auth_token(&self) -> String { self.0.auth_token() }
         fn rpc(&self, method: &str, params: &serde_json::Value) -> std::result::Result<serde_json::Value, VenueError> {
+            if method == "eth_getBlockByNumber" {
+                if let Some(timestamp) = *self.2.read_script.block_time.lock().unwrap() {
+                    let mut value = self.0.rpc(method, params)?;
+                    value["timestamp"] = serde_json::json!(format!("{timestamp:#x}"));
+                    return Ok(value);
+                }
+            }
+            if let Some(value) = self.2.read_script.rpc(method, params) { return Ok(value); }
             if self.filled() && method == "eth_getTransactionReceipt" {
                 let tx = params[0].as_str().unwrap();
                 let record = self.2.order_by_tx(tx)
@@ -744,7 +754,7 @@ impl super::account::SyntheticTransport for BookTransport {
                     }
                 }
                 if selector == hex::encode(&balance.as_slice()[..4]) {
-                    let cash = self.spent_cash();
+                    let cash = if self.fill_hidden() { U256::ZERO } else { self.spent_cash() };
                     return Ok(serde_json::json!(format!("0x{:064x}",
                         U256::from(100) * U256::from(WEI) - cash)));
                 }
@@ -757,6 +767,7 @@ impl super::account::SyntheticTransport for BookTransport {
             self.0.rpc(method, params)
         }
         fn rest(&self, method: &reqwest::Method, path: &str, bearer: Option<&str>, body: Option<&serde_json::Value>) -> Result<String> {
+            let raw = (|| {
             if path == "/orders" && *method == reqwest::Method::POST {
                 if let Some(first_post) = self.2.first_post.lock().unwrap().take() { first_post(); }
                 let body = body.unwrap();
@@ -790,6 +801,25 @@ impl super::account::SyntheticTransport for BookTransport {
                             .ok_or_else(|| anyhow::anyhow!("CONTROLLED_UNKNOWN_ORDER"))?;
                         return Ok(serde_json::json!({"data":{"id":"synthetic-order",
                             "marketId":record.market_id,"amountFilled":"0","status":"OPEN",
+                            "order":record.order}}).to_string());
+                    }
+                }
+                if self.1 == "controlled_missing_facts" {
+                    // The venue lists the order, but it states no status this
+                    // runtime knows: the fact is genuinely missing, not a
+                    // complete reading of zero.
+                    if path.starts_with("/positions?") {
+                        return Ok(serde_json::json!({"data":[]}).to_string());
+                    }
+                    if path.starts_with("/orders/matches?") {
+                        return Ok(serde_json::json!({"data":[]}).to_string());
+                    }
+                    if path.starts_with("/orders/") && !path.contains('?') {
+                        let hash = path.trim_start_matches("/orders/");
+                        let record = self.2.order_by_hash(hash)
+                            .ok_or_else(|| anyhow::anyhow!("CONTROLLED_UNKNOWN_ORDER"))?;
+                        return Ok(serde_json::json!({"data":{"id":"synthetic-order",
+                            "marketId":record.market_id,"amountFilled":"0","status":"UNRECOGNIZED",
                             "order":record.order}}).to_string());
                     }
                 }
@@ -831,6 +861,8 @@ impl super::account::SyntheticTransport for BookTransport {
                 return Ok(serde_json::json!({"data":{"asks":[[ask,depth]],"bids":[[bid,100.0]]}}).to_string());
             }
             self.0.rest(method, path, bearer, body)
+            })()?;
+            self.2.read_script.rest(path, raw)
         }
         fn sign(&self, order: &Order) -> Result<(alloy_primitives::B256, String)> {
             let result = self.0.sign(order)?;

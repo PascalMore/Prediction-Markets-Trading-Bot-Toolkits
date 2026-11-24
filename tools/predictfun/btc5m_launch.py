@@ -96,6 +96,42 @@ def _atoms(value: Any) -> int:
     return int(value)
 
 
+def _budget_atoms(value: Any) -> int:
+    """The committed budget in atoms, whether the audit states it as text or a number."""
+    if type(value) is str:
+        return _atoms(value)
+    if type(value) is int and value > 0:
+        return value
+    raise Refused("RECONCILIATION_FACTS")
+
+
+def _atoms_text(atoms: int) -> str:
+    """One budget's exact decimal USDT text, so a public config states it to the atom."""
+    whole, fraction = divmod(atoms, 10 ** 18)
+    return f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")
+
+
+def _anchor_budget_atoms(public_config: Any) -> int | None:
+    """The stopped window's own declared C0, read through the canonical public parser.
+
+    The window's public configuration is covered by its candidate digest, so its
+    budget is an anchor the operator cannot change alone. A window that declares
+    no budget (a legacy fixture) has no anchor and keeps its old behaviour.
+    """
+    import btc5m_control as control
+    if not isinstance(public_config, dict):
+        raise Refused("HISTORY_IDENTITY")
+    if not isinstance(public_config.get("controlled_run"), dict):
+        return None
+    try:
+        params = control.parameters(public_config)
+    except control.Refused:
+        raise Refused("HISTORY_IDENTITY") from None
+    if params is None:
+        return None
+    return params["budget"]
+
+
 def preflight(config_path: Path, reconciliation_path: Path, *,
               now: dt.datetime,
               declared_orders: list[str] | None = None) -> dict[str, Any]:
@@ -396,11 +432,119 @@ def _check_old_guard(existing: dict, account: dict, now: dt.datetime) -> None:
     live.require(live.timestamp(existing["armed_at"]) <= now)
 
 
+def _stopped_window_kind(ended: dict, final: dict, accounting: dict,
+                         exit_facts: dict) -> str:
+    """Classify a stopped window before a new window may take it over.
+
+    Only three kinds may continue: a healthy window, a pending payout, and one
+    known accepted order whose terminal facts remain incomplete. The last kind
+    only qualifies for fresh read-only proof: it does not establish zero fills
+    or upgrade the old final to COMPLETE. Every other fault remains refused.
+    """
+    if (accounting["loss_latched"] or not final["audit_complete"]
+            or exit_facts["launcher_exit"] != 0 or exit_facts["child_returncode"] != 0
+            or exit_facts["child_signal"] is not None or exit_facts["forced_cleanup"]):
+        return "REFUSE"
+    settled = accounting["reserved"] == "0" and final["unresolved"] == []
+    if (settled and ended["incomplete_reason"] is None
+            and not final["takeover_required"] and final["execution_complete"]
+            and final["cash_complete"] and accounting["status"] == "COMPLETE"
+            and accounting["reason"] == "NONE"):
+        return "HEALTHY"
+    # A fresh reconciliation may close an audited pending payout, not disguise
+    # another exit fault, unresolved submission, loss latch or missing final.
+    if (settled and final["stop_reason"] == "CASH_PENDING" and final["stop_detail"] is None
+            and final["takeover_required"] and not final["cash_complete"]
+            and ended["incomplete_reason"] == "FACT_INCOMPLETE"
+            and ended["incomplete_detail"] is None
+            and accounting["status"] == "INCOMPLETE"
+            and accounting["reason"] == "FACT_INCOMPLETE"
+            and _atoms(accounting["pending_claim_value"]) > 0):
+        return "CASH_PENDING"
+    # Terminal facts are incomplete for one known accepted order. Only a fresh,
+    # complete read may prove it final; this audit does not prove zero fills.
+    if (accounting["reserved"] != "0" and final["unresolved"] != []
+            and final["stop_reason"] == "FACT_INCOMPLETE" and final["stop_detail"] is None
+            and final["takeover_required"] and not final["execution_complete"]
+            and not final["cash_complete"]
+            and ended["incomplete_reason"] == "FACT_INCOMPLETE"
+            and ended["incomplete_detail"] is None
+            and accounting["status"] == "INCOMPLETE"
+            and accounting["reason"] == "FACT_INCOMPLETE"):
+        unresolved = final["unresolved"]
+        # Exactly one unresolved hash; no inference of zero fills from inventory.
+        if (len(unresolved) != 1 or unresolved[0].get("closure") != "UNPROVEN"
+                or unresolved[0].get("reason") != "FACT_INCOMPLETE"
+                or type(unresolved[0].get("signed_hash")) is not str
+                or ORDER_HASH.fullmatch(unresolved[0]["signed_hash"]) is None):
+            return "REFUSE"
+        return "UNFILLED_ORDER"
+    return "REFUSE"
+
+
+def _check_incomplete_order(relations: Any, entry: dict, accounting: dict) -> None:
+    """Qualify exactly one known accepted attempt using the existing audit index."""
+    open_attempts = {key: value for key, value in relations.attempts.items()
+                     if not relations._closed(value)}
+    attempt = open_attempts.get(entry.get("attempt_id"))
+    if (len(open_attempts) != 1 or attempt is None
+            or attempt["submission"] != "ACCEPTED" or attempt["venue"] is None
+            or attempt["hash"] != entry.get("signed_hash")
+            or entry.get("reserved_atoms") != accounting["reserved"]
+            or _atoms(entry["reserved_atoms"]) != attempt["remaining"]):
+        raise Refused("HISTORY_REQUIRES_TAKEOVER")
+
+
+def _fresh_read_closes_window(window: dict[str, Any], fresh: dict[str, Any]) -> bool:
+    """Say whether a fresh complete read closes the stopped window's one order.
+
+    The read must prove the order final with no inventory, no open order and no
+    position, and it must return the stopped window's committed cash to the
+    atom. Anything else stays a takeover refusal.
+    """
+    # Public helper inputs use the same positive atoms contract as audit seeds:
+    # an integer or ASCII integer text, never decimal USDT or a boolean.
+    try:
+        budget = _budget_atoms(window.get("budget_atoms"))
+    except Refused:
+        return False
+    if budget <= 0:
+        return False
+    account = fresh.get("account") or {}
+    reconciliation = fresh.get("reconciliation") or {}
+    if (fresh.get("read_only") is not True
+            or reconciliation.get("complete") is not True
+            or reconciliation.get("positions_match_history") is not True
+            or account.get("pagination_complete") is not True
+            or account.get("positions_explained") is not True
+            or account.get("open_orders") != []
+            or account.get("positions", []) != []):
+        return False
+    proven = set(reconciliation.get("declared_orders") or ())
+    unresolved = window["unresolved"]
+    if not unresolved or any(entry.get("signed_hash") not in proven for entry in unresolved):
+        return False
+    cash = _atoms(account["collateral_atoms"])
+    claims = sum(_atoms(claim["claim_atoms"]) for claim in account.get("claimed_win", []))
+    return cash - claims == budget
+
+
 def history_for_window(existing: dict, account: dict) -> list[str]:
     """Carry only the stopped run's declared history and system-accepted orders.
 
     Remote unknown orders are never added automatically. An unresolved submission
     or incomplete local audit requires takeover, even if no process remains.
+    """
+    return _stopped_window(existing, account)["orders"]
+
+
+def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
+    """Read the stopped window's own audit and say what kind of stop it was.
+
+    The returned facts are the window's committed cash, its unresolved orders
+    and the declarations the next window must carry. A known accepted order
+    with incomplete terminal facts only qualifies for fresh read-only proof;
+    the old audit neither proves zero fills nor becomes COMPLETE.
     """
     import btc5m_live_events as live
     run = existing["run_id"]
@@ -425,11 +569,14 @@ def history_for_window(existing: dict, account: dict) -> list[str]:
         raise Refused("HISTORY_IDENTITY")
 
     seeds = list(reports.glob(f"*/evidence/launch-attempts/{run}/attempt-reserved.json"))
+    budget = None
+    seed_budget = None
     if len(seeds) == 1:
         seed = live.strict_json(live._read_file(seeds[0], 1024 * 1024))
         if seed.get("run_id") != run:
             raise Refused("HISTORY_IDENTITY")
         orders = seed["declared_orders"]
+        seed_budget = seed.get("committed_budget_atoms")
     elif not seeds:
         # Read-only compatibility with the previous approved scratch launch's
         # public dispatch evidence. Never execute or modify that scratch script.
@@ -449,6 +596,18 @@ def history_for_window(existing: dict, account: dict) -> list[str]:
             or ORDER_HASH.fullmatch(value) is None for value in orders)):
         raise Refused("HISTORY_HASH")
     orders = list(dict.fromkeys(orders))
+    # The stopped window's own public configuration is covered by its candidate
+    # digest, so its declared C0 is an anchor. The launch attempt's seed is a
+    # writable record: it may corroborate the anchor, never replace it.
+    anchor = _anchor_budget_atoms(public)
+    if seed_budget is not None:
+        try:
+            seed_budget = _budget_atoms(seed_budget)
+        except Refused:
+            raise Refused("HISTORY_REQUIRES_TAKEOVER") from None
+    if anchor is not None and seed_budget is not None and anchor != seed_budget:
+        raise Refused("HISTORY_REQUIRES_TAKEOVER")
+    budget = anchor if anchor is not None else seed_budget
     latest = {}
     relations = live.LiveRelations(run, existing["risk_window_id"], started["public_config_identity"])
     event_path = previous / "events.jsonl"
@@ -477,37 +636,44 @@ def history_for_window(existing: dict, account: dict) -> list[str]:
     final = relations.final["payload"]
     accounting = ended["final_accounting"]
     exit_facts = ended["exit_facts"]
-    if (accounting["loss_latched"] or accounting["reserved"] != "0"
-            or not final["audit_complete"] or final["unresolved"] != []
-            or exit_facts["launcher_exit"] != 0 or exit_facts["child_returncode"] != 0
-            or exit_facts["child_signal"] is not None or exit_facts["forced_cleanup"]):
+    kind = _stopped_window_kind(ended, final, accounting, exit_facts)
+    if kind == "REFUSE":
         raise Refused("HISTORY_REQUIRES_TAKEOVER")
-    healthy = (ended["incomplete_reason"] is None and not final["takeover_required"]
-               and final["execution_complete"] and final["cash_complete"]
-               and accounting["status"] == "COMPLETE" and accounting["reason"] == "NONE")
-    # A fresh reconciliation may close an audited pending payout, not disguise
-    # another exit fault, unresolved submission, loss latch or missing final.
-    cash_pending = (final["stop_reason"] == "CASH_PENDING" and final["stop_detail"] is None
-                    and final["takeover_required"] and not final["cash_complete"]
-                    and ended["incomplete_reason"] == "FACT_INCOMPLETE"
-                    and ended["incomplete_detail"] is None
-                    and accounting["status"] == "INCOMPLETE"
-                    and accounting["reason"] == "FACT_INCOMPLETE"
-                    and _atoms(accounting["pending_claim_value"]) > 0)
-    if not (healthy or cash_pending):
-        raise Refused("HISTORY_REQUIRES_TAKEOVER")
+    unresolved = final["unresolved"]
+    if kind == "UNFILLED_ORDER":
+        # This restricted class requires both the verified public C0 and its
+        # launch seed; legacy healthy/payout windows retain their compatibility.
+        if anchor is None or seed_budget is None or budget is None or budget <= 0:
+            raise Refused("HISTORY_REQUIRES_TAKEOVER")
+        _check_incomplete_order(relations, unresolved[0], accounting)
     if any(state == "UNKNOWN" for state in latest.values()):
         raise Refused("HISTORY_SUBMISSION_UNKNOWN")
     for order, state in latest.items():
         if state == "ACCEPTED" and order not in orders:
             orders.append(order)
-    return orders
+    for entry in unresolved:
+        signed = entry.get("signed_hash")
+        if signed is not None and signed not in orders:
+            orders.append(signed)
+    return {"kind": kind, "orders": orders, "budget_atoms": budget,
+            "unresolved": unresolved}
+
+
+def _reconciled_identity_matches(value: Any) -> bool:
+    """Use the canonical fixed-account rules without rewriting native address spelling."""
+    import btc5m_live_events as live
+    try:
+        live.exact(value, "chain_id account_mode trading_address signer_address")
+        live.check_account_identity({"venue": "PREDICT_FUN", **value})
+    except live.LiveInvalid:
+        return False
+    return True
 
 
 def _cash_snapshot(value: dict, orders: list[str], *, require_complete: bool) -> tuple[int, int]:
     """Validate native read facts before deriving the exact new accounting C0."""
-    identity = {key: item for key, item in account_identity().items() if key != "venue"}
-    if (value.get("read_only") is not True or value.get("account_identity") != identity
+    if (value.get("read_only") is not True
+            or not _reconciled_identity_matches(value.get("account_identity"))
             or value["account"]["pagination_complete"] is not True
             or value["account"]["open_orders"] != []
             or value["account"].get("positions", []) != []
@@ -528,7 +694,20 @@ def _cash_snapshot(value: dict, orders: list[str], *, require_complete: bool) ->
     return cash, claims
 
 
-def prepare_account(args: argparse.Namespace, directory: Path, environment: dict) -> None:
+def _account_facts(account: dict) -> dict[str, Any]:
+    """Compare complete settled records without ordering them or losing duplicates."""
+    facts = {key: value for key, value in account.items() if key != "positions_explained"}
+    for key in ("claimed_win", "settled_zero"):
+        if key in facts:
+            records = facts[key]
+            if type(records) is not list or any(type(record) is not dict for record in records):
+                raise Refused("RECONCILIATION_FACTS")
+            facts[key] = sorted(_canonical(record) for record in records)
+    return facts
+
+
+def prepare_account(args: argparse.Namespace, directory: Path, environment: dict,
+                   stopped: dict[str, Any] | None = None) -> None:
     """Two fixed native reads, exact C0 and one declaration list; no order calls."""
     import btc5m_control as control
     import btc5m_live_events as live
@@ -543,18 +722,40 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
     descriptor = guard._directory(directory.parent)
     os.close(descriptor)
     directory.mkdir(mode=0o700, exist_ok=False)
+    # The stopped window's verified C0 is this window's C0. It anchors both
+    # reads, so the venue's own read can explain the account's claims and both
+    # reads are complete reconciliations of one frozen C0. A balance is never
+    # the anchor: an adapting budget would make any balance acceptable. Only
+    # the takeover of an unfilled order needs it; a healthy window and a
+    # pending payout keep their existing two-step behaviour.
+    anchor = None
+    if stopped is not None and stopped["kind"] == "UNFILLED_ORDER":
+        anchor = stopped["budget_atoms"]
+    if anchor is not None:
+        data["controlled_run"] = {"budget_usdt": _atoms_text(anchor),
+                                  "duration_seconds": settings.get("duration_seconds", 86400),
+                                  "operations_mode": args.operations_mode}
+        control.check_fixed_values(data, control.MODE_SIGNED_FUTURE_LIVE)
     first_config = directory / "account-read-config.json"
     live._create_file(first_config, live.canonical(data) + b"\n")
     first = control.local_signer.reconcile_account(
         first_config, args.rpc_url, args.declared_order, directory / "reconciliation-pass-1.json",
         environment=environment)
-    if first["exit_code"] not in (0, 4):
-        raise Refused("RECONCILIATION_NOT_COMPLETE")
     first_value = first["projection"]
-    cash, claims = _cash_snapshot(first_value, args.declared_order, require_complete=False)
-    baseline = cash - claims
-    whole, fraction = divmod(baseline, 10 ** 18)
-    budget = f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")
+    if anchor is not None:
+        # An anchored first read is a complete reconciliation like the second:
+        # a partial read may not open a new window.
+        if first["exit_code"] != 0:
+            raise Refused("RECONCILIATION_NOT_COMPLETE")
+        cash, claims = _cash_snapshot(first_value, args.declared_order, require_complete=True)
+        if cash - claims != anchor:
+            raise Refused("CASH_BUDGET_MISMATCH")
+        budget = _atoms_text(anchor)
+    else:
+        if first["exit_code"] not in (0, 4):
+            raise Refused("RECONCILIATION_NOT_COMPLETE")
+        cash, claims = _cash_snapshot(first_value, args.declared_order, require_complete=False)
+        budget = _atoms_text(cash - claims)
     data["controlled_run"] = {"budget_usdt": budget,
         "duration_seconds": settings.get("duration_seconds", 86400),
         "operations_mode": args.operations_mode}
@@ -569,9 +770,12 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
     _cash_snapshot(value, args.declared_order, require_complete=True)
     # Explanation can change from false to true when C0 is supplied, but the
     # account facts themselves must not change between the two reads.
-    if ({key: item for key, item in first_value["account"].items() if key != "positions_explained"}
-            != {key: item for key, item in value["account"].items() if key != "positions_explained"}):
+    if _account_facts(first_value["account"]) != _account_facts(value["account"]):
         raise Refused("RECONCILIATION_DRIFT")
+    if stopped is not None and stopped["kind"] == "UNFILLED_ORDER":
+        # The stopped window's order may only be closed by this fresh read.
+        if not _fresh_read_closes_window(stopped, value):
+            raise Refused("HISTORY_REQUIRES_TAKEOVER")
     value = {**value, "finished_at": value["observation"]["finished_at"]}
     record = directory / "reconciliation.json"
     live._create_file(record, live.canonical(value) + b"\n")
@@ -616,8 +820,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
     account = account_identity()
     if not args.auto_prepare:
         projection = live.strict_json(live._read_file(Path(args.reconciliation), 1024 * 1024))
-        if projection.get("account_identity") != {key: value for key, value in account.items()
-                                                    if key != "venue"}:
+        if not _reconciled_identity_matches(projection.get("account_identity")):
             raise Refused("RECONCILIATION_ACCOUNT")
     now = dt.datetime.now(dt.timezone.utc)
     date = now.astimezone(dt.timezone(dt.timedelta(hours=8))).date()
@@ -664,8 +867,10 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
         guard._uri_matches(uri, binding)
         if args.deployment_id is not None and args.deployment_id != binding["deployment_id"]:
             raise Refused("STORAGE_BINDING")
+        stopped = None
         if args.auto_prepare:
-            orders = history_for_window(existing, account)
+            stopped = _stopped_window(existing, account)
+            orders = stopped["orders"]
             if args.declared_order is not None and args.declared_order != orders:
                 raise Refused("DECLARED_ORDERS_MISMATCH")
             args.declared_order = orders
@@ -726,7 +931,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             return observed
 
         if args.auto_prepare:
-            prepare_account(args, directory, environment)
+            prepare_account(args, directory, environment, stopped)
         return launch(args, fetch_account=lambda: account,
                       read_barrier=read_barrier,
                       rotate_barrier=rotate, write_activation=activate, write_evidence=evidence,

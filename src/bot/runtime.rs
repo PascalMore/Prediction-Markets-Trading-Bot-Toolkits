@@ -1631,21 +1631,21 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                         return Ok(());
                     }
                 }
-                let waiting_cash = live_control::cash_wait::waiting(ctx.broker.as_ref());
-                if let Err(e) = live_control::cash_wait::observe_wait_tick(ctx.broker.as_ref()).await {
-                    warn!(error = ?e, "order state check failed");
-                }
+                let (waiting_cash, waiting_order) =
+                    live::order_wait::observe_tick(ctx.broker.as_ref(), ctx.data.as_ref()).await;
                 if ctx.broker.live_operation_lane().is_some()
                     && ctx.broker.state.lock().live.controlled.as_ref().is_some_and(|run| run.must_end()) {
                     ctx.broker.finish_controlled(ctx.data.as_ref()).await;
                     return Ok(());
                 }
-                if !waiting_cash && ctx.broker.is_halted() {
+                if !waiting_cash && !waiting_order && ctx.broker.is_halted() {
                     if let Err(e) = ctx.broker.cancel_all().await {
                         warn!(error = ?e, "couldn't pull quotes while halted");
                     }
                 }
-                let result = if waiting_cash || live_control::cash_wait::waiting(ctx.broker.as_ref()) {
+                let result = if waiting_cash || waiting_order
+                    || live_control::cash_wait::waiting(ctx.broker.as_ref())
+                    || live::order_wait::waiting(ctx.broker.as_ref()) {
                     Ok(()) } else if ctx.broker.is_live() {
                     // Dropping a tick midway could lose track of an order it just
                     // posted, so a live run finishes it. Every call in it is

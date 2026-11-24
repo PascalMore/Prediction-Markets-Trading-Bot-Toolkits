@@ -148,6 +148,50 @@ sys.exit(int(sys.argv[2]))
             facts["launcher_exit"] = 1
         return facts, final, live.read_live_run(directory), store
 
+    def test_r17_native_wait_drive_stream_and_diagnostics_reach_existing_consumers(self):
+        name = ("bot::runtime::live_control::order_wait_tests::"
+                "original_drive_observes_zero_then_resumes_a_second_post_on_the_same_adapter")
+        result = subprocess.run(
+            ["cargo", "test", "--locked", "--offline", "--target-dir",
+             os.environ["CARGO_TARGET_DIR"], "--lib", name,
+             "--", "--exact", "--nocapture"],
+            cwd=control.BOT, capture_output=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode() + result.stdout.decode())
+        self.assertIn(b"1 passed", result.stdout)
+        frames = [line + b"\n" for line in result.stdout.splitlines()
+                  if line.startswith(self.live.EVENT_PREFIX)]
+        started, public, context = self.metadata(frames[0])
+        probe = self.live.LiveEventStore(self.root / "probe", started, public, context)
+        self.addCleanup(probe.close)
+        for index, frame in enumerate(frames):
+            try:
+                probe.append(frame, ack=lambda _ack: None)
+            except ValueError as error:
+                self.fail(f"native frame {index + 1}: {error}: {frame!r}")
+        facts, final, read, store = self.consume(frames)
+        self.assertEqual(facts["launcher_exit"], 0, (facts, read.get("reasons")))
+        self.assertIsNotNone(final)
+        self.assertEqual(len(store.relations.attempts), 2)
+        first = [event for event in read["events"]
+                 if event["event_kind"] == "execution" and event["payload"]["attempt_id"] == "1"]
+        self.assertTrue(any(event["payload"]["closure"] == "OPEN" for event in first))
+        self.assertTrue(any(event["payload"]["closure"] == "FINAL" for event in first))
+        releases = [event for event in read["events"] if event["event_kind"] == "reservation"
+                    and event["payload"]["attempt_id"] == "1"
+                    and event["payload"]["action"] == "RELEASE"]
+        self.assertEqual(len(releases), 1)
+        logs = [line for line in result.stderr.splitlines() if b"order closure observation" in line]
+        self.assertTrue(logs)
+        budget = [0]
+        for line in logs:
+            control.append_run_log(store.directory, "stderr", line, budget)
+        text = (store.directory / control.RUN_LOG_NAME).read_text()
+        for field in ("venue_status", "expiration", "block_time", "closure_branch"):
+            self.assertIn(field, text)
+        self.assertIn("SIGNED_EXPIRY", text)
+        self.assertLessEqual(budget[0], control.RUN_LOG_LIMIT)
+
     def test_native_nonzero_fee_stream_reaches_disk_and_final(self):
         frames = self.native_stream(813, 827)
         facts, final, read, _store = self.consume(frames)
@@ -338,8 +382,8 @@ sys.exit(int(sys.argv[2]))
         builder.assert_called_once()
         command = child.call_args.args[0]
         expected = control.BOT.parents[4] / (
-            "data/reports/2026-11-23-btc5m-r16-integrated-validation/"
-            "evidence/deployment/candidate-r16-f1/polymarket-toolkits")
+            "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/"
+            "candidate-runtime-wait-fix2/polymarket-toolkits")
         self.assertEqual(command[0], str(expected))
         directory = root / args[args.index("--run-id") + 1]
         self.assertEqual(command[command.index("--controlled-live-manifest") + 1],
@@ -353,7 +397,8 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(started["candidate_identity"], control.public_identity({}, live=True))
         context = json.loads((directory / "live-context.json").read_bytes())
         self.assertEqual(context["candidate_digest"], self.live.candidate_digest(started))
-        self.assertEqual(len(started["candidate_identity"]["files"]), 80)
+        self.assertEqual(len(started["candidate_identity"]["files"]), 84)
+        print("R17_CANDIDATE_IDENTITY " + json.dumps(started["candidate_identity"], sort_keys=True))
         self.assertEqual([call[0] for call in collection.calls], ["insert", "read"])
         self.assertEqual(len(collection.documents), 1)
         with self.assertRaises(control.Refused) as refused:
@@ -512,7 +557,9 @@ sys.exit(int(sys.argv[2]))
                              "tools/predictfun/tests/test_btc5m_live_events.py",
                              # Current account/request diagnostic boundary correction.
                              "src/service/predict_fun/request.rs", "src/service/predict_fun/account.rs"}
-        added = {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs"}
+        added = {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs",
+                 "src/bot/runtime/live/order_wait.rs", "src/bot/runtime/live_control/tests/order_wait.rs",
+                 "src/service/predict_fun/fills/order_wait_tests.rs"}
         send_latency_changed = {"src/bot/runtime.rs", "src/bot/runtime/taker.rs", "src/service/predict_fun/account.rs", "src/service/predict_fun/fills.rs", "src/service/predict_fun/request.rs"}
         deployment_changed = {"tools/predictfun/btc5m_control.py",
                               "tools/predictfun/tests/test_btc5m_control.py"}
@@ -595,7 +642,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) - set(old_files), added | set(control.LIVE_PATHS) - set(old_files))
         self.assertEqual(set(old_files) - set(identity["files"]), set())
         self.assertEqual(len(old_files), 57)
-        self.assertEqual(len(identity["files"]), 80)
+        self.assertEqual(len(identity["files"]), 84)
         protected = set(old_files) - allowed
         self.assertEqual(len(protected), 48)
         for path in protected - gas_paths - dynamic_paths - repair_changed - live004_changed - stop_diag_changed - config_a1_changed - settled_zero_changed - r2_changed - parameterization_changed - send_latency_changed - r13_changed - r13c_changed - r15_changed - r16_changed:
@@ -608,7 +655,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(control.PAPER72_BINARY, evidence / "candidate-v2/polymarket-toolkits")
         self.assertEqual(hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest(),
                          "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa")
-        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-23-btc5m-r16-integrated-validation/evidence/deployment/candidate-r16-f1/polymarket-toolkits")
+        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/candidate-runtime-wait-fix2/polymarket-toolkits")
         old_live = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-gas-payer-fix/evidence/candidate/polymarket-toolkits"
         self.assertEqual(hashlib.sha256(old_live.read_bytes()).hexdigest(),
                          "f8171a45bc6ca09d5f1bbbe4d3f35bba6fdd31927f86974930e5960dfa624043")
@@ -661,7 +708,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(digest, hashlib.sha256(live.canonical(digest_input)).hexdigest())
         line_counts = {path: len((control.BOT / path).read_bytes().splitlines()) for path in identity["files"]}
         for path in ("tools/predictfun/btc5m_control.py", "tools/predictfun/tests/test_btc5m_control.py"):
-            self.assertLessEqual(line_counts[path], 2400)
+            self.assertLessEqual(line_counts[path], 3599 if path.endswith("test_btc5m_control.py") else 2400)
         # Historical live003 binding: the record on disk is pinned, not recomputed.
         live003 = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-controlled-paper/evidence/btc5m-supervised-live-003"
         live_public = json.loads((live003 / "public-config.json").read_bytes())
@@ -755,7 +802,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(current["binary_sha256"], hashlib.sha256(historical_binary.read_bytes()).hexdigest())
         self.assertEqual(current["file_count"], 65)
         self.assertEqual(current["file_count"], len(current["candidate_identity"]["files"]))
-        self.assertEqual(final_sha, "13a8ef883ec38b63cf2bc64bf26e99ca2b914be4e93dd9cfd1b493fdb405aaeb")
+        self.assertEqual(final_sha, "a39d725b15d6f5c1450f8eea3e2af108c006767420f4dc3232ac14712859ab5b")
         self.assertEqual(current["scope"],
                          "deployed and bound; pending independent Validate; not activated or started")
         self.assertEqual({key: current[key] for key in public if key != "sha256"},

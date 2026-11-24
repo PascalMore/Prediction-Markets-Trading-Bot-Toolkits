@@ -108,6 +108,40 @@ impl OrderVenue for PredictFunTrader {
         self.controlled_metadata.read().get(signed_hash)
     }
 
+    /// The signed expiry of one controlled order, in unix seconds.
+    ///
+    /// The answer comes from the original bound of that very order: the
+    /// hash, the attempt and the venue's own order id must all agree with the
+    /// identity that asks for it. An order that was never bound, an identity
+    /// that does not match its bound, or an expiry that is not a positive
+    /// number gives no lifetime at all: the caller then keeps the budget it
+    /// already had.
+    fn controlled_order_expiration(
+        &self,
+        identity: &crate::service::venue::OrderIdentity,
+    ) -> Result<Option<i64>> {
+        let Some(hash) = identity.signed_hash.as_deref() else {
+            return Ok(None);
+        };
+        if self.controlled_metadata.read().get(hash).is_none() { return Ok(None); }
+        let bound = self.bound_orders.read().get(hash).cloned();
+        let Some(bound) = bound else { return Ok(None); };
+        let record = bound.handle.lock();
+        if record.identity != *identity {
+            return Err(VenueError::new(
+                VenueErrorCode::AccountMismatch,
+                "controlled_order_expiration",
+                "ORDER_IDENTITY_MISMATCH",
+            )
+            .into());
+        }
+        let accepted = record.submission == Submission::Accepted
+            && record.identity.venue_order_id.as_ref().is_some_and(|id| !id.is_empty());
+        Ok((accepted && bound.expiration > 0
+            && chrono::DateTime::from_timestamp(bound.expiration, 0).is_some())
+            .then_some(bound.expiration))
+    }
+
     async fn place(&self, planned: &PlannedOrder, _: u64, live: bool) -> Result<OrderTicket> {
         if live {
             bail!("EXECUTION_NOT_ENABLED:TRACKED_ATTEMPT_REQUIRED");
@@ -1031,6 +1065,15 @@ impl PredictFunTrader {
             .data;
         bound.validate(&before, hash)?;
         let identity = bound.handle.lock().identity.clone();
+        let check_id = |data: &ApiOrderData| -> Result<()> {
+            if self.controlled_metadata.read().get(hash).is_some()
+                && bound.handle.lock().submission == Submission::Accepted
+                && identity.venue_order_id.as_deref() != Some(data.id.as_str())
+            { return Err(VenueError::new(VenueErrorCode::AccountMismatch,
+                "read_order_execution", "ORDER_IDENTITY_MISMATCH").into()); }
+            Ok(())
+        };
+        check_id(&before)?;
         let q_before = venue_gross_q(&before)?;
         let unknown = || Field::Unknown("FACT_INCOMPLETE".into());
         let mut snapshot = ExecutionSnapshot {
@@ -1058,6 +1101,12 @@ impl PredictFunTrader {
             observed_at: chrono::Utc::now(),
             tx_hash: None,
         };
+        let status_class = |status: &str| match status {
+            "OPEN" => "OPEN", "FILLED" => "FILLED", "CANCELLED" => "CANCELLED",
+            "EXPIRED" => "EXPIRED", "INVALIDATED" => "INVALIDATED", _ => "UNRECOGNIZED",
+        };
+        let mut venue_status = status_class(&before.status);
+        let mut block_time = None;
         let result: Result<()> = async {
             let mut matches = Vec::new();
             let mut cursor: Option<String> = None;
@@ -1141,6 +1190,8 @@ impl PredictFunTrader {
                 .await?
                 .data;
             bound.validate(&after, hash)?;
+            check_id(&after)?;
+            venue_status = status_class(&after.status);
             let q_after = venue_gross_q(&after)?;
             snapshot.gross_q_after = q_after;
             snapshot.quantity = Quantity::Known {
@@ -1150,6 +1201,7 @@ impl PredictFunTrader {
             let mut accounting = snapshot.accounting.clone();
             let matched = q_before == q_after && q_after == facts.gross_q_atoms;
             let chain = self.chain_read().await?;
+            block_time = Some(chain.timestamp.to_string());
             if !matched || !chain.settled(&bound, &identity, &legs, &accounting).await? {
                 accounting.net_cash = Field::Unknown("SETTLEMENT_UNPROVEN".into());
                 accounting.net_inventory = Field::Unknown("SETTLEMENT_UNPROVEN".into());
@@ -1172,6 +1224,11 @@ impl PredictFunTrader {
         }
         .await;
         if let Err(error) = result {
+            if error.downcast_ref::<VenueError>().is_some_and(|e| e.code == VenueErrorCode::AccountMismatch) { return Err(error); }
+            let expiration = (bound.expiration > 0).then(|| bound.expiration.to_string());
+            tracing::info!(venue_status, expiration = %expiration.as_deref().unwrap_or("null"),
+                block_time = %block_time.as_deref().unwrap_or("null"),
+                closure_branch = "READ_UNAVAILABLE", "order closure observation");
             // Preserve REST facts already obtained, but never turn an RPC or
             // parsing failure into settled inventory or authoritative closure.
             snapshot.pages_complete = false;
@@ -1183,6 +1240,9 @@ impl PredictFunTrader {
         Ok(snapshot)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod order_wait_tests;
 
 /// The API's page size for matches and orders.
 pub const PAGE_SIZE: u32 = 100;

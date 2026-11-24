@@ -3408,6 +3408,9 @@ async fn an_accepted_order_whose_facts_lag_is_re_read_before_a_blocked_candidate
         "arriving facts must not be turned into a run failure: {:?}",
         stopped(&broker)
     );
+    // The order's facts are read by the original sync, tick after tick, until
+    // the venue's lagging fill read returns the whole fill.
+    super::order_wait_tests::read_until_the_fill_arrives(&broker, &id).await;
     let state = broker.state.lock();
     assert!(state.live.controlled.as_ref().unwrap().may_add_risk());
     assert_eq!(state.live.net_inventory[&id], requested - requested / U256::from(100));
@@ -3415,16 +3418,16 @@ async fn an_accepted_order_whose_facts_lag_is_re_read_before_a_blocked_candidate
     // Every re-read went through the existing execution read.
     assert!(state.live.generation[&id] >= 2, "the unread attempt was re-read");
     drop(state);
+    assert!(stopped(&broker).is_none(), "the run never stopped: {:?}", stopped(&broker));
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "no new order was sent");
     assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn an_order_still_unread_at_the_bound_keeps_the_existing_stop() {
-    let (broker, _clock, market, book, candidate, _transport, trace) =
-        sending_fixture_with_trace("controlled_fill").await;
-    *trace.hidden_until.lock().unwrap() =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    // The venue states no status this runtime knows: the fact is missing.
+    let (broker, _clock, market, book, candidate, _transport, _trace) =
+        sending_fixture_with_trace("controlled_missing_facts").await;
     let (id, _) =
         first_order_with_visible_ack_but_invisible_fill(&broker, &market, &book, &candidate).await;
     assert!(stopped(&broker).is_none());
@@ -3445,10 +3448,9 @@ async fn an_order_still_unread_at_the_bound_keeps_the_existing_stop() {
 
 #[tokio::test]
 async fn a_conflict_observed_while_waiting_keeps_the_existing_conflict_stop() {
-    let (broker, _clock, market, book, candidate, _transport, trace) =
-        sending_fixture_with_trace("controlled_fill").await;
-    *trace.hidden_until.lock().unwrap() =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    // The venue states no status this runtime knows: the fact is missing.
+    let (broker, _clock, market, book, candidate, _transport, _trace) =
+        sending_fixture_with_trace("controlled_missing_facts").await;
     let (id, _) =
         first_order_with_visible_ack_but_invisible_fill(&broker, &market, &book, &candidate).await;
     // The next reading proves a higher risk than the order ever reserved: the
@@ -3477,10 +3479,9 @@ async fn a_conflict_observed_while_waiting_keeps_the_existing_conflict_stop() {
 
 #[tokio::test]
 async fn a_re_read_that_reaches_the_run_deadline_stops_with_the_deadline_reason() {
-    let (broker, _clock, market, book, candidate, _transport, trace) =
-        sending_fixture_with_trace("controlled_fill").await;
-    *trace.hidden_until.lock().unwrap() =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    // The venue states no status this runtime knows: the fact is missing.
+    let (broker, _clock, market, book, candidate, _transport, _trace) =
+        sending_fixture_with_trace("controlled_missing_facts").await;
     let (_id, _) =
         first_order_with_visible_ack_but_invisible_fill(&broker, &market, &book, &candidate).await;
     assert!(stopped(&broker).is_none());
@@ -3525,16 +3526,15 @@ fn fail_run_clock_after(broker: &Broker, healthy: usize) {
 
 #[tokio::test]
 async fn a_read_whose_clock_fails_without_a_recorded_stop_still_stops_the_run() {
-    let (broker, _clock, market, book, candidate, transport, trace) =
-        sending_fixture_with_trace("controlled_fill").await;
-    *trace.hidden_until.lock().unwrap() =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    // The venue states no status this runtime knows: the fact is missing.
+    let (broker, _clock, market, book, candidate, transport, _trace) =
+        sending_fixture_with_trace("controlled_missing_facts").await;
     let (id, _) =
         first_order_with_visible_ack_but_invisible_fill(&broker, &market, &book, &candidate).await;
     assert!(stopped(&broker).is_none());
     // The facts are applied, then the run's own clock read fails before any
     // stop is written: that reading is a failure, not a reason to keep going.
-    fail_run_clock_after(&broker, 2);
+    fail_run_clock_after(&broker, 4);
     let started = std::time::Instant::now();
     let result = broker
         .resolve_blocked_candidate(
@@ -3561,10 +3561,9 @@ async fn a_read_whose_clock_fails_without_a_recorded_stop_still_stops_the_run() 
 
 #[tokio::test]
 async fn a_read_that_already_recorded_its_reason_keeps_that_reason() {
-    let (broker, _clock, market, book, candidate, _transport, trace) =
-        sending_fixture_with_trace("controlled_fill").await;
-    *trace.hidden_until.lock().unwrap() =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    // The venue states no status this runtime knows: the fact is missing.
+    let (broker, _clock, market, book, candidate, _transport, _trace) =
+        sending_fixture_with_trace("controlled_missing_facts").await;
     let (id, _) =
         first_order_with_visible_ack_but_invisible_fill(&broker, &market, &book, &candidate).await;
     // The failing reading stops the run itself: its projection cannot name the

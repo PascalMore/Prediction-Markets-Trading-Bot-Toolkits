@@ -29,6 +29,10 @@ mod r16_cash_drive;
 mod r16_diagnostics;
 
 #[cfg(test)]
+#[path = "live_control/tests/order_wait.rs"]
+mod order_wait_tests;
+
+#[cfg(test)]
 #[path = "live_control/tests.rs"]
 pub(crate) mod candidate_tests;
 
@@ -156,6 +160,12 @@ pub struct ControlledLiveState {
     pub account_read: Option<LiveAccountRead>,
     /// Cash wait metadata, never a second balance ledger.
     pub cash_wait: Option<cash_wait::CashWait>,
+    /// The bounded wait for one accepted order's complete execution facts.
+    ///
+    /// It holds no quantity, no cash and no release: the ledger's own atomic
+    /// facts remain the only truth about the order, and only the original
+    /// Final path still releases the risk.
+    pub order_wait: Option<crate::bot::runtime::live::order_wait::OrderWait>,
     /// The original deadline on the run clock; it never restarts with a wait.
     pub run_deadline_elapsed_ms: u64,
     /// When this tick's first account read was issued.
@@ -330,8 +340,13 @@ impl ControlledLiveState {
     /// A degraded window may not add risk: it observes until its facts come
     /// back. Degradation is not a stop — the run's own state machine still
     /// says `Ready`, and a success restores trading.
+    ///
+    /// An order that is waiting for its own facts may not add risk either: the
+    /// window knows an order it may still own, so it only observes.
     pub fn may_add_risk(&self) -> bool {
-        self.control.lock().may_add_risk() && !self.degraded
+        self.control.lock().may_add_risk()
+            && !self.degraded
+            && self.order_wait.is_none()
     }
 
     /// Whether the window must be finished at once.
@@ -1173,6 +1188,7 @@ impl ControlledLiveState {
             output_failed,
             account_read: None,
             cash_wait: None,
+            order_wait: None,
             run_deadline_elapsed_ms,
             tick_started_elapsed_ms: None,
             opening_claim_cash: U256::ZERO,
@@ -1393,6 +1409,9 @@ pub(super) fn fresh_marks(state: &State) -> super::live_accounting::Marks {
 /// window cannot know what it owns: that keeps its existing stop semantics.
 pub(super) fn refresh_live_risk(state: &mut State) {
     use super::live_accounting::{self, AccountingStatus, ProjectionGap, StateFacts};
+    if let Some(run) = state.live.controlled.as_mut() {
+        super::live::order_wait::observe_budget(run);
+    }
     let Some(run) = state.live.controlled.as_ref() else { return; };
     let Ok(now) = run.phase1.clock.now() else {
         state.live.controlled.as_mut().unwrap().stop("DATA_UNAVAILABLE", true, Utc::now());
@@ -1428,6 +1447,7 @@ pub(super) fn refresh_live_risk(state: &mut State) {
         run.clear_failure(FailureKind::Valuation);
     }
     refresh_live_exposure(state, now.utc);
+    super::live::order_wait::recover_after_checks(state);
 }
 
 /// Check existing exposure only, without reclassifying an in-flight partial read.
@@ -1453,6 +1473,23 @@ impl Broker {
         &self, market: &crate::service::venue::TradableMarket,
         book: &crate::models::BookSnapshot,
     ) {
+        let receipt = self.state.lock().live.controlled.as_ref()
+            .and_then(|run| run.phase1.clock.now().ok());
+        self.observe_controlled_live_receipt(market, book, receipt);
+    }
+
+    /// Apply an already validated observation without manufacturing a new receipt.
+    pub(super) fn observe_controlled_live_at(
+        &self, market: &crate::service::venue::TradableMarket,
+        book: &crate::models::BookSnapshot, receipt: crate::service::observation::CheckTime,
+    ) {
+        self.observe_controlled_live_receipt(market, book, Some(receipt));
+    }
+
+    fn observe_controlled_live_receipt(
+        &self, market: &crate::service::venue::TradableMarket,
+        book: &crate::models::BookSnapshot, receipt: Option<crate::service::observation::CheckTime>,
+    ) {
         let lane = self.live_operation_lane().unwrap();
         let Ok(_operation) = lane.try_lock() else {
             self.state.lock().live.controlled.as_mut().unwrap().stop("AUDIT_UNAVAILABLE", true, Utc::now());
@@ -1462,7 +1499,9 @@ impl Broker {
         let state = &mut *locked;
         let run = state.live.controlled.as_mut().unwrap();
         if run.emitter.is_finished() { return; }
-        let mark = super::paper::mid_of(book).zip(run.phase1.clock.now().ok());
+        let mark = super::paper::mid_of(book).zip(receipt.filter(|receipt| {
+            run.phase1.clock.now().is_ok_and(|now| fresh_receipt(*receipt, now))
+        }));
         for (token, yes) in [(&market.yes_token, true), (&market.no_token, false)] {
             if let Some((mid, now)) = mark {
                 state.marks.insert(token.clone(), if yes { mid } else { 1.0 - mid });

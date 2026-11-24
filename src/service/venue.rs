@@ -806,6 +806,20 @@ pub trait OrderVenue: Send + Sync {
         None
     }
 
+    /// The signed expiry of one controlled order, in unix seconds.
+    ///
+    /// This is a read-only projection of the order's own signed bound: the
+    /// default answers `None`, so an ordinary venue never gains a lifetime it
+    /// cannot prove. A venue that answers `Some` has proven that the order
+    /// named by `identity` carries exactly this expiry; it is not a fresh
+    /// reading of the venue and never proves anything about a fill.
+    ///
+    /// The answer is not a permission and never causes a request: an order
+    /// whose expiry cannot be proven keeps the runtime's existing budget.
+    fn controlled_order_expiration(&self, _identity: &OrderIdentity) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
     /// Read the account once and report the claim evidence the same read proved.
     ///
     /// The default delegates to the venue's own account read and reports no

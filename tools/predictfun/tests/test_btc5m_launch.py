@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -735,6 +736,226 @@ def test_launcher_root_is_the_business_project():
     assert launch.ROOT == Path(__file__).resolve().parents[8]
 
 
+@pytest.fixture
+def native_order_main(automatic_main, monkeypatch):
+    """Replay saved native account facts; adapt only fixture time/history in memory."""
+    import local_signer
+    env = automatic_main
+    source = (Path(__file__).resolve().parents[8] /
+        'data/reports/2026-11-24-btc5m-controlled-paper/evidence/launch-attempts/'
+        'btc5m-live-7a95eeeb5a04411d')
+    env.native_pair = [json.loads((source / f'reconciliation-pass-{n}.json').read_text())
+                       for n in (1, 2)]
+    env.native_reads = []
+    env.returned_payloads = []
+
+    def replay(config, rpc_url, orders, output, *, environment):
+        index = len(env.native_reads)
+        assert index < 2
+        value = copy.deepcopy(env.native_pair[index])
+        value['observation']['finished_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
+        value['reconciliation']['declared_orders'] = list(orders)
+        env.native_reads.append(value)
+        env.returned_payloads.append(copy.deepcopy(value))
+        Path(output).write_text(json.dumps(value))
+        return {'exit_code': 4 if index == 0 else 0, 'projection': value}
+
+    monkeypatch.setattr(local_signer, 'reconcile_account', replay)
+    return env
+
+
+@pytest.mark.parametrize('variant', ['native_pair', 'object_key_order'])
+def test_native_order_only_changes_reach_one_child_without_rewriting(native_order_main, variant):
+    env = native_order_main
+    if variant == 'object_key_order':
+        for key in ('claimed_win', 'settled_zero'):
+            env.native_pair[1]['account'][key] = [dict(reversed(list(row.items())))
+                                                  for row in env.native_pair[0]['account'][key]]
+    before = copy.deepcopy(env.native_pair)
+    assert launch.main(env.argv) == 0
+    assert len(env.native_reads) == 2 and len(env.children) == 1
+    assert env.native_pair == before and env.native_reads == env.returned_payloads
+    attempt = env.root / 'launch-attempts/btc5m-unattended-live-012'
+    for index, expected in enumerate(before, 1):
+        saved = json.loads((attempt / f'reconciliation-pass-{index}.json').read_text())
+        assert saved['account'] == expected['account']
+
+
+def test_native_order_original_pair_replays_with_frozen_clock(native_order_main, monkeypatch):
+    import local_signer
+    from types import SimpleNamespace
+    env = native_order_main
+    before = copy.deepcopy(env.native_pair)
+    observed = launch._parse_time(before[1]['observation']['finished_at'])
+
+    class ReplayClock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed
+
+    calls = []
+
+    def original(config, rpc_url, orders, output, *, environment):
+        index = len(calls)
+        calls.append(str(output))
+        value = copy.deepcopy(before[index])
+        Path(output).write_text(json.dumps(value))
+        return {'exit_code': 4 if index == 0 else 0, 'projection': value}
+
+    monkeypatch.setattr(launch, 'dt', SimpleNamespace(datetime=ReplayClock, timezone=dt.timezone))
+    monkeypatch.setattr(local_signer, 'reconcile_account', original)
+    args = launch.build_parser().parse_args(env.argv)
+    args.declared_order = before[0]['reconciliation']['declared_orders']
+    launch.prepare_account(args, env.root / 'launch-attempts/original-pair-replay', {})
+    assert len(calls) == 2 and env.native_pair == before
+    assert [json.loads(Path(path).read_text()) for path in calls] == before
+    assert env.children == [] and env.calls == []
+
+
+@pytest.mark.parametrize('change', ['claim_amount', 'claim_token', 'claim_market', 'claim_status',
+    'claim_extra', 'claim_duplicate', 'claim_remove', 'zero_market', 'zero_status',
+    'zero_duplicate', 'zero_remove', 'gas', 'cash', 'extra_field', 'missing_zero',
+    'empty_vs_missing', 'zero_non_list'])
+def test_native_order_real_fact_changes_refuse_before_publish(native_order_main, change):
+    env = native_order_main
+    first, second = [value['account'] for value in env.native_pair]
+    if change.startswith('claim_') or change.startswith('zero_') and change != 'zero_non_list':
+        records = second['claimed_win' if change.startswith('claim_') else 'settled_zero']
+        field = change.split('_', 1)[1]
+        if field == 'duplicate':
+            records.append(copy.deepcopy(records[0]))
+        elif field == 'remove':
+            records.pop()
+        elif field == 'amount':
+            records[0]['claim_atoms'] = str(int(records[0]['claim_atoms']) + 1)
+        elif field == 'market':
+            records[0]['market_id'] += 1
+        elif field == 'token':
+            records[0]['token'] = str(int(records[0]['token']) + 1)
+        elif field == 'status':
+            records[0]['outcome_status'] = 'CHANGED'
+        else:
+            records[0]['extra'] = True
+    elif change in ('gas', 'cash'):
+        field = 'gas_atoms' if change == 'gas' else 'collateral_atoms'
+        second[field] = str(int(second[field]) + 1)
+    elif change == 'extra_field':
+        second['unexpected'] = True
+    elif change in ('missing_zero', 'empty_vs_missing'):
+        second.pop('settled_zero')
+        if change == 'empty_vs_missing':
+            first['settled_zero'] = []
+    else:
+        second['settled_zero'] = {'invalid': 'not-a-list'}
+    before = env.activation.read_bytes()
+    assert launch.main(env.argv) == 1
+    assert len(env.native_reads) == 2 and env.children == [] and env.calls == []
+    assert env.activation.read_bytes() == before and env.collection.record == env.old
+
+
+@pytest.fixture
+def saved_native_projection():
+    source = (Path(__file__).resolve().parents[8] /
+        'data/reports/2026-11-24-btc5m-controlled-paper/evidence/launch-attempts/'
+        'btc5m-live-55bf9782c36040a4/reconciliation-pass-1.json')
+    return json.loads(source.read_text())
+
+
+@pytest.mark.parametrize('spelling', ['native', 'lower', 'upper'])
+def test_native_address_saved_projection_replays_without_rewriting(saved_native_projection, monkeypatch, spelling):
+    from types import SimpleNamespace
+    value = saved_native_projection
+    if spelling != 'native':
+        for key in ('trading_address', 'signer_address'):
+            suffix = value['account_identity'][key][2:]
+            value['account_identity'][key] = '0x' + (suffix.lower() if spelling == 'lower' else suffix.upper())
+    before = copy.deepcopy(value)
+    observed = launch._parse_time(value['observation']['finished_at'])
+
+    class ReplayClock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed
+
+    monkeypatch.setattr(launch, 'dt', SimpleNamespace(datetime=ReplayClock, timezone=dt.timezone))
+    orders = value['reconciliation']['declared_orders']
+    cash, claims = launch._cash_snapshot(value, orders, require_complete=False)
+    assert cash == int(value['account']['collateral_atoms']) and cash > claims
+    assert value == before
+    with pytest.raises(launch.Refused, match='RECONCILIATION_NOT_COMPLETE'):
+        launch._cash_snapshot(value, orders, require_complete=True)
+
+
+def test_native_address_saved_projection_still_rejects_stale_facts(saved_native_projection, monkeypatch):
+    from types import SimpleNamespace
+    value = saved_native_projection
+    observed = launch._parse_time(value['observation']['finished_at'])
+
+    class StaleClock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed + dt.timedelta(seconds=launch.MAX_RECONCILIATION_AGE_SECONDS + 1)
+
+    monkeypatch.setattr(launch, 'dt', SimpleNamespace(datetime=StaleClock, timezone=dt.timezone))
+    with pytest.raises(launch.Refused, match='STALE_RECONCILIATION'):
+        launch._cash_snapshot(value, value['reconciliation']['declared_orders'], require_complete=False)
+
+
+@pytest.mark.parametrize('shape', ['missing', 'null', 'extra'])
+def test_native_address_bad_identity_shape_refuses(saved_native_projection, shape):
+    value = saved_native_projection
+    if shape == 'missing':
+        value['account_identity'].pop('signer_address')
+    elif shape == 'null':
+        value['account_identity'] = None
+    else:
+        value['account_identity']['unexpected'] = True
+    with pytest.raises(launch.Refused, match='RECONCILIATION_FACTS'):
+        launch._cash_snapshot(value, value['reconciliation']['declared_orders'], require_complete=False)
+
+
+@pytest.mark.parametrize('field,replacement', [
+    ('trading_address', '0x' + '1' * 40), ('signer_address', '0x' + '1' * 40),
+    ('trading_address', '0x123'), ('signer_address', '0x' + 'g' * 40),
+    ('chain_id', '56'), ('chain_id', 56.0), ('chain_id', True), ('chain_id', 1),
+    ('account_mode', 'eoa'), ('venue', 'PREDICT_FUN')])
+def test_native_address_wrong_identity_stays_refused(saved_native_projection, field, replacement):
+    value = saved_native_projection
+    value['account_identity'][field] = replacement
+    with pytest.raises(launch.Refused, match='RECONCILIATION_FACTS'):
+        launch._cash_snapshot(value, value['reconciliation']['declared_orders'], require_complete=False)
+
+
+def test_native_address_auto_main_accepts_both_checksum_reads(automatic_main, saved_native_projection, monkeypatch):
+    import local_signer
+    env = automatic_main
+    payloads = []
+
+    def native_format(config, rpc_url, orders, output, *, environment):
+        result = env.fake_reconcile(config, rpc_url, orders, output, environment=environment)
+        result['projection']['account_identity'] = copy.deepcopy(saved_native_projection['account_identity'])
+        payloads.append(copy.deepcopy(result['projection']))
+        Path(output).write_text(json.dumps(result['projection']))
+        return result
+
+    monkeypatch.setattr(local_signer, 'reconcile_account', native_format)
+    assert launch.main(env.argv) == 0
+    assert len(env.reads) == 2 and len(env.children) == 1
+    assert all(value['account_identity'] == saved_native_projection['account_identity'] for value in payloads)
+    attempt = env.root / 'launch-attempts/btc5m-unattended-live-012'
+    assert all(json.loads((attempt / f'reconciliation-pass-{index}.json').read_text())['account_identity']
+               == saved_native_projection['account_identity'] for index in (1, 2))
+
+
+def test_native_address_explicit_main_accepts_checksum_identity(native_main, saved_native_projection):
+    env = native_main
+    facts = json.loads(env.record.read_text())
+    facts['account_identity'] = saved_native_projection['account_identity']
+    env.record.write_text(json.dumps(facts))
+    assert launch.main(env.argv) == 0
+    assert len(env.children) == 1
+
+
 @pytest.mark.parametrize('framing', ['unterminated_final', 'crlf', 'prefix_overflow', 'exact_boundary'])
 def test_history_raw_frames_match_canonical_reader_before_launch(automatic_main, framing):
     import btc5m_live_events as live
@@ -942,3 +1163,186 @@ def test_m123_barrier_reread_drift_never_publishes_activation(native_main, monke
     assert launch.main(env.argv) == 1
     assert len(calls) == 2
     assert env.activation.read_bytes() == before and env.calls == []
+
+
+UNFILLED_ORDER = '0xf2b0bd91f5fece54686cd26ca0cdebcabf339136a146f5d5c3d282fd02cda202'
+REAL_STOP = ('2026-11-24-btc5m-controlled-paper/evidence/btc5m-live-5201fd7ac6c1425b')
+REAL_FRESH = ('2026-11-24-btc5m-order-closure/evidence/'
+              'poststop-20261124T082516Z/reconciliation-pass-1.json')
+REAL_ROOT = Path(__file__).resolve().parents[8]
+
+
+@pytest.fixture
+def unfilled_stop(tmp_path, monkeypatch):
+    """The real stopped window: one accepted order with UNPROVEN terminal facts.
+
+    The audit and the closing read are the frozen production evidence, not a
+    hand-written imitation: a forged audit line would break the reader's own
+    cross-check and prove nothing.
+    """
+    import btc5m_live_events as live
+    source = REAL_ROOT / 'data/reports' / REAL_STOP
+    previous = tmp_path / 'data/reports/offline/evidence' / source.name
+    previous.mkdir(parents=True)
+    for name in ('started.json', 'ended.json', 'public-config.json',
+                 'live-context.json', 'events.jsonl'):
+        (previous / name).write_bytes((source / name).read_bytes())
+    attempt = tmp_path / 'data/reports/offline/evidence/launch-attempts' / source.name
+    attempt.mkdir(parents=True)
+    (attempt / 'attempt-reserved.json').write_bytes(
+        (REAL_ROOT / 'data/reports/2026-11-24-btc5m-controlled-paper/evidence/'
+         'launch-attempts/btc5m-live-5201fd7ac6c1425b/attempt-reserved.json').read_bytes())
+    started = json.loads((previous / 'started.json').read_text())
+    old = {key: started[key] for key in ('run_id', 'risk_window_id', 'authorization_ref')}
+    old['candidate_digest'] = live.candidate_digest(started)
+    monkeypatch.setattr(launch, 'ROOT', tmp_path)
+    env = SimpleNamespace(root=tmp_path, previous=previous, old=old,
+                          account=started['account_identity'],
+                          fresh=json.loads((REAL_ROOT / 'data/reports' / REAL_FRESH).read_text()))
+    return env
+
+
+def test_unfilled_stop_is_read_as_an_unfilled_order_not_a_takeover_refusal(unfilled_stop):
+    """The real stopped window classifies as one unfilled order, not a refusal."""
+    env = unfilled_stop
+    stopped = launch._stopped_window(env.old, env.account)
+    assert stopped['kind'] == 'UNFILLED_ORDER'
+    assert stopped['budget_atoms'] == 95488500000000000000
+    assert len(stopped['orders']) == 5
+    assert UNFILLED_ORDER in stopped['orders']
+    # The real post-stop read closes it: the order is proven and the cash
+    # returns to the committed budget to the atom.
+    assert launch._fresh_read_closes_window(stopped, env.fresh)
+
+
+@pytest.mark.parametrize('damage', ['unproven_order', 'cash_short', 'cash_long',
+                                    'open_order', 'position', 'incomplete'])
+def test_unfilled_stop_refuses_a_read_that_does_not_close_it(unfilled_stop, damage):
+    """A read that does not prove the order final never closes the window."""
+    env = unfilled_stop
+    stopped = launch._stopped_window(env.old, env.account)
+    fresh = copy.deepcopy(env.fresh)
+    if damage == 'unproven_order':
+        fresh['reconciliation']['declared_orders'] = [
+            value for value in fresh['reconciliation']['declared_orders']
+            if value != UNFILLED_ORDER]
+    elif damage == 'cash_short':
+        fresh['account']['collateral_atoms'] = '99250496491228070175'
+    elif damage == 'cash_long':
+        fresh['account']['collateral_atoms'] = '99250496491228070177'
+    elif damage == 'open_order':
+        fresh['account']['open_orders'] = ['0x' + 'a' * 64]
+    elif damage == 'position':
+        fresh['account']['positions'] = [{'token': '7', 'shares_atoms': '1'}]
+    else:
+        fresh['reconciliation']['complete'] = False
+    assert not launch._fresh_read_closes_window(stopped, fresh)
+
+
+def test_other_stopped_windows_keep_their_takeover_refusal(tmp_path, monkeypatch):
+    """Only an unfilled order may continue; every other fault still refuses."""
+    source = REAL_ROOT / 'data/reports' / REAL_STOP
+    previous = tmp_path / 'data/reports/offline/evidence' / source.name
+    previous.mkdir(parents=True)
+    for name in ('started.json', 'ended.json', 'public-config.json',
+                 'live-context.json', 'events.jsonl'):
+        (previous / name).write_bytes((source / name).read_bytes())
+    attempt = tmp_path / 'data/reports/offline/evidence/launch-attempts' / source.name
+    attempt.mkdir(parents=True)
+    (attempt / 'attempt-reserved.json').write_bytes(
+        (REAL_ROOT / 'data/reports/2026-11-24-btc5m-controlled-paper/evidence/'
+         'launch-attempts/btc5m-live-5201fd7ac6c1425b/attempt-reserved.json').read_bytes())
+    import btc5m_live_events as live
+    started = json.loads((previous / 'started.json').read_text())
+    old = {key: started[key] for key in ('run_id', 'risk_window_id', 'authorization_ref')}
+    old['candidate_digest'] = live.candidate_digest(started)
+    monkeypatch.setattr(launch, 'ROOT', tmp_path)
+    ended_path = previous / 'ended.json'
+    original = ended_path.read_bytes()
+    for fault in ('loss_latch', 'forced_cleanup', 'child_exit', 'mixed_reason',
+                  'audit_incomplete', 'two_orders'):
+        ended = json.loads(original)
+        if fault == 'loss_latch':
+            ended['final_accounting']['loss_latched'] = True
+        elif fault == 'forced_cleanup':
+            ended['exit_facts']['forced_cleanup'] = True
+        elif fault == 'child_exit':
+            ended['exit_facts']['child_returncode'] = 1
+        elif fault == 'mixed_reason':
+            ended['incomplete_reason'] = 'OUTPUT_INVALID'
+        elif fault == 'audit_incomplete':
+            ended['audit_complete'] = False
+        else:
+            ended['final_accounting']['reserved'] = '1996800000000000000'
+        ended_path.write_bytes(json.dumps(ended).encode())
+        with pytest.raises((launch.Refused, live.LiveInvalid)):
+            launch._stopped_window(old, started['account_identity'])
+    ended_path.write_bytes(original)
+    assert launch._stopped_window(old, started['account_identity'])['kind'] == 'UNFILLED_ORDER'
+
+
+UNFILLED_FINAL = {'audit_complete': True, 'cash_complete': False, 'execution_complete': False,
+                   'positions': [], 'run_status': 'INCOMPLETE', 'stop_detail': None,
+                   'stop_reason': 'FACT_INCOMPLETE', 'takeover_required': True,
+                   'unresolved': [{'attempt_id': '1', 'closure': 'UNPROVEN',
+                                   'reason': 'FACT_INCOMPLETE',
+                                   'reserved_atoms': '998400000000000000',
+                                   'signed_hash': UNFILLED_ORDER}]}
+UNFILLED_ENDED = {'incomplete_reason': 'FACT_INCOMPLETE', 'incomplete_detail': None,
+                  'final_accounting': {'loss_latched': False, 'reserved': '998400000000000000',
+                                       'status': 'INCOMPLETE', 'reason': 'FACT_INCOMPLETE',
+                                       'pending_claim_value': None},
+                  'exit_facts': {'launcher_exit': 0, 'child_returncode': 0,
+                                 'child_signal': None, 'forced_cleanup': False,
+                                 'stop_reason': 'FACT_INCOMPLETE'}}
+
+
+def _kind(ended_overrides=None, final_overrides=None, exit_overrides=None):
+    ended = copy.deepcopy(UNFILLED_ENDED)
+    final = copy.deepcopy(UNFILLED_FINAL)
+    ended.update(ended_overrides or {})
+    final.update(final_overrides or {})
+    ended['exit_facts'].update(exit_overrides or {})
+    return launch._stopped_window_kind(ended, final, ended['final_accounting'],
+                                       ended['exit_facts'])
+
+
+@pytest.mark.parametrize('overrides,expected', [
+    ({}, 'UNFILLED_ORDER'),
+    # A loss latch, a forced cleanup or a failed child is never continued.
+    ({'exit_facts': {'forced_cleanup': True}}, 'REFUSE'),
+    ({'exit_facts': {'child_returncode': 1}}, 'REFUSE'),
+    ({'exit_facts': {'launcher_exit': 1}}, 'REFUSE'),
+    ({'exit_facts': {'child_signal': 9}}, 'REFUSE'),
+    ({'final_accounting': {'loss_latched': True}}, 'REFUSE'),
+    # An incomplete audit is never continued.
+    ({'final': {'audit_complete': False}}, 'REFUSE'),
+    # Another stop reason is never disguised as an unfilled order.
+    ({'final': {'stop_reason': 'OUTPUT_INVALID'}}, 'REFUSE'),
+    ({'final': {'stop_detail': 'DETAIL'}}, 'REFUSE'),
+    ({'ended': {'incomplete_reason': 'OUTPUT_INVALID'}}, 'REFUSE'),
+    ({'ended': {'incomplete_detail': 'DETAIL'}}, 'REFUSE'),
+    # Two open orders, or an order of another kind, are never continued.
+    ({'final': {'unresolved': UNFILLED_FINAL['unresolved'] * 2}}, 'REFUSE'),
+    ({'final': {'unresolved': [{**UNFILLED_FINAL['unresolved'][0], 'closure': 'OPEN'}]}}, 'REFUSE'),
+    ({'final': {'unresolved': [{**UNFILLED_FINAL['unresolved'][0], 'reason': 'OTHER'}]}}, 'REFUSE'),
+    # A settled window with no open item is the healthy kind, not this one.
+    ({'final_accounting': {'reserved': '0', 'status': 'COMPLETE', 'reason': 'NONE'},
+      'final': {'unresolved': [], 'takeover_required': False, 'execution_complete': True,
+                'cash_complete': True},
+      'ended': {'incomplete_reason': None}}, 'HEALTHY'),
+])
+def test_stopped_window_kind_matrix(overrides, expected):
+    """The classification decides by its own fields, never by the audit alone."""
+    ended_overrides = overrides.get('ended', {})
+    final_overrides = overrides.get('final', {})
+    exit_overrides = overrides.get('exit_facts', {})
+    accounting_overrides = overrides.get('final_accounting', {})
+    ended = copy.deepcopy(UNFILLED_ENDED)
+    final = copy.deepcopy(UNFILLED_FINAL)
+    ended.update(ended_overrides)
+    final.update(final_overrides)
+    ended['final_accounting'].update(accounting_overrides)
+    ended['exit_facts'].update(exit_overrides)
+    assert launch._stopped_window_kind(ended, final, ended['final_accounting'],
+                                       ended['exit_facts']) == expected

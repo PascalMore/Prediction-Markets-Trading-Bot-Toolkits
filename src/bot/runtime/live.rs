@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod claims;
+pub(crate) mod order_wait;
+
+pub(super) use order_wait::re_read_unread_facts;
 
 /// The state the live path keeps, in the broker's lock.
 #[derive(Debug, Default)]
@@ -80,6 +83,14 @@ pub struct CumulativeWatermark {
 }
 
 impl CumulativeWatermark {
+    /// Whether this reading carried every accounting field of its quantity.
+    ///
+    /// A complete zero fill is a complete reading: it knows that nothing
+    /// filled, and that is not the same as a fact that has not arrived.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.fields.len() == 5
+    }
+
     /// Known net risk at current coverage, otherwise the confirmed gross risk.
     pub(crate) fn risk_lower_bound(&self) -> U256 {
         let cash = self
@@ -433,141 +444,12 @@ pub(super) enum UnreadFacts {
     Expired,
 }
 
-/// The one attempt whose accepted facts are still invisible.
+/// The one attempt whose accepted facts are still invisible, and the bounded
+/// re-read of that attempt's facts.
 ///
-/// Only an order that may already be at the venue qualifies: a proven or
-/// possible submission, not closed yet, with a hash to read back and no
-/// positive cumulative quantity. More than one such attempt explains nothing,
-/// so the caller reads no facts at all rather than guess.
-fn unread_attempt(state: &State) -> Option<(u64, String)> {
-    let mut found = None;
-    for (id, handle) in &state.live.attempts {
-        let record = handle.lock();
-        let waiting = matches!(record.submission, Submission::Accepted | Submission::Unknown)
-            && record.phase != AttemptPhase::Closed;
-        let visible = record.phase == AttemptPhase::Closed
-            || state
-                .live
-                .watermarks
-                .get(id)
-                .is_some_and(|watermark| !watermark.gross_q.is_zero());
-        if !waiting || visible {
-            continue;
-        }
-        let Some(hash) = record.identity.signed_hash.clone() else {
-            continue;
-        };
-        if found.is_some() {
-            return None;
-        }
-        found = Some((*id, hash));
-    }
-    found
-}
-
-/// Re-read the one order whose facts have not arrived, bounded in time.
-///
-/// Only this attempt's existing execution read is repeated: no other order is
-/// read, no new request kind is used and nothing is sent. The caller owns the
-/// operation lane. Every stop the read path itself raises keeps its first
-/// reason, so a conflict is never swallowed by the wait.
-pub(super) async fn re_read_unread_facts(
-    broker: &Broker,
-    budget: Duration,
-    interval: Duration,
-) -> UnreadFacts {
-    let Some((attempt_id, _)) = ({ let state = broker.state.lock(); unread_attempt(&state) })
-    else {
-        return UnreadFacts::NothingToRead;
-    };
-    let started = Instant::now();
-    loop {
-        if broker.controlled_stopped() {
-            broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
-            return UnreadFacts::Resolved;
-        }
-        let hash = {
-            let state = broker.state.lock();
-            if let Some(run) = state.live.controlled.as_ref() {
-                if run.control.lock().stop.is_some() {
-                    return UnreadFacts::Resolved;
-                }
-            }
-            unread_attempt(&state).and_then(|(id, hash)| (id == attempt_id).then_some(hash))
-        };
-        let Some(hash) = hash else {
-            return UnreadFacts::Resolved;
-        };
-        if started.elapsed() >= budget {
-            return UnreadFacts::Expired;
-        }
-        let Some(venue) = broker.taker.as_ref() else {
-            return UnreadFacts::Resolved;
-        };
-        let snapshot = match venue.execution_snapshot(&hash).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                // A transient read failure degrades the window: it keeps
-                // observing and adds no risk, and a later read restores it.
-                // Only a streak that outlasts the budget stops the run.
-                let stopped = {
-                    let mut state = broker.state.lock();
-                    match state.live.controlled.as_mut() {
-                        Some(run) => run.note_failure(super::live_control::FailureKind::Execution,
-                            "READ_UNAVAILABLE", chrono::Utc::now()),
-                        None => true,
-                    }
-                };
-                if stopped {
-                    let _ = super::live_events::stop_on_lane(broker, "READ_UNAVAILABLE");
-                }
-                return UnreadFacts::Resolved;
-            }
-        };
-        if consume_snapshot(broker, &snapshot).is_err() {
-            // The read path stops the run with its own reason, unless the
-            // failure arrives after the facts were applied and before any stop
-            // was written (a lost clock read). That reading is still a failure:
-            // no later observation may continue without a stop.
-            latch_unlatched_read_failure(broker);
-            return UnreadFacts::Resolved;
-        }
-        if {
-            let state = broker.state.lock();
-            unread_attempt(&state).is_none()
-        } {
-            return UnreadFacts::Resolved;
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Stop the run when a failed reading recorded no stop of its own.
-///
-/// A reading can fail after it already applied its facts — a lost clock read
-/// is the existing example — without stopping the run. The window may not keep
-/// observing then. The first stop the run already holds keeps its reason, its
-/// detail and its takeover flag; otherwise this failure stops the run with the
-/// same code an unread fact would use.
-fn latch_unlatched_read_failure(broker: &Broker) {
-    let unlatched = {
-        let state = broker.state.lock();
-        state.entry_stop_reason.is_none()
-            && state
-                .live
-                .controlled
-                .as_ref()
-                .is_some_and(|run| run.control.lock().stop.is_none())
-    };
-    if unlatched {
-        // A lost output is already sticky on the emitter, so a failed flush of
-        // this stop needs no second record here.
-        let _ = super::live_events::stop_on_lane(
-            broker,
-            super::live_events::reason::FACT_INCOMPLETE,
-        );
-    }
-}
+/// Both live with the wait that consumes them, in
+/// [`order_wait`](super::order_wait): the wait owns the classification of a
+/// reading, and this module keeps only the runtime's original facade over it.
 
 /// The failure code this run already holds for an incomplete attempt.
 ///
@@ -645,11 +527,20 @@ pub(super) fn consume_snapshot(
 ) -> anyhow::Result<AppliedExecution> {
     let metadata = snapshot.identity.signed_hash.as_deref()
         .and_then(|hash| broker.taker.as_ref()?.controlled_order_metadata(hash));
+    // The order's own signed expiry, read from the venue's original bound.
+    // It is never derived from the local clock and never from the running TTL.
+    let expiration = broker.taker.as_ref().map_or(Ok(None), |venue| {
+        venue.controlled_order_expiration(&snapshot.identity)
+    });
     let (applied, events) = {
         let mut state = broker.state.lock();
+        order_wait::before_read(&mut state);
         let id = snapshot.identity.local_attempt_id;
         let previous = state.live.reservations.get(&id).copied().unwrap_or(U256::ZERO);
-        let mut result = apply_snapshot_detailed(&mut state, snapshot);
+        let mut result = match &expiration {
+            Ok(_) => apply_snapshot_detailed(&mut state, snapshot),
+            Err(_) => Err("ORDER_IDENTITY_MISMATCH".into()),
+        };
         if state.live.controlled.is_some()
             && result.as_ref().is_ok_and(|applied| !applied.accounting_complete)
         { state.halted = true; }
@@ -668,6 +559,18 @@ pub(super) fn consume_snapshot(
             }
             if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
                 gate.record_reconciliation(identity, error);
+            }
+        }
+        // What this reading proves about the order's own wait. The wait holds
+        // no facts of its own: it only records what this reading established.
+        let applied_complete = result
+            .as_ref()
+            .is_ok_and(|applied| applied.accounting_complete && applied.applied);
+        order_wait::note_snapshot(&mut state, snapshot, applied_complete,
+            expiration.as_ref().ok().copied().flatten());
+        if applied_complete && snapshot.submission == Submission::Accepted {
+            if let Some(run) = state.live.controlled.as_mut() {
+                run.clear_failure(super::live_control::FailureKind::Execution);
             }
         }
         // A rejected reading still discloses its original facts, never a
@@ -1193,6 +1096,7 @@ pub(super) async fn check_runtime_account(
         if let Some(run) = state.live.controlled.as_mut() {
             run.clear_failure(super::live_control::FailureKind::Read);
         }
+        super::live_control::refresh_live_risk(&mut state);
     }
     if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
         if result.is_ok() {
@@ -1241,6 +1145,7 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
         let snapshot = match venue.execution_snapshot(&hash).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                order_wait::note_read_error(broker, &error);
                 if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
                     gate.record_read_failure(identity, "execution", "READ_FAILED");
                 }
@@ -1262,13 +1167,6 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
                 return Err(error);
             }
         };
-        {
-            // The execution read came back: its failure streak is over.
-            let mut state = broker.state.lock();
-            if let Some(run) = state.live.controlled.as_mut() {
-                run.clear_failure(super::live_control::FailureKind::Execution);
-            }
-        }
         let controlled = broker.state.lock().live.controlled.is_some();
         let applied = if controlled {
             consume_snapshot(broker, &snapshot).map(|_| ()).map_err(|error| error.to_string())

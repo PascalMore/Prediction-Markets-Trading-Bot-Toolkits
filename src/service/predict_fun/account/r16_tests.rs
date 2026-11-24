@@ -63,6 +63,132 @@ async fn cold_position_only_market_precedes_declared_history_and_hot_scan_still_
         "RECONCILIATION_REQUIRED:UNEXPLAINED_HISTORY");
 }
 
+/// A declared order with no fills cannot seed its market from positions or matches.
+struct ZeroFillHistory {
+    inner: Arc<super::super::fills::tests::Scenario>,
+    fault: &'static str,
+    market_reads: AtomicUsize,
+}
+impl SyntheticTransport for ZeroFillHistory {
+    fn auth_token(&self) -> String { self.inner.auth_token() }
+    fn sign(&self, _: &super::super::Order) -> anyhow::Result<(B256, String)> {
+        panic!("history reconciliation must not sign")
+    }
+    fn rpc(&self, method: &str, params: &Value) -> Result<Value, VenueError> {
+        if self.fault == "executable" && method == "eth_call" {
+            use alloy_sol_types::SolCall;
+            let selector = hex::encode(ExchangeRead::getOrderStatusCall::SELECTOR);
+            if params[0]["data"].as_str().unwrap().starts_with(&format!("0x{selector}")) {
+                return Ok(serde_json::json!(format!("0x{:064x}{:064x}", 0, 0)));
+            }
+        }
+        self.inner.rpc(method, params)
+    }
+    fn rest(&self, method: &reqwest::Method, path: &str, bearer: Option<&str>, body: Option<&Value>)
+        -> anyhow::Result<String> {
+        assert_eq!(*method, reqwest::Method::GET, "history reconciliation cannot write");
+        if path.starts_with("/positions?") || path.starts_with("/orders/matches?") {
+            return Ok(serde_json::json!({"data":[]}).to_string());
+        }
+        if path == "/markets/1" {
+            self.market_reads.fetch_add(1, Ordering::SeqCst);
+            if self.fault == "read" { return Err(read_error("READ_FAILED").into()); }
+            let mut market = serde_json::json!({"id":1,"tradingStatus":"CLOSED",
+                "conditionId":B256::repeat_byte(0xcc),"isNegRisk":false,"isYieldBearing":false,
+                "feeRateBps":0,"outcomes":[{"onChainId":"77"},{"onChainId":"88"}]});
+            match self.fault {
+                "wrong_id" => market["id"] = serde_json::json!(2),
+                "missing_token" => market["outcomes"][0]["onChainId"] = serde_json::json!("99"),
+                "duplicate" => market["outcomes"][1]["onChainId"] = serde_json::json!("77"),
+                "extra" => market["outcomes"].as_array_mut().unwrap().push(
+                    serde_json::json!({"onChainId":"99"})),
+                _ => {}
+            }
+            return Ok(serde_json::json!({"data":market}).to_string());
+        }
+        self.inner.rest(method, path, bearer, body)
+    }
+}
+
+async fn zero_fill_history(fault: &'static str) -> (PredictFunTrader, Arc<ZeroFillHistory>, String) {
+    use super::super::fills::tests::{historical_trader, history_record, record_history};
+    let (mut trader, inner, [_, zero]) = historical_trader("history_duplicate").await;
+    let mut record = history_record(&inner, &zero);
+    if fault == "open" || fault == "unknown" {
+        record["order"]["status"] = serde_json::json!(if fault == "open" { "OPEN" } else { "NEW_STATUS" });
+        record_history(&inner, &zero, record);
+    }
+    trader.run_context.write().as_mut().unwrap().reconciled_orders = vec![zero.clone()];
+    trader.client.markets.write().clear();
+    let transport = Arc::new(ZeroFillHistory { inner, fault, market_reads: AtomicUsize::new(0) });
+    Arc::get_mut(&mut trader.client).unwrap().synthetic = Some(transport.clone());
+    (trader, transport, zero)
+}
+
+#[tokio::test]
+async fn zero_fill_cold_history_reconciles_without_positions_or_matches_and_memoizes_final() {
+    use super::super::fills::tests::queried_order_count;
+    let (trader, transport, zero) = zero_fill_history("").await;
+    assert!(trader.client.markets.read().is_empty());
+    let signs = transport.inner.base.signs.load(Ordering::SeqCst);
+    let posts = transport.inner.base.posts.load(Ordering::SeqCst);
+    let snapshot = trader.read_account_snapshot().await.unwrap();
+    assert!(snapshot.complete && snapshot.positions_explained);
+    assert!(snapshot.positions.is_empty() && snapshot.open_orders.is_empty());
+    assert_eq!(transport.market_reads.load(Ordering::SeqCst), 1);
+    let reads = queried_order_count(&transport.inner, &zero);
+    assert!(reads >= 3, "must read and verify the actual declared order");
+    assert!(trader.read_account_snapshot().await.unwrap().positions_explained);
+    assert_eq!(queried_order_count(&transport.inner, &zero), reads);
+    assert_eq!(transport.market_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.inner.base.signs.load(Ordering::SeqCst), signs);
+    assert_eq!(transport.inner.base.posts.load(Ordering::SeqCst), posts);
+}
+
+#[tokio::test]
+async fn zero_fill_cold_history_keeps_unclosed_orders_unproven() {
+    for fault in ["open", "unknown", "executable"] {
+        let (trader, _, _) = zero_fill_history(fault).await;
+        let error = trader.read_account_snapshot().await.unwrap_err();
+        assert_eq!(error.to_string(), "RECONCILIATION_REQUIRED:HISTORY_NOT_CLOSED", "{fault}");
+        assert!(trader.history_proven.read().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn zero_fill_cold_history_rejects_wrong_market_binding_and_failed_reads() {
+    for fault in ["wrong_id", "missing_token", "duplicate", "extra", "read"] {
+        let (trader, transport, _) = zero_fill_history(fault).await;
+        assert!(trader.read_account_snapshot().await.is_err(), "{fault}");
+        assert!(trader.history_proven.read().is_empty());
+        assert_eq!(transport.market_reads.load(Ordering::SeqCst), 1, "{fault}");
+    }
+}
+
+#[tokio::test]
+async fn zero_fill_cold_history_rejects_conflicting_preexisting_cache() {
+    for fault in ["cached_wrong_id", "partial_replacement", "complement_first", "complement_second"] {
+        let (trader, _, _) = zero_fill_history("").await;
+        let (first, second) = match fault {
+            "cached_wrong_id" => ("77", "88"),
+            "complement_first" => ("88", "99"),
+            _ => ("99", "88"),
+        };
+        let cached: ApiMarket = serde_json::from_value(serde_json::json!({
+            "id":if fault == "partial_replacement" { 1 } else { 2 },
+            "tradingStatus":"CLOSED", "conditionId":B256::repeat_byte(0xcc),
+            "isNegRisk":false, "isYieldBearing":false, "feeRateBps":0,
+            "outcomes":[{"onChainId":first}, {"onChainId":second}]
+        })).unwrap();
+        trader.client.remember_market(&cached);
+        let error = trader.read_account_snapshot().await.unwrap_err();
+        assert_eq!(error.downcast_ref::<VenueError>().unwrap().reason, "TOKEN_MISMATCH", "{fault}");
+        assert!(trader.history_proven.read().is_empty());
+        assert_eq!(trader.client.market_for_token("88").unwrap().outcomes[0].on_chain_id,
+            cached.outcomes[0].on_chain_id, "failed hydration must not poison the cache");
+    }
+}
+
 struct FundsFault {
     inner: Arc<dyn SyntheticTransport>,
     balance: &'static str,
