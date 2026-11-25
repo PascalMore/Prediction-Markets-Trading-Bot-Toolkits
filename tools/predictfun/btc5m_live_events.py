@@ -455,7 +455,8 @@ class LiveRelations:
                 self.attempts[attempt_id] = {"candidate": candidate, "identity": market_token,
                     "worst": int(payload["worst_cash_atoms"]), "remaining": int(payload["remaining_atoms"]),
                     "hash": None, "venue": None, "phase": None, "submission": None,
-                    "execution": None, "applied": {key: 0 for key in DELTA_NAMES}}
+                    "execution": None, "send_observed": False,
+                    "applied": {key: 0 for key in DELTA_NAMES}}
             else:
                 attempt = self._attempt(payload, market_token)
                 require(candidate == attempt["candidate"]
@@ -467,6 +468,10 @@ class LiveRelations:
             attempt = self._attempt(payload, market_token)
             require(payload["candidate_id"] == attempt["candidate"])
             self._bind(attempt, payload)
+            attempt["send_observed"] |= (
+                payload["attempt_phase"] in ("MAY_HAVE_SUBMITTED", "SUBMITTED")
+                or payload["submission"] in ("UNKNOWN", "ACCEPTED")
+                or payload["venue_order_id"] is not None)
             bound = tuple(payload[key] for key in ("request_gross_atoms", "max_cash_atoms"))
             require("bound" not in attempt or attempt["bound"] == bound)
             attempt["bound"] = bound
@@ -557,10 +562,20 @@ class LiveRelations:
         require(attempt is not None and attempt["identity"] == identity)
         return attempt
 
+    @staticmethod
+    def _zero_risk_unsent(attempt: dict) -> bool:
+        """Exclude only a closed attempt proven never to own execution or risk."""
+        return (attempt["phase"] == "CLOSED"
+                and attempt["submission"] in ("NOT_SUBMITTED", "REJECTED_FINAL")
+                and not attempt.get("send_observed", True)
+                and attempt["execution"] is None and attempt["venue"] is None
+                and attempt["remaining"] == 0
+                and all(value == 0 for value in attempt["applied"].values()))
+
     def _payout(self, payload: dict, identity: tuple) -> None:
         """Index owner-specific cash facts; never manufacture a balance or proof."""
         owners = [(key, attempt) for key, attempt in self.attempts.items()
-                  if attempt["identity"] == identity]
+                  if attempt["identity"] == identity and not self._zero_risk_unsent(attempt)]
         require(bool(owners))
         status = payload["status"]
         if status in ("UNRESOLVED", "CONFLICT"):

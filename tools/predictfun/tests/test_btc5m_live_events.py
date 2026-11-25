@@ -126,6 +126,8 @@ class EventTests(unittest.TestCase):
     def setUpClass(cls):
         # Native tests: cancelled pending POST and bounded cleanup, respectively.
         cls.revaluations = native_revaluations()
+        cls.edge_preview = native_stream(
+            "live004_regression::conservative_edge_preview_skips_before_reserve_sign_and_keeps_next_core_candidate")
         cls.pending = native_stream(745, 755)
         cls.cleanup = native_stream(813, 827)
         cls.decoded = [live.validate_live_event(frame) for frame in cls.cleanup]
@@ -183,6 +185,21 @@ class EventTests(unittest.TestCase):
 
     def frame(self, event):
         return live.EVENT_PREFIX + json.dumps(event, separators=(",", ":")).encode() + b"\n"
+
+    def test_conservative_edge_preview_native_stream_stays_readable_without_stop(self):
+        store = self.store(self.edge_preview)
+        for frame in self.edge_preview:
+            store.append(frame)
+        read = live.read_live_run(store.directory)
+        self.assertNotIn("OUTPUT_INVALID", read["reasons"])
+        events = read["events"]
+        self.assertEqual(len(events), len(self.edge_preview))
+        self.assertFalse(any(event["event_kind"] == "stop" for event in events))
+        reserves = [event for event in events if event["event_kind"] == "reservation"
+                    and event["payload"]["action"] == "RESERVE"]
+        self.assertEqual(len(reserves), 1)
+        self.assertEqual(reserves[0]["payload"]["attempt_id"], "1")
+        self.assertIsNone(read["ended"])  # A readable running trace is not a fabricated complete run.
 
     def test_legacy_details_default_to_null_but_other_keys_stay_strict(self):
         events = [live.validate_live_event(frame) for frame in self.runtime_stop]
@@ -897,6 +914,193 @@ class EventTests(unittest.TestCase):
             self.assertEqual(write.call_count, 0)
         self.assertEqual(acks, [])
         self.assertEqual(store.relations.seq, 0)
+
+
+class PayoutOwnerRegressionTests(unittest.TestCase):
+    """Frozen live prefix plus explicitly derived/injected settlement frames."""
+
+    @classmethod
+    def setUpClass(cls):
+        bot = Path(__file__).resolve().parents[3]
+        cls.source = bot.parents[4] / ('data/reports/2026-11-25-btc5m-controlled-paper/'
+                                     'evidence/btc5m-live-60ad1be52eb643f0')
+        cls.started = json.loads((cls.source / 'started.json').read_text())
+        cls.public = json.loads((cls.source / 'public-config.json').read_text())
+        cls.context = json.loads((cls.source / 'live-context.json').read_text())
+        live.check_metadata(cls.started, cls.public, cls.context)
+        cls.raw_prefix = (cls.source / 'events.jsonl').read_bytes().splitlines(keepends=True)
+        cls.prefix = live.LiveRelations(cls.started['run_id'], cls.started['risk_window_id'],
+                                        cls.started['public_config_identity'])
+        for line in cls.raw_prefix:
+            cls.prefix = cls.prefix.stage(live.validate_live_event(
+                live.EVENT_PREFIX + line, cls.started['public_config_identity']))
+        assert cls.prefix.seq == 532
+        stop = json.loads((cls.source / 'stop-output.json').read_text())
+        text = stop['text']
+        if '<REDACTED>' in text:
+            assert text.count('<REDACTED>') == 1
+            shape = json.loads(text[len(live.EVENT_PREFIX):].replace('<REDACTED>', 'null'))
+            owners = [attempt for attempt in cls.prefix.attempts.values()
+                      if attempt['identity'][0] == shape['market_id']
+                      and attempt['execution'] is not None]
+            assert len(owners) == 1
+            # Saved diagnostic redacts token; derive only that field in memory.
+            text = text.replace('<REDACTED>', json.dumps(owners[0]['identity'][1]))
+            assert len(text.encode()) == stop['bytes']
+        cls.payout = live.validate_live_event(text, cls.started['public_config_identity'])
+        assert cls.payout['event_seq'] == 533
+        cls.before_hashes = {name: hashlib.sha256((cls.source / name).read_bytes()).hexdigest()
+                             for name in ('events.jsonl', 'ended.json', 'stop-output.json')}
+
+    def test_live_prefix_payout_ignores_only_unsubmitted_zero_risk_attempt(self):
+        result = self.prefix.stage(self.payout)
+        self.assertEqual(result.seq, 533)
+        self.assertEqual(result.attempts['2']['submission'], 'NOT_SUBMITTED')
+        self.assertIsNone(result.attempts['2']['execution'])
+        self.assertEqual(result.claims['3']['value'][1], 1126622988505747127)
+        self.assertNotIn('2', result.claims)
+        self.assertTrue(result.cash_pending)
+        self.assertEqual(result.previous_cash, self.prefix.previous_cash)
+        self.assertEqual(self.prefix.seq, 532)
+
+    def test_real_store_persists_derived_payout_once_without_order_ack(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
+            store = live.LiveEventStore(Path(temporary) / 'isolated', self.started,
+                                        self.public, self.context)
+            try:
+                for line in self.raw_prefix:
+                    store.append(live.EVENT_PREFIX + line)
+                acknowledgements = []
+                store.append(live.EVENT_PREFIX + live.canonical(self.payout) + b'\n',
+                             acknowledgements.append)
+                self.assertEqual(store.relations.seq, 533)
+                self.assertEqual(acknowledgements, [])  # Only PREPARED orders receive an ACK.
+                saved = (store.directory / 'events.jsonl').read_bytes().splitlines()
+                self.assertEqual(len(saved), 533)
+                self.assertEqual(json.loads(saved[-1]), self.payout)
+                self.assertEqual(store.relations.previous_cash, self.prefix.previous_cash)
+            finally:
+                store.close()
+        for name, expected in self.before_hashes.items():
+            self.assertEqual(hashlib.sha256((self.source / name).read_bytes()).hexdigest(), expected)
+
+    def test_unknown_prior_order_is_not_erased_by_later_not_submitted(self):
+        events = [json.loads(line) for line in self.raw_prefix]
+        insertion = next(index for index, event in enumerate(events)
+                         if event['event_kind'] == 'order'
+                         and event['payload']['attempt_id'] == '2')
+        prior = copy.deepcopy(events[insertion])
+        prior['payload'].update(attempt_phase='PREPARED', submission='UNKNOWN')
+        reserved = next(event['payload']['worst_cash_atoms'] for event in events
+                        if event['event_kind'] == 'reservation'
+                        and event['payload']['attempt_id'] == '2'
+                        and event['payload']['action'] == 'RESERVE')
+        prior['accounting']['reserved'] = reserved
+        if prior['accounting']['cash'] is not None:
+            prior['accounting']['available'] = str(int(prior['accounting']['cash']) - int(reserved))
+        events.insert(insertion, prior)
+        relations = live.LiveRelations(self.started['run_id'], self.started['risk_window_id'],
+                                        self.started['public_config_identity'])
+        for sequence, event in enumerate(events, 1):
+            event['event_seq'] = sequence
+            relations = relations.stage(event)
+        payout = copy.deepcopy(self.payout)
+        payout['event_seq'] = relations.seq + 1
+        with self.assertRaises(live.LiveInvalid):
+            relations.stage(payout)
+
+    def test_same_identity_risky_attempts_are_not_silently_ignored(self):
+        for damage in ('unknown', 'accepted', 'prepared', 'reserved', 'inventory',
+                       'fee', 'venue', 'execution', 'send_observed', 'missing_proof'):
+            with self.subTest(damage=damage):
+                relations = copy.deepcopy(self.prefix)
+                attempt = relations.attempts['2']
+                if damage in ('unknown', 'accepted'):
+                    attempt['submission'] = damage.upper()
+                elif damage == 'prepared':
+                    attempt['phase'] = 'PREPARED'
+                elif damage == 'reserved':
+                    attempt['remaining'] = 1
+                elif damage in ('inventory', 'fee'):
+                    attempt['applied']['net_inventory_atoms' if damage == 'inventory'
+                                       else 'collateral_fee_atoms'] = 1
+                elif damage == 'venue':
+                    attempt['venue'] = 'unexpected-venue-id'
+                elif damage == 'execution':
+                    attempt['execution'] = copy.deepcopy(relations.attempts['3']['execution'])
+                elif damage == 'send_observed':
+                    attempt['send_observed'] = True
+                else:
+                    attempt.pop('send_observed')
+                # Index-level fault probe after a fully validated real prefix.
+                with self.assertRaises(live.LiveInvalid):
+                    relations.stage(self.payout)
+                self.assertEqual(relations.seq, 532)
+                self.assertNotIn('3', relations.claims)
+
+    def test_two_real_economic_owners_still_refuse(self):
+        relations = copy.deepcopy(self.prefix)
+        relations.attempts['other-economic-owner'] = copy.deepcopy(relations.attempts['3'])
+        with self.assertRaises(live.LiveInvalid):
+            relations.stage(self.payout)
+
+    def test_final_rejected_without_any_send_or_risk_is_not_a_payout_owner(self):
+        relations = live.LiveRelations(self.started['run_id'], self.started['risk_window_id'],
+                                        self.started['public_config_identity'])
+        for line in self.raw_prefix:
+            event = json.loads(line)
+            if event['event_kind'] == 'order' and event['payload']['attempt_id'] == '2':
+                event['payload']['submission'] = 'REJECTED_FINAL'
+            relations = relations.stage(event)
+        result = relations.stage(self.payout)
+        self.assertIn('3', result.claims)
+        self.assertNotIn('2', result.claims)
+
+    def test_payout_without_any_economic_owner_refuses(self):
+        relations = copy.deepcopy(self.prefix)
+        relations.attempts.pop('3')
+        with self.assertRaises(live.LiveInvalid):
+            relations.stage(self.payout)
+
+    def test_exact_claim_can_clear_its_wait_but_not_other_guards(self):
+        relations = self.prefix.stage(self.payout)
+        paid = copy.deepcopy(self.payout)
+        paid['event_seq'] += 1
+        paid['event_time'] = (live.timestamp(paid['event_time']) + dt.timedelta(milliseconds=1)
+                              ).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        amount = paid['payload']['claim_value_atoms']
+        paid['payload'].update(status='CASH_CONFIRMED', reason='NONE', cash_received_atoms=amount)
+        book = paid['accounting']
+        book.update(cash=str(int(book['cash']) + int(amount)),
+                    available=str(int(book['available']) + int(amount)),
+                    realized=str(int(book['realized']) + int(amount) - int(book['cost'])),
+                    cost='0', unrealized='0', pending_claim_value=None)
+        result = relations.stage(paid)
+        self.assertFalse(result.cash_pending)
+        self.assertFalse(result.stopped)
+        self.assertTrue(result.claims['3']['confirmed'])
+        hard_stop = copy.deepcopy(relations)
+        hard_stop.stop_reason = 'FACT_CONFLICT'
+        hard_stop.stopped = True
+        paid_hard_stop = hard_stop.stage(paid)
+        self.assertTrue(paid_hard_stop.stopped)
+        self.assertEqual(paid_hard_stop.stop_reason, 'FACT_CONFLICT')
+        for damage in ('one_atom_short', 'generation', 'position', 'shares', 'payout'):
+            with self.subTest(damage=damage):
+                before = copy.deepcopy(relations)
+                frame = copy.deepcopy(paid)
+                if damage == 'one_atom_short':
+                    frame['payload']['cash_received_atoms'] = str(int(amount) - 1)
+                elif damage == 'generation':
+                    before.reconciled_generations['3'] -= 1
+                elif damage == 'position':
+                    before.positions = [{'token': frame['token']}]
+                elif damage == 'shares':
+                    frame['payload']['position_net_atoms'] = str(int(amount) + 1)
+                else:
+                    frame['payload']['payout_yes'] = 1.0
+                with self.assertRaises(live.LiveInvalid):
+                    before.stage(frame)
 
 
 if __name__ == "__main__":

@@ -981,6 +981,10 @@ pub struct MarketQuery {
 pub trait MarketData: Send + Sync {
     async fn markets(&self, query: &MarketQuery) -> Result<Vec<TradableMarket>>;
     async fn market(&self, id: u64) -> Result<TradableMarket>;
+    /// Authoritative result read; adapters must preserve required auxiliary read errors.
+    async fn settlement_market(&self, id: u64) -> Result<TradableMarket> {
+        self.market(id).await
+    }
     /// `market` with its end time, category and tags filled in. A scan leaves these
     /// out so that it doesn't need a request per market.
     async fn with_schedule(&self, market: &TradableMarket) -> Result<TradableMarket>;

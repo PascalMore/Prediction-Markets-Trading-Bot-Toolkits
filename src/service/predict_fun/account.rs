@@ -534,7 +534,7 @@ impl PredictFunTrader {
         let known = self.client.market_for_token(token)?;
         // The market alone carries no round prices: read it the same way the
         // controlled settlement path reads an official result.
-        let market = self.client.market(known.id).await?;
+        let market = self.client.settlement_market(known.id).await?;
         // Compare against the pre-read binding: market() refreshes the cache.
         // A matching market id alone cannot identify a claim or its side.
         let known_yes = known.outcomes.first().map(|outcome| outcome.on_chain_id.as_str());
@@ -1226,30 +1226,23 @@ impl ChainRead<'_> {
         token: &str,
         expected: U256,
     ) -> Result<(), VenueError> {
-        let (_, ctf, _) = assets(
-            self.trader.identity().chain_id,
-            market.is_neg_risk,
-            market.is_yield_bearing,
-        );
-        let id = U256::from_str_radix(token, 10).map_err(|_| mismatch("TOKEN_MISMATCH"))?;
-        let actual = self
-            .call(
-                ctf,
-                CtfRead::balanceOfCall {
-                    owner: self.trader.trading_address(),
-                    id,
-                },
-            )
-            .await?
-            ._0;
+        let actual = self.position_balance(market, token).await?;
         if actual != expected {
-            return Err(VenueError::new(
-                VenueErrorCode::ReconciliationRequired,
-                "positions",
-                "INVENTORY_MISMATCH",
-            ));
+            tracing::warn!(branch = "REST_CHAIN_QUANTITY", token, expected_atoms = %expected,
+                actual_atoms = %actual, block = %self.block, "inventory reconciliation refused");
+            return Err(VenueError::new(VenueErrorCode::ReconciliationRequired, "positions", "INVENTORY_MISMATCH"));
         }
         Ok(())
+    }
+
+    pub(super) async fn position_balance(&self, market: &ApiMarket, token: &str) -> Result<U256, VenueError> {
+        let (_, ctf, _) = assets(
+            self.trader.identity().chain_id, market.is_neg_risk, market.is_yield_bearing,
+        );
+        let id = U256::from_str_radix(token, 10).map_err(|_| mismatch("TOKEN_MISMATCH"))?;
+        Ok(self.call(ctf, CtfRead::balanceOfCall {
+            owner: self.trader.trading_address(), id,
+        }).await?._0)
     }
 
     pub(super) async fn signature(&self, hash: B256, signature: &str) -> Result<(), VenueError> {

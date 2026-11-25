@@ -66,9 +66,22 @@ impl PredictFunTrader {
                 {
                     anyhow::bail!("RECONCILIATION_REQUIRED:CLAIM_GENERATION");
                 }
-                // Even an absent REST token requires the original pinned chain proof.
-                chain.position(&bound.market, &inventory.identity.token_id, U256::ZERO).await?;
+                // REST can hide a losing outcome without burning its ERC-1155 token.
+                // Read once at the original pinned block; only exact or zero can be explained.
+                let chain_inventory = chain.position_balance(&bound.market, &inventory.identity.token_id).await?;
+                if !chain_inventory.is_zero() && chain_inventory != inventory.inventory_atoms {
+                    tracing::warn!(branch = "CLOSED_CHAIN_QUANTITY", token = %inventory.identity.token_id,
+                        expected_atoms = %inventory.inventory_atoms, actual_atoms = %chain_inventory,
+                        block = %chain.block, "inventory reconciliation refused");
+                    return Err(VenueError::new(VenueErrorCode::ReconciliationRequired, "positions", "INVENTORY_MISMATCH").into());
+                }
                 let Some(settlement) = self.official_settlement(&inventory.identity.token_id).await? else {
+                    if !chain_inventory.is_zero() {
+                        tracing::warn!(branch = "SETTLEMENT_UNAVAILABLE", token = %inventory.identity.token_id,
+                            expected_atoms = %inventory.inventory_atoms, actual_atoms = %chain_inventory,
+                            block = %chain.block, "inventory reconciliation refused");
+                        return Err(VenueError::new(VenueErrorCode::ReconciliationRequired, "positions", "INVENTORY_MISMATCH").into());
+                    }
                     continue;
                 };
                 let yes = bound.market.outcomes.first()
@@ -87,6 +100,12 @@ impl PredictFunTrader {
                 if settlement.payout == 0.0 {
                     explanation.settled_zero.push(settlement.settled_zero(&inventory.identity.token_id));
                     continue;
+                }
+                if !chain_inventory.is_zero() {
+                    tracing::warn!(branch = "POSITIVE_PAYOUT_UNBURNED", token = %inventory.identity.token_id,
+                        expected_atoms = %inventory.inventory_atoms, actual_atoms = %chain_inventory,
+                        block = %chain.block, "inventory reconciliation refused");
+                    return Err(VenueError::new(VenueErrorCode::ReconciliationRequired, "positions", "INVENTORY_MISMATCH").into());
                 }
                 let Some(claim) = settlement.claimed_win(
                     &inventory.identity.token_id, inventory.inventory_atoms,
@@ -117,7 +136,11 @@ impl PredictFunTrader {
                 },
                 bound_claims,
             })
-        }.await;
+        }.await.map_err(|error| {
+            // Auxiliary official-settlement reads belong to this account
+            // observation too; preserve typed causes before the public boundary.
+            super::super::request::account_read_error(error, "RUNTIME_ACCOUNT")
+        });
         match &result {
             Ok(_) => self.gate.record_read_success(&identity, "snapshot"),
             Err(error) => {

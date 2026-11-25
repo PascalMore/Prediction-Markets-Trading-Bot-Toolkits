@@ -114,6 +114,8 @@ pub(super) const READ_FAILURE_BUDGET: std::time::Duration = std::time::Duration:
 pub(super) enum FailureKind {
     /// A read of the venue's own account or market facts failed.
     Read,
+    /// Official settlement batches have their own recovery clock.
+    Settlement,
     /// A read of one order's execution facts failed.
     Execution,
     /// The valuation of a held position could not be made.
@@ -188,6 +190,7 @@ pub struct ControlledLiveState {
     /// stopping it: the window keeps watching, adds no risk, and recovers by
     /// itself when the facts come back.
     pub(super) read_failures: Option<FailureStreak>,
+    pub(super) settlement_failures: Option<FailureStreak>,
     /// The consecutive execution-read failures of this window.
     pub(super) execution_failures: Option<FailureStreak>,
     /// The consecutive valuation gaps of this window.
@@ -372,6 +375,7 @@ impl ControlledLiveState {
     ) -> bool {
         let streak = match kind {
             FailureKind::Read => &mut self.read_failures,
+            FailureKind::Settlement => &mut self.settlement_failures,
             FailureKind::Execution => &mut self.execution_failures,
             FailureKind::Valuation => &mut self.valuation_failures,
         };
@@ -392,10 +396,12 @@ impl ControlledLiveState {
     pub(super) fn clear_failure(&mut self, kind: FailureKind) {
         match kind {
             FailureKind::Read => self.read_failures = None,
+            FailureKind::Settlement => self.settlement_failures = None,
             FailureKind::Execution => self.execution_failures = None,
             FailureKind::Valuation => self.valuation_failures = None,
         }
         self.degraded = self.read_failures.is_some()
+            || self.settlement_failures.is_some()
             || self.execution_failures.is_some()
             || self.valuation_failures.is_some();
     }
@@ -648,16 +654,17 @@ impl LiveCandidateGuard {
                 FrozenInput::Window => bail!("INPUT_CHANGED"),
             };
         }
-        let value = accounting::exact_floor_mul(bound.min_net_shares_atoms, candidate.fair())
-            .ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN"))?;
-        let edge = crate::service::predict_fun::controlled::cash_at_limit_atoms(
-            bound.request_gross_atoms, run.phase1.min_edge)?;
-        if bound.min_net_shares_atoms.is_zero()
-            || value.checked_sub(bound.max_cash_atoms).is_none_or(|net| net < edge)
-        {
-            drop(state);
+        if !crate::service::predict_fun::controlled::conservative_buy_edge(
+            bound.request_gross_atoms, bound.max_cash_atoms, bound.fee_rate_bps,
+            candidate.fair(), run.phase1.min_edge,
+        )? {
             self.record_check_at(now, stage, SendCheckDetail::EdgeBelowMin);
-            bail!("SIGNED_BOUND_UNPROVEN");
+            // The bound was proved above. Only its economics failed, before any
+            // send permission: finish this candidate, not the risk window.
+            return match frozen {
+                FrozenInput::Candidate => Err(crate::service::venue::CandidateRefused.into()),
+                FrozenInput::Window => bail!("SIGNED_BOUND_UNPROVEN"),
+            };
         }
         Ok(diagnostic)
     }
@@ -1195,6 +1202,7 @@ impl ControlledLiveState {
             mark_receipts: HashMap::new(),
             loss_latched: false,
             read_failures: None,
+            settlement_failures: None,
             execution_failures: None,
             valuation_failures: None,
             degraded: false,

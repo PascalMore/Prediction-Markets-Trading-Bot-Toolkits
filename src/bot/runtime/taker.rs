@@ -236,6 +236,16 @@ impl Broker {
                 return Ok(LiveTakeOutcome { result: TakeResult::Blocked(Blocked::Halted),
                     guard: None, attempt_id: None });
             }
+            // The model's price-dependent fee estimate is not the signed worst-case
+            // share floor. Reject an uneconomic candidate before reserving or signing.
+            let gross = crate::service::predict_fun::controlled::gross_quantity(&planned)?;
+            if !crate::service::predict_fun::controlled::conservative_buy_edge(
+                gross, reservation, candidate.fee_rate_bps(), candidate.fair(),
+                state.live.controlled.as_ref().unwrap().phase1.min_edge,
+            )? {
+                return Ok(LiveTakeOutcome { result: TakeResult::Blocked(Blocked::ThinBook),
+                    guard: None, attempt_id: None });
+            }
             let attempt_id = crate::bot::runtime::live::next_attempt_id(&mut state.live);
             let record = AttemptRecord {
                 identity: crate::service::venue::OrderIdentity {

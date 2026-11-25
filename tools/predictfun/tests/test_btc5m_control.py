@@ -382,8 +382,8 @@ sys.exit(int(sys.argv[2]))
         builder.assert_called_once()
         command = child.call_args.args[0]
         expected = control.BOT.parents[4] / (
-            "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/"
-            "candidate-runtime-wait-fix2/polymarket-toolkits")
+            "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/"
+            "candidate-root-fix/polymarket-toolkits")
         self.assertEqual(command[0], str(expected))
         directory = root / args[args.index("--run-id") + 1]
         self.assertEqual(command[command.index("--controlled-live-manifest") + 1],
@@ -397,7 +397,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(started["candidate_identity"], control.public_identity({}, live=True))
         context = json.loads((directory / "live-context.json").read_bytes())
         self.assertEqual(context["candidate_digest"], self.live.candidate_digest(started))
-        self.assertEqual(len(started["candidate_identity"]["files"]), 84)
+        self.assertEqual(len(started["candidate_identity"]["files"]), 89)
         print("R17_CANDIDATE_IDENTITY " + json.dumps(started["candidate_identity"], sort_keys=True))
         self.assertEqual([call[0] for call in collection.calls], ["insert", "read"])
         self.assertEqual(len(collection.documents), 1)
@@ -642,7 +642,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) - set(old_files), added | set(control.LIVE_PATHS) - set(old_files))
         self.assertEqual(set(old_files) - set(identity["files"]), set())
         self.assertEqual(len(old_files), 57)
-        self.assertEqual(len(identity["files"]), 84)
+        self.assertEqual(len(identity["files"]), 89)
         protected = set(old_files) - allowed
         self.assertEqual(len(protected), 48)
         for path in protected - gas_paths - dynamic_paths - repair_changed - live004_changed - stop_diag_changed - config_a1_changed - settled_zero_changed - r2_changed - parameterization_changed - send_latency_changed - r13_changed - r13c_changed - r15_changed - r16_changed:
@@ -655,7 +655,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(control.PAPER72_BINARY, evidence / "candidate-v2/polymarket-toolkits")
         self.assertEqual(hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest(),
                          "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa")
-        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/candidate-runtime-wait-fix2/polymarket-toolkits")
+        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/candidate-root-fix/polymarket-toolkits")
         old_live = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-gas-payer-fix/evidence/candidate/polymarket-toolkits"
         self.assertEqual(hashlib.sha256(old_live.read_bytes()).hexdigest(),
                          "f8171a45bc6ca09d5f1bbbe4d3f35bba6fdd31927f86974930e5960dfa624043")
@@ -756,7 +756,7 @@ sys.exit(int(sys.argv[2]))
         c1_bound = json.loads((binding_root / "c1-c2-final/post-binding-identity.json").read_bytes())
         self.assertEqual(c1_bound["candidate_digest"], "617f9f264454bf2fd5c72d153e22c633458b4b88e99201fd2ac867b9f56562d4")
         self.assertEqual({path for path, sha in c1_bound["candidate_identity"]["files"].items()
-                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs"} | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(c1_bound["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live003_regression.rs"})
+                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs"} | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(c1_bound["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs"})
         pre_binding = json.loads((binding_root / "rework-r6/final-candidate-identity.json").read_bytes())
         self.assertEqual(pre_binding["candidate_digest"],
                          "e20da168d8cd2b08203e9128ce23145cc4d72e55d7d04cf7f31c600d69b34d5c")
@@ -787,13 +787,13 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) ^ set(previous["candidate_identity"]["files"]), set(control.LIVE_PATHS) - set(previous["candidate_identity"]["files"]))
         self.assertEqual({path for path, digest in previous["candidate_identity"]["files"].items()
                           if identity["files"][path] != digest},
-                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(previous["candidate_identity"]["files"])))
+                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(previous["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live004_regression.rs"})
         self.assertNotEqual(current["candidate_digest"], previous["candidate_digest"])
         self.assertNotEqual(live_digest, saved["candidate_digest"])
         self.assertNotEqual(live_digest, "6908dd0072d916494e5e2f5059c34ef143ac2acbebd0f9a7f7a3c8e7f6ebb617")
         self.assertNotEqual(live_digest, candidate_identity["binary_sha256"])
         self.assertEqual(current["candidate_digest"], live.candidate_digest({key: current[key] for key in ("candidate_identity", "public_config_identity")}))
-        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest}, deployment_changed | r15_changed | r16_changed | {"tools/predictfun/local_signer.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py", "docs/LIVE-TRADING.md"})
+        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest}, deployment_changed | r15_changed | r16_changed | {"tools/predictfun/local_signer.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py", "docs/LIVE-TRADING.md", "src/bot/runtime/live_control/tests/live004_regression.rs"})
         self.assertEqual(set(current["candidate_identity"]["files"]) ^ set(candidate_identity["files"]), set(control.LIVE_PATHS) - set(current["candidate_identity"]["files"]))
         self.assertEqual(current["public_config_identity"], public)
         historical_binary = binding_root / "parameterization/candidate-r14/polymarket-toolkits"
@@ -802,7 +802,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(current["binary_sha256"], hashlib.sha256(historical_binary.read_bytes()).hexdigest())
         self.assertEqual(current["file_count"], 65)
         self.assertEqual(current["file_count"], len(current["candidate_identity"]["files"]))
-        self.assertEqual(final_sha, "a39d725b15d6f5c1450f8eea3e2af108c006767420f4dc3232ac14712859ab5b")
+        self.assertEqual(final_sha, "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1")
         self.assertEqual(current["scope"],
                          "deployed and bound; pending independent Validate; not activated or started")
         self.assertEqual({key: current[key] for key in public if key != "sha256"},

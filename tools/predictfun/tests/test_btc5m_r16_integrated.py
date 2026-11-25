@@ -102,6 +102,9 @@ class R16RelationsTests(unittest.TestCase):
     def test_actual_account_adapter_two_orders_have_one_complete_original_reader_run(self) -> None:
         names = (
             ("actual_adapter_result_first_cash_then_second_real_post", 2, 2),
+            ("settlement_http503_recovers_and_trades_again", 2, 2),
+            ("category_http429_account_recovers_and_trades_again", 2, 1),
+            ("original_drive_category_fault_recovers_without_restart_or_duplicate_post", 2, 1),
             ("actual_adapter_cash_first_result_then_second_real_post", 2, 2),
             ("original_drive_result_first_recovers_and_posts_without_restart", 2, 2),
             ("original_drive_cash_first_recovers_and_posts_without_restart", 2, 2),

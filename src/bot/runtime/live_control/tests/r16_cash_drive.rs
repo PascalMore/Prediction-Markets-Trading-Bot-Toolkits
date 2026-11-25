@@ -186,9 +186,409 @@ async fn actual_adapter_result_first_cash_then_second_real_post() {
     actual_adapter_two_rounds(false).await;
 }
 
+// Keep the same Broker, native trader, gate and DecisionCore across settlement,
+// the failed official GET and the next real (synthetic-transport) submission.
+async fn settlement_read_recovers(fault: &'static str, payout: f64) {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, payout));
+    if payout == 0.0 { facts.hidden.lock().unwrap().insert(77); }
+    else { facts.pay(77); }
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    live::check_runtime_account(&broker, false).await.unwrap();
+    let claims = broker.state.lock().live.claims.clone();
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().may_add_risk());
+    *facts.market_fault.lock().unwrap() = Some(fault);
+    let error = live::check_runtime_account(&broker, false).await.unwrap_err();
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(!run.must_end(), "one official GET failure must degrade, not stop: {error}");
+        assert!(run.degraded() && !run.may_add_risk());
+        assert!(run.control.lock().stop.is_none());
+        assert!(run.account_read.is_none());
+        assert_eq!(state.live.claims, claims, "failed read cannot credit the claim twice");
+    }
+    let venue = error.downcast_ref::<crate::service::venue::VenueError>().unwrap();
+    assert_eq!(venue.code, crate::service::venue::VenueErrorCode::ReadUnavailable);
+    assert!(venue.reason.starts_with(if fault.starts_with("category_") {
+        "SETTLEMENT_CATEGORY_READ_UNAVAILABLE"
+    } else { "RUNTIME_ACCOUNT_READ_UNAVAILABLE" }));
+    assert!(!format!("{error:?}").contains("SECRET_SENTINEL"));
+    let since = broker.state.lock().live.controlled.as_ref().unwrap().read_failures.as_ref().unwrap().since;
+    assert!(live::check_runtime_account(&broker, false).await.is_err());
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert_eq!(run.read_failures.as_ref().unwrap().since, since);
+        assert_eq!(run.read_failures.as_ref().unwrap().count, 2);
+        assert!(!run.must_end() && !run.may_add_risk());
+    }
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    *facts.market_fault.lock().unwrap() = None;
+    live::check_runtime_account(&broker, false).await.unwrap();
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(run.may_add_risk() && !run.degraded() && run.read_failures.is_none());
+        assert_eq!(state.live.claims, claims);
+    }
+    clock.advance(300_000);
+    let second = send_round(&broker, &clock, &facts, &mut core, 2).await;
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+    facts.round(resolved(second, 1.0));
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    facts.pay(177);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
+    broker.finish_controlled_live_with(r16_fixture::data(&trader).as_ref(),
+        std::time::Duration::from_secs(1), std::time::Duration::ZERO).await;
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished());
+}
+
+#[tokio::test]
+async fn settlement_http503_recovers_and_trades_again() {
+    settlement_read_recovers("http503", 1.0).await;
+}
+
+#[tokio::test]
+async fn category_http429_account_recovers_and_trades_again() {
+    settlement_read_recovers("category_http429", 0.0).await;
+}
+
+#[tokio::test]
+async fn settlement_consumer_typed_faults_degrade_instead_of_stopping() {
+    for fault in ["http429", "http503", "transport", "category_http429",
+                  "category_http503", "category_transport"] {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        facts.round(resolved(market, 0.0));
+        facts.hidden.lock().unwrap().insert(77);
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+        live::check_runtime_account(&broker, false).await.unwrap();
+        *facts.market_fault.lock().unwrap() = Some(fault);
+        let error = broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.err().unwrap();
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(!run.must_end(), "official settlement read must degrade: {fault}: {error}");
+        assert!(run.degraded() && !run.may_add_risk());
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn settlement_other_typed_read_faults_recover_after_paid_or_zero_outcome() {
+    for fault in ["http401", "http429", "transport", "category_http429", "category_http503", "category_transport"] {
+        for payout in [0.0, 1.0] { settlement_read_recovers(fault, payout).await; }
+    }
+}
+
+#[tokio::test]
+async fn settlement_invalid_data_and_unknown_errors_still_stop() {
+    for (fault, detail) in [("schema", "RUNTIME_ACCOUNT_FACT_INCOMPLETE"), ("raw", "UNKNOWN")] {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        facts.round(resolved(market, 1.0));
+        facts.pay(77);
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+        *facts.market_fault.lock().unwrap() = Some(fault);
+        let error = live::check_runtime_account(&broker, false).await.unwrap_err();
+        let reason = error.downcast_ref::<crate::service::venue::VenueError>()
+            .map(|venue| venue.reason.clone()).unwrap_or_else(|| error.to_string());
+        assert_eq!(reason, detail, "safe error projection");
+        assert!(!format!("{error:?}").contains("SECRET_SENTINEL"));
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(run.must_end() && !run.may_add_risk());
+        let stop = run.control.lock().stop.clone().unwrap();
+        assert_eq!(stop.reason, "RECONCILIATION_REQUIRED");
+        assert_eq!(stop.detail.as_deref(), Some(detail));
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn settlement_read_exhaustion_remains_sticky_after_a_valid_read() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 1.0));
+    facts.pay(77);
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    *facts.market_fault.lock().unwrap() = Some("http503");
+    assert!(live::check_runtime_account(&broker, false).await.is_err());
+    {
+        let mut state = broker.state.lock();
+        let run = state.live.controlled.as_mut().unwrap();
+        assert!(!run.must_end());
+        // Only the existing streak's input clock is injected; no real wait or
+        // production budget change. Equal/exceeded existing budget must stop.
+        run.read_failures.as_mut().unwrap().since = Utc::now()
+            - chrono::Duration::from_std(READ_FAILURE_BUDGET).unwrap();
+    }
+    assert!(live::check_runtime_account(&broker, false).await.is_err());
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().must_end());
+    *facts.market_fault.lock().unwrap() = None;
+    let _ = live::check_runtime_account(&broker, false).await;
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.must_end() && !run.may_add_risk());
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "READ_UNAVAILABLE");
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn actual_adapter_cash_first_result_then_second_real_post() {
     actual_adapter_two_rounds(true).await;
+}
+
+#[tokio::test]
+async fn unburned_loss_native_account_requires_exact_or_zero_balance_and_official_zero_payout() {
+    for (payout, balance_kind, accepted) in [
+        (Some(0.0), "exact", true), (Some(0.0), "zero", true),
+        (Some(0.0), "short", false), (Some(0.0), "excess", false),
+        (Some(1.0), "exact", false), (Some(0.5), "exact", false),
+        (None, "exact", false), (None, "zero", false),
+    ] {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        let inventory = {
+            let state = broker.state.lock();
+            let identity = state.live.attempts[&1].lock().identity.clone();
+            RuntimeClaimInventory { identity,
+                execution_generation: state.live.generation[&1], inventory_atoms: state.live.net_inventory[&1] }
+        };
+        assert!(!inventory.inventory_atoms.is_zero());
+        let balance = match balance_kind {
+            "zero" => U256::ZERO,
+            "short" => inventory.inventory_atoms - U256::from(1),
+            "excess" => inventory.inventory_atoms + U256::from(1),
+            _ => inventory.inventory_atoms,
+        };
+        facts.hidden.lock().unwrap().insert(77);
+        facts.position_overrides.lock().unwrap().insert(77, balance);
+        if let Some(payout) = payout { facts.round(resolved(market, payout)); }
+        let observation = trader.runtime_account_observation(&[inventory.clone()]).await;
+        let zero_proven = observation.as_ref().is_ok_and(|value| !value.snapshot.settled_zero.is_empty());
+        assert_eq!(zero_proven, accepted, "{payout:?}/{balance_kind}: {observation:?}");
+        if !accepted && !(payout.is_none() && balance_kind == "zero") {
+            assert!(observation.is_err(), "{payout:?}/{balance_kind} must not explain a claim");
+        }
+        if accepted {
+            let observation = observation.unwrap();
+            assert!(observation.snapshot.complete && observation.snapshot.positions_explained);
+            assert!(observation.snapshot.positions.is_empty());
+            assert_eq!(observation.snapshot.settled_zero.len(), 1);
+            assert!(observation.bound_claims.is_empty(), "zero payout is not a cash claim");
+            for field in ["generation", "identity"] {
+                let mut wrong = inventory.clone();
+                if field == "generation" { wrong.execution_generation += 1; }
+                else { wrong.identity.market_id += 1; }
+                assert!(trader.runtime_account_observation(&[wrong]).await.is_err());
+            }
+        }
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn unburned_loss_original_broker_closes_once_and_allows_second_round() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 0.0));
+    facts.hidden.lock().unwrap().insert(77);
+    // REST removes a losing outcome without redeeming/burning its ERC-1155 balance.
+    live::check_runtime_account(&broker, false).await.unwrap();
+    {
+        let state = broker.state.lock();
+        assert!(state.live.claims.is_empty(), "adapter evidence cannot credit before official consumption");
+        assert!(state.live.pending_claims.is_empty(), "zero payout is not a pending cash claim");
+        assert!(state.live.controlled.as_ref().unwrap().attempt_outcomes.is_empty());
+    }
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    for _ in 0..2 {
+        live::check_runtime_account(&broker, false).await.unwrap();
+        broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    }
+    {
+        let state = broker.state.lock();
+        assert!(state.live.claims.is_empty(), "loss must never credit cash");
+        assert!(state.live.pending_claims.is_empty());
+        let run = state.live.controlled.as_ref().unwrap();
+        assert_eq!(run.attempt_outcomes.len(), 1);
+        assert_eq!(run.attempt_outcomes[&1].claim_value_atoms, Some(U256::ZERO));
+        assert!(run.may_add_risk());
+    }
+    assert!(!facts.paid.lock().unwrap().contains(&77), "fixture did not burn or redeem");
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    clock.advance(300_000);
+    send_round(&broker, &clock, &facts, &mut core, 2).await;
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn settlement_and_account_streaks_do_not_clear_each_other_or_renew() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    facts.round(resolved(market, 0.0));
+    facts.hidden.lock().unwrap().insert(77);
+    let data = r16_fixture::data(&trader);
+    broker.settle_resolved(data.as_ref()).await.unwrap();
+    *facts.market_fault.lock().unwrap() = Some("category_http429");
+    assert!(live::check_runtime_account(&broker, false).await.is_err());
+    assert!(broker.settle_resolved(data.as_ref()).await.is_err());
+    let since = broker.state.lock().live.controlled.as_ref().unwrap()
+        .settlement_failures.unwrap().since;
+    *facts.market_fault.lock().unwrap() = None;
+    live::check_runtime_account(&broker, false).await.unwrap();
+    assert_eq!(broker.state.lock().live.controlled.as_ref().unwrap()
+        .settlement_failures.unwrap().since, since);
+    assert!(!broker.state.lock().live.controlled.as_ref().unwrap().may_add_risk());
+    *facts.market_fault.lock().unwrap() = Some("category_http503");
+    assert!(broker.settle_resolved(data.as_ref()).await.is_err());
+    assert_eq!(broker.state.lock().live.controlled.as_ref().unwrap()
+        .settlement_failures.unwrap().since, since);
+    *facts.market_fault.lock().unwrap() = None;
+    broker.settle_resolved(data.as_ref()).await.unwrap();
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().may_add_risk());
+    *facts.market_fault.lock().unwrap() = Some("category_http429");
+    assert!(live::check_runtime_account(&broker, false).await.is_err());
+    *facts.market_fault.lock().unwrap() = None;
+    broker.settle_resolved(data.as_ref()).await.unwrap();
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().read_failures.is_some());
+    live::check_runtime_account(&broker, false).await.unwrap();
+    *facts.market_fault.lock().unwrap() = Some("category_http429");
+    assert!(broker.settle_resolved(data.as_ref()).await.is_err());
+    broker.state.lock().live.controlled.as_mut().unwrap().settlement_failures.as_mut().unwrap()
+        .since = Utc::now() - chrono::Duration::from_std(READ_FAILURE_BUDGET).unwrap();
+    assert!(broker.settle_resolved(data.as_ref()).await.is_err());
+    *facts.market_fault.lock().unwrap() = None;
+    broker.settle_resolved(data.as_ref()).await.unwrap();
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.must_end() && !run.may_add_risk());
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "READ_UNAVAILABLE");
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn category_invalid_success_stays_fatal_and_optional_market_is_unchanged() {
+    for fault in ["schema", "raw", "category_schema", "category_missing"] {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+        facts.round(resolved(market, 0.0));
+        facts.hidden.lock().unwrap().insert(77);
+        let data = r16_fixture::data(&trader);
+        broker.settle_resolved(data.as_ref()).await.unwrap();
+        *facts.market_fault.lock().unwrap() = Some("category_http429");
+        assert!(data.market(1).await.is_ok(), "ordinary optional category fallback is preserved");
+        *facts.market_fault.lock().unwrap() = Some(fault);
+        if let Err(error) = broker.settle_resolved(data.as_ref()).await {
+            assert!(!format!("{error:?}").contains("SECRET_SENTINEL"));
+        }
+        assert!(broker.state.lock().live.controlled.as_ref().unwrap().must_end());
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct SettlementRecoveryDrive {
+    core: crate::bot::arbitrage::DecisionCore,
+    clock: Arc<FixtureClock>,
+    facts: Arc<r16_fixture::Facts>,
+    submitted: usize,
+}
+
+#[async_trait::async_trait]
+impl crate::bot::runtime::Strategy for SettlementRecoveryDrive {
+    fn name(&self) -> &'static str { "settlement-category-drive" }
+    async fn tick(&mut self, ctx: &crate::bot::runtime::Ctx) -> anyhow::Result<()> {
+        if self.submitted == 0 {
+            let market = send_round(&ctx.broker, &self.clock, &self.facts, &mut self.core, 1).await;
+            self.facts.round(resolved(market, 0.0));
+            self.facts.hidden.lock().unwrap().insert(77);
+            ctx.broker.settle_resolved(ctx.data.as_ref()).await?;
+            live::check_runtime_account(&ctx.broker, false).await?;
+            self.submitted = 1;
+            *self.facts.market_fault.lock().unwrap() = Some("category_http429");
+        } else if self.facts.market_fault.lock().unwrap().is_none() {
+            self.clock.advance(300_000);
+            let market = send_round(&ctx.broker, &self.clock, &self.facts, &mut self.core, 2).await;
+            self.facts.round(resolved(market, 1.0));
+            ctx.broker.settle_resolved(ctx.data.as_ref()).await?;
+            self.facts.pay(177);
+            live::check_runtime_account(&ctx.broker, false).await?;
+            self.submitted = 2;
+            self.clock.advance(3_600_000);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn original_drive_category_fault_recovers_without_restart_or_duplicate_post() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut strategy = SettlementRecoveryDrive {
+        core: crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        }), clock: clock.clone(), facts: facts.clone(), submitted: 0,
+    };
+    let mut cfg = candidate_tests::ctx_fixture(broker.identity.as_ref().unwrap());
+    cfg.strategies.poll_secs = 1;
+    let client = r16_fixture::data(&trader);
+    let ctx = crate::bot::runtime::Ctx { cfg, client: client.clone(), data: client, broker: broker.clone() };
+    let driving = crate::bot::runtime::drive(&mut strategy, &ctx);
+    tokio::pin!(driving);
+    tokio::select! {
+        result = &mut driving => panic!("category failure terminated original drive: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(61_100)) => (),
+    }
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(run.settlement_failures.is_some() && run.degraded());
+        assert!(!run.must_end() && !run.may_add_risk());
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
+    }
+    *facts.market_fault.lock().unwrap() = None;
+    // Exercise recovery through the original consumer, without resetting the drive/core.
+    broker.settle_resolved(ctx.data.as_ref()).await.unwrap();
+    live::check_runtime_account(&broker, false).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut driving)
+        .await.expect("same drive recovers and closes at original deadline").unwrap();
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.emitter.is_finished());
+    assert_eq!(run.control.lock().stop.as_ref().unwrap().reason, "DEADLINE");
 }
 
 struct NextRound {

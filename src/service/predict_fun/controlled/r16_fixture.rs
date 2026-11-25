@@ -10,9 +10,13 @@ use serde_json::{json, Value};
 pub(crate) struct Facts {
     pub rounds: Mutex<HashMap<u64, TradableMarket>>,
     pub paid: Mutex<HashSet<u64>>,
+    pub hidden: Mutex<HashSet<u64>>,
+    pub position_overrides: Mutex<HashMap<u64, U256>>,
     pub cash_offset: Mutex<i128>,
     pub rpc_calls: Mutex<Vec<String>>,
     pub rest_calls: Mutex<Vec<String>>,
+    /// Fault only the public official-settlement GET, never signing or POST.
+    pub market_fault: Mutex<Option<&'static str>>,
 }
 
 impl Facts {
@@ -60,6 +64,9 @@ impl SyntheticTransport for R16Transport {
             }
             if selector == hex::encode(&alloy_primitives::keccak256("balanceOf(address,uint256)")[..4]) {
                 let token = U256::from_str_radix(&data[data.len()-64..], 16).unwrap().to::<u64>();
+                if let Some(balance) = self.facts.position_overrides.lock().unwrap().get(&token) {
+                    return Ok(json!(format!("0x{balance:064x}")));
+                }
                 if self.facts.paid.lock().unwrap().contains(&token) {
                     return Ok(json!(format!("0x{:064x}", 0)));
                 }
@@ -71,6 +78,25 @@ impl SyntheticTransport for R16Transport {
         -> Result<String> {
         self.facts.rest_calls.lock().unwrap().push(path.into());
         if let Some(id) = path.strip_prefix("/markets/").and_then(|text| text.parse::<u64>().ok()) {
+            match *self.facts.market_fault.lock().unwrap() {
+                Some(fault @ ("http401" | "http429" | "http503")) => {
+                    let status = fault.strip_prefix("http").unwrap().parse::<u16>().unwrap();
+                    return Err(super::super::ApiError {
+                        status: reqwest::StatusCode::from_u16(status).unwrap(),
+                        body: "SECRET_SENTINEL bearer=do-not-log".into(),
+                    }.into());
+                }
+                Some("transport") => {
+                    // Construct a real reqwest error locally; no socket is opened.
+                    return Err(reqwest::Client::new().get("http://[SECRET_SENTINEL")
+                        .build().unwrap_err().into());
+                }
+                Some("schema") => return Ok(r#"{"data":{"id":"SECRET_SENTINEL"}}"#.into()),
+                Some("raw") => anyhow::bail!("SECRET_SENTINEL unclassified response"),
+                None => {}
+                Some(fault) if fault.starts_with("category_") => {}
+                Some(_) => panic!("unknown settlement fixture fault"),
+            }
             let results = self.facts.rounds.lock().unwrap();
             let result = results.get(&id).expect("configure real market facts before account reads");
             let round = self.inner.2.round_by_id(id).unwrap();
@@ -91,18 +117,32 @@ impl SyntheticTransport for R16Transport {
             return Ok(json!({"data":raw}).to_string());
         }
         if let Some(id) = path.strip_prefix("/categories/r16-").and_then(|text| text.parse::<u64>().ok()) {
+            match *self.facts.market_fault.lock().unwrap() {
+                Some(fault @ ("category_http429" | "category_http503")) => {
+                    return Err(super::super::ApiError {
+                        status: reqwest::StatusCode::from_u16(if fault.ends_with("429") { 429 } else { 503 }).unwrap(),
+                        body: "SECRET_SENTINEL category-only failure".into(),
+                    }.into());
+                }
+                Some("category_transport") => return Err(reqwest::Client::new()
+                    .get("http://[SECRET_SENTINEL").build().unwrap_err().into()),
+                Some("category_schema") => return Ok(r#"{"data":{"variantData":{"startPrice":"SECRET_SENTINEL"}}}"#.into()),
+                _ => {}
+            }
             let results = self.facts.rounds.lock().unwrap();
             let result = &results[&id];
             return Ok(json!({"data":{"startsAt":result.starts_at,"endsAt":result.ends_at,
-                "variantData":{"startPrice":result.start_price,"endPrice":result.end_price,
+                "variantData":{"startPrice":result.start_price,"endPrice":if *self.facts.market_fault.lock().unwrap() == Some("category_missing") { None } else { result.end_price },
                     "priceFeedSymbol":"BTCUSDT","priceFeedProvider":"CHAINLINK"},"markets":[]}}).to_string());
         }
         let raw = self.inner.rest(method, path, bearer, body)?;
         if path.starts_with("/positions?") {
             let paid = self.facts.paid.lock().unwrap();
+            let hidden = self.facts.hidden.lock().unwrap();
             let mut response: Value = serde_json::from_str(&raw)?;
             response["data"].as_array_mut().unwrap().retain(|position| {
-                !paid.contains(&position["outcome"]["onChainId"].as_str().unwrap().parse::<u64>().unwrap())
+                let token = position["outcome"]["onChainId"].as_str().unwrap().parse::<u64>().unwrap();
+                !paid.contains(&token) && !hidden.contains(&token)
             });
             return Ok(response.to_string());
         }

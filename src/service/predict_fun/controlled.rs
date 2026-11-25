@@ -204,6 +204,23 @@ pub(crate) fn cash_at_limit_atoms(gross_q_atoms: U256, limit_price: f64) -> Resu
     U256::from_str_radix(&cash.to_string(), 10).map_err(|_| anyhow::anyhow!("RESERVATION_OVERFLOW"))
 }
 
+/// Check a controlled BUY's worst-case economic edge using the signed fee floor.
+/// Invalid bounds are errors, never an economic candidate refusal.
+pub(crate) fn conservative_buy_edge(
+    gross: U256, cash: U256, fee_rate_bps: u32, fair: f64, min_edge: f64,
+) -> Result<bool> {
+    if fee_rate_bps > MAX_SIGNED_FEE_BPS {
+        bail!("SIGNED_BOUND_UNPROVEN:FEE_RATE_ABOVE_CAP");
+    }
+    let net = minimum_net_shares(gross, fee_rate_bps)
+        .filter(|net| !net.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN:NET_SHARES"))?;
+    let value = crate::bot::runtime::live_accounting::exact_floor_mul(net, fair)
+        .ok_or_else(|| anyhow::anyhow!("SIGNED_BOUND_UNPROVEN"))?;
+    let required = cash_at_limit_atoms(gross, min_edge)?;
+    Ok(value.checked_sub(cash).is_some_and(|profit| profit >= required))
+}
+
 /// The ordinary reservation bound, for the paths that keep it.
 ///
 /// It stays exactly as it was: a cash fee on top of the gross.

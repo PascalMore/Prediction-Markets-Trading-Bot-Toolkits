@@ -678,19 +678,29 @@ impl crate::bot::runtime::Broker {
             .traded.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            let market = match data.market(id).await {
+            let market = match data.settlement_market(id).await {
                 Ok(market) => market,
-                Err(_) => {
+                Err(error) => {
+                    let error = crate::service::predict_fun::settlement_read_error(error);
+                    let transient = error.downcast_ref::<crate::service::venue::VenueError>()
+                        .is_some_and(|error| error.code == crate::service::venue::VenueErrorCode::ReadUnavailable);
                     let events = {
                         let mut state = self.state.lock();
-                        state.live.controlled.as_mut().unwrap().stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                        let run = state.live.controlled.as_mut().unwrap();
+                        run.account_read = None;
+                        if transient {
+                            run.note_failure(super::live_control::FailureKind::Settlement,
+                                "READ_UNAVAILABLE", chrono::Utc::now());
+                        } else {
+                            run.stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                        }
                         super::live_events::prepare_lifecycle(&mut state)
                     };
                     super::live_events::flush_events(events.map_err(anyhow::Error::msg)?)
                         .map_err(anyhow::Error::msg)?;
                     // A failed authoritative read cannot certify cleanup or
                     // keep a deadline-only tail alive as if reconciliation succeeded.
-                    anyhow::bail!("DATA_UNAVAILABLE:official result read failed");
+                    return Err(error);
                 }
             };
             let events = {
@@ -709,6 +719,8 @@ impl crate::bot::runtime::Broker {
         if !self.state.lock().live.pending_claims.is_empty() {
             super::live::check_runtime_account(self, false).await?;
         }
+        self.state.lock().live.controlled.as_mut().unwrap()
+            .clear_failure(super::live_control::FailureKind::Settlement);
         Ok(())
     }
 }

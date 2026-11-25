@@ -52,8 +52,8 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-24-btc5m-unproven-root-cause/evidence/candidate-runtime-wait-fix2/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "a39d725b15d6f5c1450f8eea3e2af108c006767420f4dc3232ac14712859ab5b"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/candidate-root-fix/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
@@ -74,6 +74,11 @@ LIVE_PATHS = (
     "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs",
     "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py",
     "tools/predictfun/tests/test_btc5m_takeover.py",
+    "tools/predictfun/btc5m_payout_recovery.py",
+    "tools/predictfun/tests/test_btc5m_payout_recovery.py",
+    "tools/predictfun/btc5m_account_recovery.py",
+    "tools/predictfun/tests/test_btc5m_account_recovery.py",
+    "tools/predictfun/tests/test_btc5m_settled_inventory_recovery.py",
     "tools/predictfun/tests/test_btc5m_parameterization.py",
     # R15/R16 loaded recovery, claim, diagnostics and regression modules.
     "src/bot/runtime/live/claims.rs", "src/bot/runtime/live_control/cash_wait.rs",
