@@ -47,6 +47,7 @@ use tracing::{debug, info, warn};
 pub mod account;
 pub mod books;
 pub mod controlled;
+pub mod discovery;
 pub mod fills;
 pub mod request;
 
@@ -603,6 +604,7 @@ pub struct PredictFunClient {
     categories: RwLock<HashMap<String, (Option<String>, Vec<String>)>>,
     /// Category slug → event. A schedule doesn't change once published.
     events: RwLock<HashMap<String, ApiEvent>>,
+    series_directory: tokio::sync::Mutex<Option<discovery::SeriesDirectory>>,
     #[cfg(test)]
     synthetic: Option<Arc<dyn account::SyntheticTransport>>,
 }
@@ -634,6 +636,7 @@ impl PredictFunClient {
             markets: RwLock::new(HashMap::new()),
             categories: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
+            series_directory: Default::default(),
             #[cfg(test)]
             synthetic: None,
         }))
@@ -664,38 +667,7 @@ impl PredictFunClient {
     /// Up/down rounds worth looking at now. Mainnet lists them under recurring
     /// series, with the live round first. Testnet has no series, only categories.
     pub async fn live_rounds(&self) -> Result<Vec<TradableMarket>> {
-        let series = self
-            .get::<Vec<ApiSeries>>("/series?marketVariant=CRYPTO_UP_DOWN")
-            .await?
-            .data;
-        if series.is_empty() {
-            return self
-                .markets(&MarketQuery {
-                    variants: vec!["CRYPTO_UP_DOWN".into()],
-                    max_pages: 5,
-                })
-                .await;
-        }
-        let now = chrono::Utc::now();
-        let mut out = Vec::new();
-        for one in series {
-            let rounds = self
-                .get::<Vec<ApiEvent>>(&format!("/series/{}/rounds?first=2", one.slug))
-                .await?
-                .data;
-            for round in &rounds {
-                for raw in &round.markets {
-                    match serde_json::from_value::<ApiMarket>(raw.clone()) {
-                        Ok(market) => {
-                            self.remember_market(&market);
-                            out.push(tradable(&market, Some(round), now));
-                        }
-                        Err(e) => debug!(error = %e, "skipping unreadable market"),
-                    }
-                }
-            }
-        }
-        Ok(out)
+        self.live_rounds_for(&[], None).await
     }
 
     /// Whatever the adapter knows about the market holding `token_id`.
@@ -1283,6 +1255,7 @@ pub struct PredictFunTrader {
     /// only ages the account read. The history scan still runs every round, so
     /// a new, undeclared hash is still refused exactly as before.
     history_proven: RwLock<HashMap<String, account::ProvenHistoryOrder>>,
+    startup_history: RwLock<account::startup_history::StartupHistory>,
     /// What the controlled domain recorded about the guarded orders.
     ///
     /// The ordinary path never writes here, and never reads it: only a
@@ -1314,6 +1287,7 @@ impl PredictFunTrader {
             run_context: RwLock::new(None),
             bound_orders: RwLock::new(HashMap::new()),
             history_proven: RwLock::new(HashMap::new()),
+            startup_history: RwLock::new(Default::default()),
             controlled_metadata: RwLock::new(controlled::ControlledMetadataStore::new()),
         };
         if cfg.live_trading_allowed() {

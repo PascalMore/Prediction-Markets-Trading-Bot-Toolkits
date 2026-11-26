@@ -20,7 +20,7 @@ impl PredictFunTrader {
                 let history = if positions.is_ok() {
                     self.reconcile_account_history().await
                 } else {
-                    Ok(HashMap::new())
+                    Ok(startup_history::HistoryRead::default())
                 };
                 (positions, history)
             };
@@ -42,7 +42,7 @@ impl PredictFunTrader {
                 .filter(|(_, amount)| !amount.is_zero()).cloned().collect();
             let (collateral_atoms, gas_atoms) = chain.balances().await?;
             let mut explanation = self.explain_positions_mode(
-                &history, &observed, collateral_atoms, closed.is_some(),
+                &history.totals, &observed, collateral_atoms, closed.is_some(),
             ).await?;
             let proofs: Vec<_> = positions.iter().map(|(token, amount)| async {
                 let market = self.client.market_for_token(token)?;
@@ -126,7 +126,7 @@ impl PredictFunTrader {
                     anyhow::bail!("RECONCILIATION_REQUIRED:CLAIM_GENERATION");
                 }
             }
-            Ok(RuntimeAccountObservation {
+            let observation = RuntimeAccountObservation {
                 snapshot: AccountSnapshot {
                     identity: identity.clone(), collateral_atoms: Some(collateral_atoms),
                     gas_atoms: Some(gas_atoms), positions,
@@ -135,7 +135,11 @@ impl PredictFunTrader {
                     open_orders, complete: true,
                 },
                 bound_claims,
-            })
+            };
+            if closed.is_none() {
+                self.stage_history(&observation.snapshot, &history, explanation.official)?;
+            }
+            Ok(observation)
         }.await.map_err(|error| {
             // Auxiliary official-settlement reads belong to this account
             // observation too; preserve typed causes before the public boundary.
@@ -144,6 +148,7 @@ impl PredictFunTrader {
         match &result {
             Ok(_) => self.gate.record_read_success(&identity, "snapshot"),
             Err(error) => {
+                self.discard_pending_history();
                 if let Some(error) = error.downcast_ref::<VenueError>()
                     .filter(|error| error.code == VenueErrorCode::AccountMismatch)
                 {

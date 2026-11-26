@@ -674,6 +674,12 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
             }
             return check_runtime_account(broker, false).await;
         }
+        let history_scope = broker.controlled.as_ref().and_then(|controlled|
+            broker.state.lock().live.controlled.as_ref()
+                .map(|run| (controlled.run_id.clone(), run.options.risk_window_id.clone())));
+        if let Some((run, window)) = &history_scope {
+            venue.begin_startup_history(run, window)?;
+        }
         let snapshot = venue.account_snapshot().await?;
         let checked = super::live_control::account_receipt(&broker.state.lock())?;
         let controlled_budget = broker
@@ -763,6 +769,9 @@ pub(super) async fn seed_predict(broker: &Broker) -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?.flatten();
         drop(state);
         if let Some(event) = event { event.flush().map_err(anyhow::Error::msg)?; }
+        if let Some((run, window)) = &history_scope {
+            venue.commit_startup_history(run, window, &snapshot)?;
+        }
         Ok(())
     }
     .await;

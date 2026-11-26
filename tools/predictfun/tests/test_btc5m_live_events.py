@@ -1103,5 +1103,267 @@ class PayoutOwnerRegressionTests(unittest.TestCase):
                     before.stage(frame)
 
 
+# The stopped run's own evidence is original and read-only. Frame 52 survives
+# only in stop-output.json with its public token redacted; the token is
+# restored from the unique canonical accepted owner, in memory only.
+INCIDENT_RUN = (Path(__file__).resolve().parents[3].parents[4]
+                / "data/reports/2026-11-26-btc5m-controlled-paper/evidence/"
+                  "btc5m-live-4d633f8696984a73")
+# The quantity the venue showed (2.63 shares minus one atom) and the cash a
+# complete read of that fill accounts for.
+PARTIAL_GROSS_Q = 2629999999999999999
+APPLIED_NET_CASH = 10 ** 18
+
+
+@functools.lru_cache(maxsize=1)
+def partial_execution_frames() -> tuple[dict, dict, dict, list[bytes], list[bytes]]:
+    """Real metadata and prefix, the derived frame and a labelled continuation.
+
+    The prefix is original wire. The first returned frame restores only the one
+    redacted public token (DERIVED_OFFLINE_PUBLIC_TOKEN_REPLAY). The frames
+    after it are a contract-valid continuation the stopped run never produced:
+    a complete read, its proven closure, a degraded observation and the final
+    record. Nothing here is written back to the original evidence.
+    """
+    started = json.loads((INCIDENT_RUN / "started.json").read_text())
+    public = json.loads((INCIDENT_RUN / "public-config.json").read_text())
+    context = json.loads((INCIDENT_RUN / "live-context.json").read_text())
+    live.check_metadata(started, public, context)
+    prefix = (INCIDENT_RUN / "events.jsonl").read_bytes().splitlines(keepends=True)
+    relations = live.LiveRelations(started["run_id"], started["risk_window_id"],
+                                   started["public_config_identity"])
+    for line in prefix:
+        relations = relations.stage(live.EVENT_PREFIX + line)
+    stop = json.loads((INCIDENT_RUN / "stop-output.json").read_text())
+    text = stop["text"]
+    assert text.count("<REDACTED>") == 1
+    shape = json.loads(text[len(live.EVENT_PREFIX):].replace("<REDACTED>", "null"))
+    owners = [attempt for attempt in relations.attempts.values()
+              if attempt["identity"][0] == shape["market_id"] and attempt["execution"] is not None]
+    assert len(owners) == 1
+    text = text.replace("<REDACTED>", json.dumps(owners[0]["identity"][1]))
+    assert len(text.encode()) == stop["bytes"]
+    derived = live.validate_live_event(text, started["public_config_identity"])
+    assert derived["event_seq"] == relations.seq + 1
+
+    def fact(atoms):
+        return {"status": "KNOWN", "atoms": str(atoms),
+                "coverage_gross_atoms": str(PARTIAL_GROSS_Q), "reason": "NONE"}
+
+    def stamp(seconds):
+        return (live.timestamp(derived["event_time"]) + dt.timedelta(seconds=seconds)
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    complete = copy.deepcopy(derived)
+    complete.update(event_seq=derived["event_seq"] + 1, event_time=stamp(1))
+    complete["accounting"] = dict(derived["accounting"], cost=str(APPLIED_NET_CASH), reserved="0")
+    complete["payload"].update(
+        generation=derived["payload"]["generation"] + 1, pages_complete=True,
+        quantity_class="PARTIAL", gross_q_atoms=str(PARTIAL_GROSS_Q),
+        accounting_gross_q_atoms=str(PARTIAL_GROSS_Q), closure="OPEN", final_gross_q_atoms=None,
+        facts={"gross_cash": fact(APPLIED_NET_CASH), "collateral_fee": fact(0),
+               "share_fee": fact(0), "net_cash": fact(APPLIED_NET_CASH),
+               "net_inventory": fact(PARTIAL_GROSS_Q), "vwap": fact(APPLIED_NET_CASH)},
+        delta={"gross_q_atoms": str(PARTIAL_GROSS_Q), "gross_cash_atoms": str(APPLIED_NET_CASH),
+               "collateral_fee_atoms": "0", "share_fee_atoms": "0",
+               "net_cash_atoms": str(APPLIED_NET_CASH),
+               "net_inventory_atoms": str(PARTIAL_GROSS_Q)},
+        reason="NONE")
+    closed = copy.deepcopy(complete)
+    closed.update(event_seq=complete["event_seq"] + 1, event_time=stamp(2))
+    closed["payload"].update(generation=complete["payload"]["generation"] + 1,
+                             closure="FINAL", final_gross_q_atoms=str(PARTIAL_GROSS_Q),
+                             delta={name: "0" for name in live.DELTA_NAMES})
+    degraded = copy.deepcopy(derived)
+    degraded.update(event_seq=closed["event_seq"] + 1, event_time=stamp(3))
+    degraded["payload"].update(generation=closed["payload"]["generation"] + 1)
+    terminal = copy.deepcopy(derived)
+    terminal.update(event_seq=degraded["event_seq"] + 1, event_time=stamp(4))
+    terminal["accounting"] = copy.deepcopy(complete["accounting"])
+    terminal["event_kind"] = "final"
+    terminal["payload"] = {"run_status": "COMPLETED", "stop_reason": "NONE",
+                           "execution_complete": True, "cash_complete": True,
+                           "audit_complete": True, "takeover_required": False,
+                           "unresolved": [], "positions": [], "stop_detail": None}
+    frames = [live.EVENT_PREFIX + live.canonical(event) + b"\n"
+              for event in (derived, complete, closed, degraded, terminal)]
+    return started, public, context, prefix, frames
+
+
+def partial_execution_wire() -> list[bytes]:
+    """The accepted prefix plus the labelled continuation for a real supervisor."""
+    _started, _public, _context, prefix, frames = partial_execution_frames()
+    return [live.EVENT_PREFIX + line for line in prefix] + list(frames)
+
+
+def ended_for_completed(final: dict) -> dict:
+    """The ended record a healthy completed run writes for this final."""
+    payload = final["payload"]
+    return {"schema_version": live.SCHEMA_VERSION, "run_id": final["run_id"],
+            "exit_facts": {"launcher_exit": 0, "child_returncode": 0, "child_signal": None,
+                           "forced_cleanup": False, "stop_reason": payload["stop_reason"]},
+            "final_event_seq": final["event_seq"], "final_accounting": final["accounting"],
+            "incomplete_reason": "NONE", "incomplete_detail": payload["stop_detail"],
+            **{key: payload[key] for key in
+               ("execution_complete", "cash_complete", "audit_complete", "takeover_required")}}
+
+
+class PartialExecutionObservationTests(unittest.TestCase):
+    """The stopped run's incomplete observation, derived only in memory.
+
+    Frame 52 of run btc5m-live-4d633f8696984a73 survives only in stop-output.json
+    with its public token redacted; the token is restored from the unique
+    canonical accepted owner. That is DERIVED_OFFLINE_PUBLIC_TOKEN_REPLAY, not
+    original wire bytes. The files on disk are only ever read here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        (cls.started, cls.public, cls.context,
+         cls.prefix, cls.frames) = partial_execution_frames()
+        def decode(frame):
+            return live.validate_live_event(frame, cls.started["public_config_identity"])
+        cls.events = [decode(frame) for frame in cls.frames]
+        cls.derived, cls.complete, cls.final_exec, cls.degraded, cls.terminal = cls.events
+        cls.before = {name: hashlib.sha256((INCIDENT_RUN / name).read_bytes()).hexdigest()
+                      for name in ("events.jsonl", "stop-output.json")}
+
+    def replay(self, count=0):
+        relations = live.LiveRelations(self.started["run_id"], self.started["risk_window_id"],
+                                       self.started["public_config_identity"])
+        for line in self.prefix:
+            relations = relations.stage(live.EVENT_PREFIX + line)
+        for event in self.events[:count]:
+            relations = relations.stage(event)
+        return relations
+
+    def test_the_derived_incomplete_frame_no_longer_erases_known_facts(self):
+        relations = self.replay(0)
+        self.assertEqual(relations.seq, 51)
+        # The accepted prefix knew a complete zero fill; frame 52 shows a
+        # quantity but no accounting yet.
+        self.assertEqual(relations.attempts["1"]["execution"]["facts"]["net_cash"]["atoms"], "0")
+        staged = relations.stage(self.derived)
+        attempt = staged.attempts["1"]
+        self.assertEqual(attempt["execution"]["gross_q_atoms"], str(PARTIAL_GROSS_Q))
+        self.assertIsNone(attempt["execution"]["accounting_gross_q_atoms"])
+        self.assertFalse(live.LiveRelations._execution_closed(attempt["execution"]))
+        # Nothing was applied or released, and the earlier facts stay known.
+        self.assertEqual(attempt["applied"], {name: 0 for name in live.DELTA_NAMES})
+        self.assertEqual(attempt["remaining"], 999400000000000000)
+        self.assertEqual(attempt["watermark"]["gross_q"], PARTIAL_GROSS_Q)
+        self.assertEqual(attempt["watermark"]["facts"]["net_cash"], (0, 0))
+        self.assertFalse(staged.cash_pending)
+        self.assertFalse(staged.stopped)
+
+    def test_complete_facts_and_a_real_closure_still_land_once_after_the_gap(self):
+        relations = self.replay(0)
+        for event in self.events[:-1]:
+            relations = relations.stage(event)
+        result = relations.stage(self.terminal)
+        attempt = result.attempts["1"]
+        self.assertEqual(attempt["applied"]["net_cash_atoms"], APPLIED_NET_CASH)
+        self.assertEqual(attempt["applied"]["net_inventory_atoms"], PARTIAL_GROSS_Q)
+        self.assertEqual(attempt["applied"]["gross_q_atoms"], PARTIAL_GROSS_Q)
+        self.assertEqual(attempt["remaining"], 0)
+        self.assertEqual(attempt["watermark"]["final_gross_q"], PARTIAL_GROSS_Q)
+        self.assertIsNotNone(result.final)
+        self.assertEqual(result.final["payload"]["run_status"], "COMPLETED")
+        self.assertFalse(result.cash_pending)
+        self.assertFalse(result.stopped)
+        # The degraded observation after the proven closure did not reopen it.
+        self.assertEqual(result.attempts["1"]["execution"]["closure"], "UNPROVEN")
+        self.assertTrue(result._closed(attempt))
+
+    def test_original_store_and_reader_persist_the_sequence_and_leave_inputs(self):
+        with tempfile.TemporaryDirectory(prefix="btc5m-partial-",
+                                         dir=os.environ["TMPDIR"]) as temporary:
+            store = live.LiveEventStore(Path(temporary) / "derived-replay", self.started,
+                                        self.public, self.context)
+            try:
+                for line in self.prefix:
+                    store.append(live.EVENT_PREFIX + line)
+                for frame in self.frames:
+                    store.append(frame)
+                store.finish(ended_for_completed(self.terminal))
+                read = live.read_live_run(store.directory)
+                self.assertEqual(read["status"], "COMPLETE")
+                self.assertEqual(read["reasons"], [])
+                self.assertEqual(len(read["events"]), len(self.prefix) + len(self.frames))
+                self.assertEqual(read["ended"]["final_event_seq"], self.terminal["event_seq"])
+            finally:
+                store.close()
+        after = {name: hashlib.sha256((INCIDENT_RUN / name).read_bytes()).hexdigest()
+                 for name in self.before}
+        self.assertEqual(self.before, after)
+
+    def test_genuine_contradictions_after_the_gap_still_refuse(self):
+        base = self.replay(2)  # accepted prefix, the derived frame and the complete read
+        self.assertEqual(base.seq, 53)
+        stamp = (live.timestamp(self.derived["event_time"]) + dt.timedelta(seconds=5)
+                 ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        def event_from(template, seq, **payload):
+            frame = copy.deepcopy(template)
+            frame["event_seq"] = seq
+            frame["event_time"] = stamp
+            frame["payload"].update(payload)
+            return frame
+
+        def facts_at(coverage, atoms=0):
+            return {name: {"status": "KNOWN", "atoms": str(atoms if name != "vwap" else 0),
+                           "coverage_gross_atoms": str(coverage), "reason": "NONE"}
+                    for name in live.FACT_NAMES}
+
+        one = int(self.derived["payload"]["gross_q_atoms"])
+        cases = {
+            "lower_gross": event_from(self.complete, 54, generation=4,
+                                      gross_q_atoms=str(one - 1)),
+            "lower_coverage": event_from(self.derived, 54, generation=4, pages_complete=True,
+                                         accounting_gross_q_atoms="0", facts=facts_at(0)),
+            "same_coverage_revision": event_from(self.complete, 54, generation=4),
+            "same_generation_revision": event_from(self.complete, 54, generation=3),
+            "lower_generation": event_from(self.complete, 54, generation=2),
+        }
+        revised = cases["same_coverage_revision"]["payload"]["facts"]["net_cash"]
+        revised["atoms"] = str(APPLIED_NET_CASH + 1)
+        revised = cases["same_generation_revision"]["payload"]["facts"]["net_cash"]
+        revised["atoms"] = str(APPLIED_NET_CASH + 1)
+        candidate = next(key for key, item in base.candidates.items()
+                         if item["attempt"] == "1")
+        reservation = copy.deepcopy(self.derived)
+        reservation.update(event_seq=54, event_time=stamp, event_kind="reservation")
+        reservation["payload"] = {"candidate_id": candidate, "attempt_id": "1", "action": "RELEASE",
+                                  "worst_cash_atoms": "999400000000000000",
+                                  "remaining_atoms": "0", "reason": "NONE"}
+        cases["release_while_incomplete"] = reservation
+        for name, frame in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(live.LiveInvalid):
+                    base.stage(frame)
+
+    def test_a_final_with_a_different_quantity_never_reopens_the_proven_one(self):
+        base = self.replay(3)  # through the proven FINAL at PARTIAL_GROSS_Q
+        self.assertEqual(base.attempts["1"]["watermark"]["final_gross_q"], PARTIAL_GROSS_Q)
+        bigger = PARTIAL_GROSS_Q + 1
+
+        def fact(atoms):
+            return {"status": "KNOWN", "atoms": str(atoms),
+                    "coverage_gross_atoms": str(bigger), "reason": "NONE"}
+
+        frame = copy.deepcopy(self.final_exec)
+        frame["event_seq"] = base.seq + 1
+        frame["payload"].update(
+            generation=5, gross_q_atoms=str(bigger), accounting_gross_q_atoms=str(bigger),
+            final_gross_q_atoms=str(bigger), closure="FINAL", pages_complete=True,
+            facts={"gross_cash": fact(APPLIED_NET_CASH), "collateral_fee": fact(0),
+                   "share_fee": fact(0), "net_cash": fact(APPLIED_NET_CASH),
+                   "net_inventory": fact(bigger), "vwap": fact(APPLIED_NET_CASH)},
+            delta={"gross_q_atoms": "1", "gross_cash_atoms": "0", "collateral_fee_atoms": "0",
+                   "share_fee_atoms": "0", "net_cash_atoms": "0", "net_inventory_atoms": "1"})
+        with self.assertRaises(live.LiveInvalid):
+            base.stage(frame)
+
+
 if __name__ == "__main__":
     unittest.main()

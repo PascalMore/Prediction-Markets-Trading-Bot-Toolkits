@@ -770,6 +770,18 @@ pub struct OrderTicket {
 pub trait OrderVenue: Send + Sync {
     fn id(&self) -> VenueId;
 
+    /// Begin a cold startup audit for one run/window; default has no I/O or state.
+    fn begin_startup_history(&self, _run_id: &str, _risk_window_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Publish only the complete startup input accepted after the STARTUP flush.
+    /// Default venues do not retain history and perform no I/O.
+    fn commit_startup_history(&self, _run_id: &str, _risk_window_id: &str,
+        _snapshot: &AccountSnapshot) -> Result<()> {
+        Ok(())
+    }
+
     /// Worst-case collateral atoms required before reserving a Predict attempt.
     /// Other venues keep their existing sizing and do not call this method.
     fn reservation_atoms(&self, _planned: &PlannedOrder) -> Result<U256> {

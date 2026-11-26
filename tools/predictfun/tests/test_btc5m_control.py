@@ -233,6 +233,84 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(read["ended"]["incomplete_reason"], "FACT_INCOMPLETE")
         self.assertEqual(final["payload"]["stop_reason"], "RECONCILIATION_REQUIRED")
 
+    def test_an_incomplete_partial_execution_keeps_the_real_supervisor_running(self):
+        # The stopped run's own prefix, the derived partial frame and the
+        # contract-valid close that could follow it go through the original
+        # supervisor and its fake child. The partial observation is evidence,
+        # not a reason to stop the run.
+        from test_btc5m_live_events import partial_execution_frames, partial_execution_wire
+        started, public, context, _prefix, _frames = partial_execution_frames()
+        frames = partial_execution_wire()
+        live = self.live
+        directory = self.root / "partial-run"
+        store = live.LiveEventStore(directory, started, public, context)
+        self.addCleanup(store.close)
+        wire = self.root / "partial.txt"
+        wire.write_bytes(b"".join(frames))
+        process = subprocess.Popen([sys.executable, "-B", str(self.script), str(wire), "0"],
+                                   env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with patch.object(control, "CLEANUP_SECONDS", .5):
+            facts, final = control.supervise(process, store, now, control.boottime())
+        try:
+            control.finish_live_evidence(store, facts, final)
+        except (OSError, ValueError):
+            facts["launcher_exit"] = 1
+        read = live.read_live_run(directory)
+        self.assertEqual(facts["launcher_exit"], 0, (facts, read.get("reasons")))
+        self.assertIsNone(facts["stop_reason"])
+        self.assertIsNotNone(final)
+        self.assertEqual(facts["events"], len(frames))
+        self.assertEqual(store.relations.seq, len(frames))
+        self.assertEqual(read["status"], "COMPLETE")
+        self.assertEqual(read["reasons"], [])
+        self.assertFalse((directory / "stop-output.json").exists())
+
+    def test_a_true_conflicting_execution_still_stops_and_preserves_evidence(self):
+        # A later read that revises a known fact at the same coverage is still
+        # a genuine contradiction: the original supervisor stops on it and
+        # keeps the refused bytes as this run's own evidence.
+        from test_btc5m_live_events import partial_execution_frames, partial_execution_wire
+        frames = list(partial_execution_wire())
+        live = self.live
+        refused = json.loads(frames[-3][len(live.EVENT_PREFIX):-1])
+        refused["payload"]["facts"]["net_cash"]["atoms"] = str(10 ** 18 + 1)
+        frames[-3] = live.EVENT_PREFIX + live.canonical(refused) + b"\n"
+        started, public, context, _prefix, _frames = partial_execution_frames()
+        directory = self.root / "conflict-run"
+        store = live.LiveEventStore(directory, started, public, context)
+        self.addCleanup(store.close)
+        wire = self.root / "conflict.txt"
+        wire.write_bytes(b"".join(frames))
+        process = subprocess.Popen([sys.executable, "-B", str(self.script), str(wire), "0"],
+                                   env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with patch.object(control, "CLEANUP_SECONDS", .5):
+            facts, final = control.supervise(process, store, now, control.boottime())
+        try:
+            control.finish_live_evidence(store, facts, final)
+        except (OSError, ValueError):
+            facts["launcher_exit"] = 1
+        read = live.read_live_run(directory)
+        self.assertEqual(facts["stop_reason"], "OUTPUT_INVALID")
+        self.assertEqual(facts["launcher_exit"], 1)
+        self.assertIsNone(final)
+        self.assertEqual(store.relations.seq, len(frames) - 3)
+        saved = (directory / "events.jsonl").read_bytes()
+        self.assertNotIn(live.canonical(refused), saved)
+        stop_evidence = json.loads((directory / "stop-output.json").read_text())
+        # The stopping fragment is kept with the public token redacted, exactly
+        # as the real stopped run's stop-output was.
+        self.assertEqual(stop_evidence["text"].count("<REDACTED>"), 1)
+        kept = json.loads(stop_evidence["text"][len(live.EVENT_PREFIX):]
+                          .replace("<REDACTED>", "null"))
+        self.assertEqual(kept["event_seq"], refused["event_seq"])
+        self.assertEqual(kept["payload"]["facts"]["net_cash"]["atoms"], str(10 ** 18 + 1))
+        self.assertEqual(read["ended"]["exit_facts"]["stop_reason"], "OUTPUT_INVALID")
+        self.assertIn("PROCESS_FAILED", read["reasons"])
+
     def launch_fixture(self, *, real_identity=False):
         """Strict fake public file and lowest-level Mongo transport only."""
         from contextlib import ExitStack
@@ -382,8 +460,8 @@ sys.exit(int(sys.argv[2]))
         builder.assert_called_once()
         command = child.call_args.args[0]
         expected = control.BOT.parents[4] / (
-            "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/"
-            "candidate-root-fix/polymarket-toolkits")
+            "data/reports/2026-11-26-btc5m-history-not-closed-root-cause/evidence/"
+            "candidate-r20/polymarket-toolkits")
         self.assertEqual(command[0], str(expected))
         directory = root / args[args.index("--run-id") + 1]
         self.assertEqual(command[command.index("--controlled-live-manifest") + 1],
@@ -397,7 +475,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(started["candidate_identity"], control.public_identity({}, live=True))
         context = json.loads((directory / "live-context.json").read_bytes())
         self.assertEqual(context["candidate_digest"], self.live.candidate_digest(started))
-        self.assertEqual(len(started["candidate_identity"]["files"]), 89)
+        self.assertEqual(len(started["candidate_identity"]["files"]), 95)
         print("R17_CANDIDATE_IDENTITY " + json.dumps(started["candidate_identity"], sort_keys=True))
         self.assertEqual([call[0] for call in collection.calls], ["insert", "read"])
         self.assertEqual(len(collection.documents), 1)
@@ -524,7 +602,9 @@ sys.exit(int(sys.argv[2]))
         dynamic_paths = {"tools/predictfun/btc5m_control.py", "tools/predictfun/btc5m_live_events.py",
                          "tools/predictfun/tests/test_btc5m_control.py",
                          "tools/predictfun/tests/test_btc5m_live_events.py",
-                         "src/bot/arbitrage/phase1/tests.rs"}
+                         "src/bot/arbitrage/phase1/tests.rs",
+                         # Part 2 only: configured discovery routing and colocated regressions.
+                         "src/bot/arbitrage.rs"}
         gas_paths = {"src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
                      "src/bot/runtime/live_control/tests.rs", "tools/predictfun/btc5m_live_guard.py",
                      "tools/predictfun/btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_guard.py",
@@ -559,7 +639,12 @@ sys.exit(int(sys.argv[2]))
                              "src/service/predict_fun/request.rs", "src/service/predict_fun/account.rs"}
         added = {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs",
                  "src/bot/runtime/live/order_wait.rs", "src/bot/runtime/live_control/tests/order_wait.rs",
-                 "src/service/predict_fun/fills/order_wait_tests.rs"}
+                 "src/service/predict_fun/fills/order_wait_tests.rs",
+                 "src/service/predict_fun/account/startup_history.rs",
+                 "src/service/predict_fun/account/startup_history_tests.rs",
+                 "src/service/predict_fun/discovery.rs",
+                 "src/bot/runtime/live_control/tests/startup_history.rs",
+                 "tools/predictfun/tests/test_btc5m_startup_history.py"}
         send_latency_changed = {"src/bot/runtime.rs", "src/bot/runtime/taker.rs", "src/service/predict_fun/account.rs", "src/service/predict_fun/fills.rs", "src/service/predict_fun/request.rs"}
         deployment_changed = {"tools/predictfun/btc5m_control.py",
                               "tools/predictfun/tests/test_btc5m_control.py"}
@@ -642,7 +727,8 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) - set(old_files), added | set(control.LIVE_PATHS) - set(old_files))
         self.assertEqual(set(old_files) - set(identity["files"]), set())
         self.assertEqual(len(old_files), 57)
-        self.assertEqual(len(identity["files"]), 89)
+        self.assertEqual(len(identity["files"]), 95)
+        self.assertIn("tools/predictfun/tests/test_btc5m_read_unavailable_recovery.py", identity["files"])
         protected = set(old_files) - allowed
         self.assertEqual(len(protected), 48)
         for path in protected - gas_paths - dynamic_paths - repair_changed - live004_changed - stop_diag_changed - config_a1_changed - settled_zero_changed - r2_changed - parameterization_changed - send_latency_changed - r13_changed - r13c_changed - r15_changed - r16_changed:
@@ -655,7 +741,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(control.PAPER72_BINARY, evidence / "candidate-v2/polymarket-toolkits")
         self.assertEqual(hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest(),
                          "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa")
-        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/candidate-root-fix/polymarket-toolkits")
+        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] / "data/reports/2026-11-26-btc5m-history-not-closed-root-cause/evidence/candidate-r20/polymarket-toolkits")
         old_live = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-gas-payer-fix/evidence/candidate/polymarket-toolkits"
         self.assertEqual(hashlib.sha256(old_live.read_bytes()).hexdigest(),
                          "f8171a45bc6ca09d5f1bbbe4d3f35bba6fdd31927f86974930e5960dfa624043")
@@ -686,7 +772,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual({path for path in historical_files
                           if identity["files"][path] != historical_files[path]},
                          repair_changed | deployment_changed | live004_changed | stop_diag_changed
-                         | guard_changed
+                         | guard_changed | {"src/bot/arbitrage.rs"}
                          | (config_a1_changed & set(historical_files))
                          | settled_zero_changed | r2_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(historical_files)))
         print("M01_PROTECTED_PARTITIONS " + json.dumps({"upstream_total": len(upstream),
@@ -756,7 +842,7 @@ sys.exit(int(sys.argv[2]))
         c1_bound = json.loads((binding_root / "c1-c2-final/post-binding-identity.json").read_bytes())
         self.assertEqual(c1_bound["candidate_digest"], "617f9f264454bf2fd5c72d153e22c633458b4b88e99201fd2ac867b9f56562d4")
         self.assertEqual({path for path, sha in c1_bound["candidate_identity"]["files"].items()
-                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs"} | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(c1_bound["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs"})
+                          if candidate_identity["files"][path] != sha}, r2_changed | r5_changed | r6_changed | {"src/service/venue.rs", "src/bot/arbitrage.rs"} | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(c1_bound["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live003_regression.rs", "src/bot/runtime/live_control/tests/live004_regression.rs"})
         pre_binding = json.loads((binding_root / "rework-r6/final-candidate-identity.json").read_bytes())
         self.assertEqual(pre_binding["candidate_digest"],
                          "e20da168d8cd2b08203e9128ce23145cc4d72e55d7d04cf7f31c600d69b34d5c")
@@ -787,13 +873,13 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(set(identity["files"]) ^ set(previous["candidate_identity"]["files"]), set(control.LIVE_PATHS) - set(previous["candidate_identity"]["files"]))
         self.assertEqual({path for path, digest in previous["candidate_identity"]["files"].items()
                           if identity["files"][path] != digest},
-                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(previous["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live004_regression.rs"})
+                         remediation_changed | config_a1_changed | c1_changed | c2_changed | r2_changed | r5_changed | send_latency_changed | r13_changed | r13c_changed | ((r15_changed | r16_changed | parameterization_changed) & set(previous["candidate_identity"]["files"])) | {"src/bot/runtime/live_control/tests/live004_regression.rs", "src/bot/arbitrage.rs"})
         self.assertNotEqual(current["candidate_digest"], previous["candidate_digest"])
         self.assertNotEqual(live_digest, saved["candidate_digest"])
         self.assertNotEqual(live_digest, "6908dd0072d916494e5e2f5059c34ef143ac2acbebd0f9a7f7a3c8e7f6ebb617")
         self.assertNotEqual(live_digest, candidate_identity["binary_sha256"])
         self.assertEqual(current["candidate_digest"], live.candidate_digest({key: current[key] for key in ("candidate_identity", "public_config_identity")}))
-        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest}, deployment_changed | r15_changed | r16_changed | {"tools/predictfun/local_signer.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py", "docs/LIVE-TRADING.md", "src/bot/runtime/live_control/tests/live004_regression.rs"})
+        self.assertEqual({path for path, digest in current["candidate_identity"]["files"].items() if candidate_identity["files"][path] != digest}, deployment_changed | r15_changed | r16_changed | {"src/bot/arbitrage.rs", "tools/predictfun/local_signer.py", "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py", "docs/LIVE-TRADING.md", "src/bot/runtime/live_control/tests/live004_regression.rs"})
         self.assertEqual(set(current["candidate_identity"]["files"]) ^ set(candidate_identity["files"]), set(control.LIVE_PATHS) - set(current["candidate_identity"]["files"]))
         self.assertEqual(current["public_config_identity"], public)
         historical_binary = binding_root / "parameterization/candidate-r14/polymarket-toolkits"
@@ -802,7 +888,7 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(current["binary_sha256"], hashlib.sha256(historical_binary.read_bytes()).hexdigest())
         self.assertEqual(current["file_count"], 65)
         self.assertEqual(current["file_count"], len(current["candidate_identity"]["files"]))
-        self.assertEqual(final_sha, "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1")
+        self.assertEqual(final_sha, "e7528b592527f362e1442a0aa35fea66ebc5aee9d39042bbe5dde76f6bd2ff6c")
         self.assertEqual(current["scope"],
                          "deployed and bound; pending independent Validate; not activated or started")
         self.assertEqual({key: current[key] for key in public if key != "sha256"},

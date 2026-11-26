@@ -52,8 +52,8 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-26-btc5m-settlement-root-fix-deploy/evidence/candidate-root-fix/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1"
+LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-26-btc5m-history-not-closed-root-cause/evidence/candidate-r20/polymarket-toolkits"
+LIVE_BINARY_SHA256 = "e7528b592527f362e1442a0aa35fea66ebc5aee9d39042bbe5dde76f6bd2ff6c"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
@@ -79,6 +79,7 @@ LIVE_PATHS = (
     "tools/predictfun/btc5m_account_recovery.py",
     "tools/predictfun/tests/test_btc5m_account_recovery.py",
     "tools/predictfun/tests/test_btc5m_settled_inventory_recovery.py",
+    "tools/predictfun/tests/test_btc5m_read_unavailable_recovery.py",
     "tools/predictfun/tests/test_btc5m_parameterization.py",
     # R15/R16 loaded recovery, claim, diagnostics and regression modules.
     "src/bot/runtime/live/claims.rs", "src/bot/runtime/live_control/cash_wait.rs",
@@ -95,6 +96,13 @@ LIVE_PATHS = (
     "src/service/predict_fun/account/r16_tests.rs",
     "src/service/predict_fun/controlled/r16_fixture.rs",
     "tools/predictfun/tests/test_btc5m_r16_integrated.py",
+    # R18 startup-only history owner and original-consumer regressions.
+    "src/service/predict_fun.rs", "src/service/venue.rs",
+    "src/service/predict_fun/account/startup_history.rs",
+    "src/service/predict_fun/account/startup_history_tests.rs",
+    "src/service/predict_fun/discovery.rs",
+    "src/bot/runtime/live_control/tests/startup_history.rs",
+    "tools/predictfun/tests/test_btc5m_startup_history.py",
     "Cargo.toml", "Cargo.lock", "src/bin/btc5m_reconcile.rs",
 )
 CLEANUP_SECONDS = 30

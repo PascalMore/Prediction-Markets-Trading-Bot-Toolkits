@@ -833,6 +833,8 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
     prefix_canonical = True
     checkpoint = checkpoint_event = None
     tail = []
+    read_unavailable = account_recovery.known_read_unavailable(ended)
+    recovery_prefix = []
     event = None
     with event_path.open("rb") as stream:
         while line := stream.readline(64 * 1024 + 1):
@@ -843,6 +845,8 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
                 live.EVENT_PREFIX + line, started["public_config_identity"])
             prefix_canonical &= line == live.canonical(event) + b"\n"
             relations = relations.stage(event)
+            if read_unavailable:
+                recovery_prefix.append(event)
             if (event["event_kind"] == "reconciliation" and event["payload"]["scope"] == "RUNTIME"
                     and event["payload"]["complete"]):
                 checkpoint, checkpoint_event, tail = relations, event, []
@@ -908,7 +912,7 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
         # qualify, but only on its own complete evidence.
         kind = _unsent_edge_kind(ended, final, accounting, exit_facts,
                                   order_events, event_kinds) or "REFUSE"
-    if kind == "REFUSE" and account_recovery.known_ended(ended):
+    if kind == "REFUSE" and (account_recovery.known_ended(ended) or read_unavailable):
         if seed is None or anchor is None or budget != seed_budget or not prefix_canonical:
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         native_path = seeds[0].parent / "reconciliation.json"
@@ -922,9 +926,12 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
                 or not _reconciled_identity_matches(old_native.get("account_identity"))):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         try:
-            recovery = account_recovery.qualify(started=started, ended=ended, relations=relations,
+            qualifier = (account_recovery.qualify_read_unavailable if read_unavailable
+                         else account_recovery.qualify)
+            recovery = qualifier(started=started, ended=ended, relations=relations,
                 checkpoint=checkpoint, checkpoint_event=checkpoint_event, tail=tail,
-                old_native=old_native, old_params=checked["params"], seed=seed, initial=first_reconciliation)
+                old_native=old_native, old_params=checked["params"], seed=seed, initial=first_reconciliation,
+                **({"prefix": recovery_prefix} if read_unavailable else {}))
         except live.LiveInvalid:
             raise Refused("HISTORY_REQUIRES_TAKEOVER") from None
         recovery["source_sha256"] = {name: hashlib.sha256(live._read_file(

@@ -22,6 +22,10 @@ pub mod diagnostics;
 pub mod cash_wait;
 
 #[cfg(test)]
+#[path = "live_control/tests/startup_history.rs"]
+mod startup_history;
+
+#[cfg(test)]
 #[path = "live_control/tests/r16_cash_drive.rs"]
 mod r16_cash_drive;
 #[cfg(test)]

@@ -334,7 +334,9 @@ impl RoundTaker {
         if let Some((rounds, _, _)) = &self.inputs {
             return Ok(rounds.clone());
         }
-        ctx.client.live_rounds().await
+        ctx.client
+            .live_rounds_for(&self.cfg.symbols, self.cfg.round_interval_secs)
+            .await
     }
 
     async fn read_quote(&mut self, symbol: &str) -> Result<SpotQuote> {
@@ -1114,6 +1116,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_read_rounds_transmits_config_and_rechecks_wire_facts() {
+        use crate::bot::runtime::Broker;
+        use crate::service::predict_fun::discovery::tests::{fixture, round_response, BTC, DIRECTORY};
+        let (client, venue) = fixture();
+        let cfg: AppConfig = serde_json::from_str(include_str!("../../tools/predictfun/btc5m-controlled-paper.json")).unwrap();
+        let ctx = Ctx {
+            cfg: cfg.clone(),
+            data: client.clone(),
+            client,
+            broker: Arc::new(Broker::new(cfg.strategies.limits.clone(), false, None, None).unwrap()),
+        };
+        let mut bot = selection_bot(Some(300));
+        venue.responses.lock().insert(BTC.into(), round_response("BTCUSDT", 300, 1));
+        let rounds = bot.read_rounds(&ctx).await.unwrap();
+        bot.select_rounds(rounds, Utc::now());
+        assert_eq!(bot.rounds.iter().map(|round| round.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(*venue.calls.lock(), vec![DIRECTORY, BTC]);
+        // A target slug cannot override the actual currency, window, strike,
+        // dispute or schedule read on this rescan. These are wire mutations.
+        for fault in ["currency", "window", "strike", "disputed", "future", "expired"] {
+            let mut body = round_response("BTCUSDT", 300, 2);
+            match fault {
+                "currency" => body["data"][0]["variantData"]["priceFeedSymbol"] = "ETHUSDT".into(),
+                "window" => body = round_response("BTCUSDT", 900, 2),
+                "strike" => body["data"][0]["variantData"]["startPrice"] = serde_json::Value::Null,
+                "disputed" => body["data"][0]["markets"][0]["status"] = "PRICE_DISPUTED".into(),
+                "future" => body["data"][0]["startsAt"] = (Utc::now() + chrono::Duration::seconds(100)).to_rfc3339().into(),
+                "expired" => body["data"][0]["endsAt"] = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339().into(),
+                _ => unreachable!(),
+            }
+            venue.responses.lock().insert(BTC.into(), body);
+            let rounds = bot.read_rounds(&ctx).await.unwrap();
+            assert_eq!(rounds.len(), 1, "routing must not fabricate facts");
+            bot.select_rounds(rounds, Utc::now());
+            assert!(bot.rounds.is_empty(), "{fault}");
+        }
+        venue.calls.lock().clear();
+        bot.cfg.symbols = vec!["ETHUSDT".into()];
+        let eth = "/series/eth-updown-5m/rounds?first=2";
+        venue.responses.lock().insert(eth.into(), round_response("ETHUSDT", 300, 3));
+        let rounds = bot.read_rounds(&ctx).await.unwrap();
+        bot.select_rounds(rounds, Utc::now());
+        assert_eq!(bot.rounds[0].id, 3);
+        assert_eq!(*venue.calls.lock(), vec![eth]);
+        venue.calls.lock().clear();
+        bot.cfg.symbols = vec!["BTCUSDT".into()];
+        bot.cfg.round_interval_secs = Some(900);
+        let btc15 = "/series/btc-updown-15m/rounds?first=2";
+        venue.responses.lock().insert(btc15.into(), round_response("BTCUSDT", 900, 4));
+        let rounds = bot.read_rounds(&ctx).await.unwrap();
+        bot.select_rounds(rounds, Utc::now());
+        assert_eq!(bot.rounds[0].id, 4);
+        assert_eq!(*venue.calls.lock(), vec![btc15]);
+        venue.calls.lock().clear();
+        bot.cfg.round_interval_secs = None;
+        bot.read_rounds(&ctx).await.unwrap();
+        assert_eq!(*venue.calls.lock(), vec![btc15, BTC]);
     }
 
     #[test]

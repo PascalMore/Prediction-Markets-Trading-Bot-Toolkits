@@ -14,6 +14,20 @@ SETTLED_BINARY_SHA256 = "9e437aa8fc047bbeccc60d5895e9d3418848819e7be9b16bf080fb2
 SETTLED_FILES_SHA256 = "83b07c5e21547216526189db6d111b82a8b7140c4a5dd17b9394a7e9e745d960"
 
 
+READ_UNAVAILABLE_BINARY_SHA256 = "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1"
+READ_UNAVAILABLE_FILES_SHA256 = "c43ab1fcfa475880520420aa5422e3c7bdc376c88f7aee0c6485f00ff31fd662"
+
+
+def known_read_unavailable(ended: dict) -> bool:
+    """Recognize only the audited, normal-exit, null-detail read stop envelope."""
+    return (ended.get("audit_complete") is True and ended.get("cash_complete") is False
+            and ended.get("execution_complete") is False and ended.get("takeover_required") is True
+            and ended.get("incomplete_reason") == "FACT_INCOMPLETE"
+            and "incomplete_detail" in ended and ended["incomplete_detail"] is None
+            and ended.get("exit_facts") == {"child_returncode": 0, "child_signal": None,
+                "forced_cleanup": False, "launcher_exit": 0, "stop_reason": "READ_UNAVAILABLE"})
+
+
 def known_ended(ended: dict) -> bool:
     """Recognize supported envelopes; qualify still binds each to exact sources."""
     return (ended.get("audit_complete") is True
@@ -32,7 +46,8 @@ def _execution_facts(execution: dict) -> dict:
 
 
 def _check_tail(checkpoint: Any, event: dict, tail: list[dict], relations: Any,
-                stop_detail: str = "UNKNOWN") -> None:
+                stop_detail: str | None = "UNKNOWN",
+                stop_reason: str = "RECONCILIATION_REQUIRED") -> None:
     """Require every event after reconciliation to carry no new economic fact."""
     live.require(bool(tail) and tail[-1] == relations.final
                  and all(frame["event_seq"] == checkpoint.seq + index for index, frame in enumerate(tail, 1))
@@ -62,12 +77,12 @@ def _check_tail(checkpoint: Any, event: dict, tail: list[dict], relations: Any,
             live.require(stops == 0 and decision["phase"] == "EVALUATE"
                          and decision["candidate_id"] is None and decision["selected_token"] is None)
         elif kind == "stop":
-            live.require(payload["reason"] == "RECONCILIATION_REQUIRED"
+            live.require(payload["reason"] == stop_reason
                          and payload["stop_detail"] == stop_detail and stops == 0)
             stops += 1
         elif kind == "recovery":
             live.require(stops == 1 and payload == {"policy": "COLD_START_REFUSE",
-                         "reason": "RECONCILIATION_REQUIRED", "state": "HANDOFF"})
+                         "reason": stop_reason, "state": "HANDOFF"})
         elif kind == "final":
             live.require(stops == 1 and frame == tail[-1])
         else:
@@ -80,6 +95,105 @@ def _check_tail(checkpoint: Any, event: dict, tail: list[dict], relations: Any,
         if before["execution"] is not None:
             live.require(_execution_facts(before["execution"]) == _execution_facts(after["execution"])
                          and after["execution"]["generation"] == generations[key])
+
+
+def qualify_read_unavailable(*, started: dict, ended: dict, relations: Any, checkpoint: Any,
+            checkpoint_event: dict, tail: list[dict], old_native: dict,
+            old_params: dict, seed: dict, initial: dict | None, prefix: list[dict]) -> dict:
+    """Qualify the pinned zero-fill read stop, never a repaired historical final.
+
+    The caller has replayed the entire canonical prefix through LiveRelations
+    and bound native/seed/public C0. Only fresh complete reads may admit a run.
+    """
+    candidate = started["candidate_identity"]
+    live.require(known_read_unavailable(ended)
+                 and candidate["binary_sha256"] == READ_UNAVAILABLE_BINARY_SHA256
+                 and hashlib.sha256(live.canonical(candidate["files"])).hexdigest() == READ_UNAVAILABLE_FILES_SHA256
+                 and checkpoint is not None and initial is not None and relations.final is not None)
+    live.require(relations.final["payload"] == {
+        "audit_complete": True, "cash_complete": False, "execution_complete": False,
+        "positions": [], "run_status": "INCOMPLETE", "stop_detail": None,
+        "stop_reason": "READ_UNAVAILABLE", "takeover_required": True, "unresolved": []}
+        and not relations.latched and not checkpoint.latched and not checkpoint.stopped
+        and not checkpoint.cash_pending and not relations.cash_pending
+        and checkpoint.claims == relations.claims == {}
+        and checkpoint.positions == relations.positions == []
+        and checkpoint.reconciled_open_hashes == relations.reconciled_open_hashes == [])
+    budget, account = old_params["budget"], old_native["account"]
+    live.require(type(seed.get("committed_budget_atoms")) is int
+                 and seed["committed_budget_atoms"] == budget and budget > 0
+                 and account.get("positions") == []
+                 and all(type(account.get(key)) is list for key in ("claimed_win", "settled_zero"))
+                 and initial["event_kind"] == "reconciliation"
+                 and initial["payload"]["scope"] == "STARTUP"
+                 and initial["payload"]["complete"] is True
+                 and not initial["payload"]["foreign_risk"]
+                 and initial["payload"]["positions"] == initial["payload"]["open_hashes"] == []
+                 and initial["payload"]["collateral_atoms"] == account["collateral_atoms"]
+                 and initial["accounting"]["cash"] == str(budget))
+    snapshot, accounting = checkpoint_event["payload"], checkpoint_event["accounting"]
+    live.require(checkpoint_event["event_kind"] == "reconciliation"
+                 and checkpoint_event["event_seq"] == checkpoint.seq
+                 and snapshot["scope"] == "RUNTIME" and snapshot["complete"] is True
+                 and not snapshot["foreign_risk"] and snapshot["open_hashes"] == snapshot["positions"] == []
+                 and snapshot["collateral_atoms"] == account["collateral_atoms"]
+                 and accounting["status"] == "COMPLETE" and accounting["reason"] == "NONE"
+                 and all(accounting[key] == str(budget) for key in ("cash", "nav", "available"))
+                 and all(accounting[key] == "0" for key in ("cost", "reserved", "realized", "unrealized", "net_pnl")))
+    _check_tail(checkpoint, checkpoint_event, tail, relations, None, "READ_UNAVAILABLE")
+    # Never let a healthy last checkpoint erase earlier unknown execution,
+    # fees, inventory or payouts. Transient MAY_HAVE_SUBMITTED/UNKNOWN is the
+    # producer's send intent; every such owner must end as ACCEPTED + Final ZERO.
+    live.require(len(prefix) == relations.seq and prefix[-1] == relations.final
+                 and all(frame["event_seq"] == index for index, frame in enumerate(prefix, 1)))
+    for frame in prefix:
+        payload, book, kind = frame["payload"], frame["accounting"], frame["event_kind"]
+        live.require(not book["loss_latched"] and book["cost"] == "0"
+                     and book["pending_claim_value"] is None and kind != "payout")
+        for key in ("cash", "nav"):
+            live.require(book[key] is None or book[key] == str(budget))
+        for key in ("realized", "unrealized", "net_pnl"):
+            live.require(book[key] in (None, "0"))
+        if kind == "execution":
+            live.require(payload["quantity_class"] == "ZERO" and payload["pages_complete"] is True
+                         and payload["gross_q_atoms"] == payload["accounting_gross_q_atoms"] == "0"
+                         and payload["final_gross_q_atoms"] in (None, "0")
+                         and all(value == "0" for value in payload["delta"].values())
+                         and all(fact == {"atoms": "0", "coverage_gross_atoms": "0",
+                                          "reason": "NONE", "status": "KNOWN"}
+                                 for name, fact in payload["facts"].items() if name != "vwap"))
+        elif kind == "reconciliation" and payload["complete"]:
+            live.require(not payload["foreign_risk"] and payload["positions"] == []
+                         and payload["collateral_atoms"] == account["collateral_atoms"])
+    zero_orders = []
+    for key, attempt in checkpoint.attempts.items():
+        if checkpoint._zero_risk_unsent(attempt):
+            live.require(attempt["hash"] not in seed["declared_orders"])
+            continue
+        execution = attempt["execution"]
+        live.require(attempt["submission"] == "ACCEPTED" and attempt["hash"] is not None
+                     and attempt["venue"] is not None and attempt["remaining"] == 0
+                     and attempt["hash"] not in seed["declared_orders"]
+                     and execution is not None and checkpoint._execution_closed(execution)
+                     and execution["quantity_class"] == "ZERO"
+                     and execution["gross_q_atoms"] == execution["final_gross_q_atoms"] == "0"
+                     and execution["signed_hash"] == attempt["hash"]
+                     and execution["venue_order_id"] == attempt["venue"]
+                     and checkpoint.reconciled_generations.get(key) == execution["generation"]
+                     and all(value == 0 for value in attempt["applied"].values()))
+        zero_orders.append({"signed_hash": attempt["hash"], "venue_order_id": attempt["venue"],
+            "market_id": attempt["identity"][0], "token": attempt["identity"][1],
+            "checkpoint_generation": execution["generation"],
+            "final_generation": relations.attempts[key]["execution"]["generation"]})
+    live.require(bool(zero_orders))
+    return {"proof_kind": "READ_UNAVAILABLE_ZERO_FILL_PLUS_FRESH_NATIVE_REQUIRED",
+            "old_run_id": started["run_id"], "old_stop_detail": None, "old_final_preserved": True,
+            "checkpoint_event_seq": checkpoint.seq, "final_event_seq": relations.seq,
+            "prior_budget_atoms": str(budget), "next_budget_atoms": str(budget),
+            "gross_spend_atoms": "0", "net_loss_atoms": "0", "confirmed_window_claim_atoms": "0",
+            "economic_orders": [], "zero_fill_orders": zero_orders,
+            "window_order_hashes": [item["signed_hash"] for item in zero_orders],
+            "expected_history": {key: list(account[key]) for key in ("claimed_win", "settled_zero")}}
 
 
 def qualify(*, started: dict, ended: dict, relations: Any, checkpoint: Any,

@@ -456,7 +456,10 @@ class LiveRelations:
                     "worst": int(payload["worst_cash_atoms"]), "remaining": int(payload["remaining_atoms"]),
                     "hash": None, "venue": None, "phase": None, "submission": None,
                     "execution": None, "send_observed": False,
-                    "applied": {key: 0 for key in DELTA_NAMES}}
+                    "applied": {key: 0 for key in DELTA_NAMES},
+                    # Known facts an earlier read established, across later
+                    # observations that cannot restate them. It only grows.
+                    "watermark": {"gross_q": None, "facts": {}, "final_gross_q": None}}
             else:
                 attempt = self._attempt(payload, market_token)
                 require(candidate == attempt["candidate"]
@@ -651,7 +654,10 @@ class LiveRelations:
 
     def _closed(self, attempt: dict) -> bool:
         return ((attempt["phase"] == "CLOSED" and attempt["submission"] in ("NOT_SUBMITTED", "REJECTED_FINAL"))
-                or (attempt["execution"] is not None and self._execution_closed(attempt["execution"])))
+                or (attempt["execution"] is not None and self._execution_closed(attempt["execution"]))
+                # A proven closure is knowledge; a later read that cannot
+                # restate it does not reopen the attempt.
+                or attempt.get("watermark", {}).get("final_gross_q") is not None)
 
     def _execution(self, attempt: dict, payload: dict) -> None:
         previous = attempt["execution"]
@@ -659,20 +665,31 @@ class LiveRelations:
             require(payload["generation"] >= previous["generation"])
             if payload["generation"] == previous["generation"]:
                 require(all(payload[key] == previous[key] for key in payload if key != "delta"))
-            for key in ("gross_q_atoms", "accounting_gross_q_atoms"):
-                if previous[key] is not None:
-                    require(payload[key] is not None and int(payload[key]) >= int(previous[key]))
-            for name in FACT_NAMES:
-                before, after = previous["facts"][name], payload["facts"][name]
-                if before["coverage_gross_atoms"] is not None:
-                    require(after["coverage_gross_atoms"] is not None and
-                            int(after["coverage_gross_atoms"]) >= int(before["coverage_gross_atoms"]))
-                if before["status"] == "KNOWN":
-                    require(after["status"] == "KNOWN")
-                    if after["coverage_gross_atoms"] == before["coverage_gross_atoms"]:
-                        require(after["atoms"] == before["atoms"])
-                    elif name != "vwap":
-                        require(int(after["atoms"]) >= int(before["atoms"]))
+        # The producer projects what the venue shows now, so a later read may
+        # know less than an earlier one. An UNKNOWN fact is missing knowledge,
+        # not a contradiction: it never erases what an earlier read
+        # established, and it never authorizes a later sub-bound fact.
+        watermark = attempt.setdefault("watermark", {"gross_q": None, "facts": {},
+                                                     "final_gross_q": None})
+        gross = payload["gross_q_atoms"]
+        if gross is not None:
+            require(watermark["gross_q"] is None or int(gross) >= watermark["gross_q"])
+            watermark["gross_q"] = int(gross)
+        if payload["closure"] == "FINAL":
+            require(watermark["final_gross_q"] is None
+                    or int(payload["final_gross_q_atoms"]) == watermark["final_gross_q"])
+        for name in FACT_NAMES:
+            fact = payload["facts"][name]
+            if fact["status"] != "KNOWN":
+                continue
+            covered, atoms = int(fact["coverage_gross_atoms"]), int(fact["atoms"])
+            known = watermark["facts"].get(name)
+            if known is not None:
+                require(covered >= known[0] and (covered > known[0] or atoms == known[1]))
+                require(name == "vwap" or atoms >= known[1])
+            watermark["facts"][name] = (covered, atoms)
+        if self._execution_closed(payload):
+            watermark["final_gross_q"] = int(payload["final_gross_q_atoms"])
         facts = payload["facts"]
         complete = (payload["gross_q_atoms"] is not None and
                     payload["accounting_gross_q_atoms"] == payload["gross_q_atoms"] and

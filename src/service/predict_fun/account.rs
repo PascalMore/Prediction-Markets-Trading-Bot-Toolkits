@@ -24,6 +24,8 @@ pub mod controlled;
 mod runtime_claims;
 #[cfg(test)]
 mod r16_tests;
+#[cfg(test)]
+pub(crate) mod startup_history_tests;
 
 /// In-memory synthetic test boundary; no socket, real signing or credentials.
 #[cfg(test)]
@@ -301,99 +303,8 @@ impl ChainRead<'_> {
     }
 }
 
-/// The verdict of one account read's position explanation.
-///
-/// Evidence is kept even when the verdict is `false`: a claim whose official
-/// facts are complete but whose cash is not exact is still the venue's own
-/// result, and the runtime consumer verifies it against its own basis.
-#[derive(Debug, Default)]
-struct ExplainedPositions {
-    settled_zero: Vec<SettledZero>,
-    claimed_win: Vec<ClaimedWin>,
-    explained: bool,
-}
-
-/// One confirmed official result, as the account reader bound it to a token.
-struct OfficialSettlement {
-    market_id: u64,
-    oracle_status: String,
-    trading_status: String,
-    outcome_status: String,
-    /// The token's payout per share: `0` for a loss, `0.5` for a tie, `1` for a win.
-    payout: f64,
-}
-
-impl OfficialSettlement {
-    /// The settlement evidence of a token the result pays zero.
-    fn settled_zero(&self, token: &str) -> SettledZero {
-        SettledZero {
-            token: token.to_string(),
-            market_id: self.market_id,
-            oracle_status: self.oracle_status.clone(),
-            trading_status: self.trading_status.clone(),
-            outcome_status: self.outcome_status.clone(),
-            payout_millionths: 0,
-        }
-    }
-
-    /// The claimed-payout evidence for `inventory`, when the payout is positive
-    /// and the claim is a whole number of atoms.
-    fn claimed_win(&self, token: &str, inventory: U256) -> Option<ClaimedWin> {
-        if inventory.is_zero() || !(self.payout > 0.0) {
-            return None;
-        }
-        // The settlement path only pays 0, 0.5 or 1; anything else is not a
-        // result this reader may turn into cash.
-        let millionths = (self.payout * 1_000_000.0).round();
-        if millionths != 500_000.0 && millionths != 1_000_000.0 {
-            return None;
-        }
-        let claim_atoms =
-            crate::bot::runtime::live_accounting::exact_floor_mul(inventory, self.payout)?;
-        if claim_atoms.is_zero() {
-            return None;
-        }
-        Some(ClaimedWin {
-            token: token.to_string(),
-            market_id: self.market_id,
-            oracle_status: self.oracle_status.clone(),
-            trading_status: self.trading_status.clone(),
-            outcome_status: self.outcome_status.clone(),
-            payout_millionths: millionths as u32,
-            inventory_atoms: inventory,
-            claim_atoms,
-        })
-    }
-}
-
-/// One closed historical order's immutable contribution to the ledger.
-///
-/// It exists so a proven final order is not re-read every round: the order's
-/// own facts cannot change, and the account read is on the send path's clock.
-#[derive(Debug, Clone)]
-pub(super) struct ProvenHistoryOrder {
-    /// The token the order traded.
-    pub token: String,
-    /// Which side of the token it took.
-    pub side: crate::models::Side,
-    /// The net inventory it contributed.
-    pub net_inventory: U256,
-}
-
-/// Add one closed order's net inventory to its token's bought/sold total.
-fn add_history_total(
-    totals: &mut HashMap<String, (U256, U256)>,
-    token: &str,
-    side: crate::models::Side,
-    net_inventory: U256,
-) -> anyhow::Result<()> {
-    let (bought, sold) = totals.entry(token.to_string()).or_default();
-    let total = if side == crate::models::Side::Buy { bought } else { sold };
-    *total = total
-        .checked_add(net_inventory)
-        .ok_or_else(|| anyhow::anyhow!("HISTORICAL_INVENTORY_OVERFLOW"))?;
-    Ok(())
-}
+pub(super) mod startup_history;
+pub(super) use startup_history::ProvenHistoryOrder;
 
 impl PredictFunTrader {
     /// Complete account read; any failed prerequisite blocks subsequent orders.
@@ -452,130 +363,6 @@ impl PredictFunTrader {
         Ok(open_orders)
     }
 
-    /// `history` explains `observed` exactly, or a history-only entry is a claim
-    /// the venue's own official result settles: zero for a loss, and its exact
-    /// payout for a win whose cash already arrived. Every other difference
-    /// stays unexplained: a market that hasn't resolved, or one that stopped
-    /// listing inventory without a payout that explains the cash, is still
-    /// missing position risk.
-    async fn explain_positions_mode(
-        &self,
-        history: &HashMap<String, U256>,
-        observed: &HashMap<String, U256>,
-        collateral_atoms: U256,
-        runtime: bool,
-    ) -> anyhow::Result<ExplainedPositions> {
-        // An observed position the history doesn't carry is unexplained risk,
-        // whether it is extra or a different amount.
-        if observed
-            .iter()
-            .any(|(token, amount)| history.get(token) != Some(amount))
-        {
-            return Ok(ExplainedPositions::default());
-        }
-        let mut settled_zero = Vec::new();
-        let mut claimed_win = Vec::new();
-        for (token, amount) in history {
-            match observed.get(token) {
-                Some(held) if held == amount => {}
-                Some(_) => return Ok(ExplainedPositions::default()),
-                None => match self.official_settlement(token).await? {
-                    Some(settlement) if settlement.payout == 0.0 => {
-                        settled_zero.push(settlement.settled_zero(token))
-                    }
-                    Some(settlement) => match settlement.claimed_win(token, *amount) {
-                        Some(basis) => claimed_win.push(basis),
-                        None => return Ok(ExplainedPositions::default()),
-                    },
-                    None => return Ok(ExplainedPositions::default()),
-                },
-            }
-        }
-        // A claimed payout is only explained by the exact cash increase over
-        // the declared pre-claim C0. No declared budget, an unknown balance, or
-        // one atom of difference keeps the claim unexplained.
-        // Runtime collateral is reconciled against the opening account and
-        // trade-only deltas by the broker, never against C0 plus old income.
-        let explained = claimed_win.is_empty()
-            || (!runtime && self.claimed_cash_matches(collateral_atoms, &claimed_win));
-        Ok(ExplainedPositions {
-            settled_zero,
-            claimed_win,
-            explained,
-        })
-    }
-
-    /// Whether the observed cash is exactly the declared budget plus the claims.
-    fn claimed_cash_matches(&self, collateral_atoms: U256, claims: &[ClaimedWin]) -> bool {
-        let Some(budget) = self
-            .run_context
-            .read()
-            .as_ref()
-            .and_then(|context| context.budget_atoms)
-        else {
-            return false;
-        };
-        let Some(claimed) = claims
-            .iter()
-            .try_fold(U256::ZERO, |total, claim| total.checked_add(claim.claim_atoms))
-        else {
-            return false;
-        };
-        budget.checked_add(claimed) == Some(collateral_atoms)
-    }
-
-    /// The venue's own official result for `token`, when it confirms a payout.
-    ///
-    /// Reuses the settlement verdict the controlled live path applies to the
-    /// same facts: only a confirmed result pays, and an exact tie pays half.
-    async fn official_settlement(&self, token: &str) -> anyhow::Result<Option<OfficialSettlement>> {
-        use crate::bot::runtime::paper::{settle_from_facts, settlement_payout, Settlement};
-        use crate::service::venue::MarketData;
-        let known = self.client.market_for_token(token)?;
-        // The market alone carries no round prices: read it the same way the
-        // controlled settlement path reads an official result.
-        let market = self.client.settlement_market(known.id).await?;
-        // Compare against the pre-read binding: market() refreshes the cache.
-        // A matching market id alone cannot identify a claim or its side.
-        let known_yes = known.outcomes.first().map(|outcome| outcome.on_chain_id.as_str());
-        let known_no = known.outcomes.get(1).map(|outcome| outcome.on_chain_id.as_str());
-        if market.id != known.id || known.outcomes.len() != 2
-            || market.yes_token.is_empty() || market.no_token.is_empty()
-            || market.yes_token == market.no_token
-            || known_yes != Some(market.yes_token.as_str())
-            || known_no != Some(market.no_token.as_str())
-            || (token != market.yes_token && token != market.no_token)
-        {
-            return Ok(None);
-        }
-        let (Some(facts), Some((start, end))) = (
-            market.round_facts.as_ref(),
-            market.start_price.zip(market.end_price),
-        ) else {
-            return Ok(None);
-        };
-        if settle_from_facts(&market, facts, start, end) != Settlement::Confirmed {
-            return Ok(None);
-        }
-        let Some(up_payout) = settlement_payout(&market, start, end) else {
-            return Ok(None);
-        };
-        let yes = market.is_yes(token);
-        let payout = if yes { up_payout } else { 1.0 - up_payout };
-        let status = if yes {
-            &facts.yes_status
-        } else {
-            &facts.no_status
-        };
-        Ok(Some(OfficialSettlement {
-            market_id: market.id,
-            oracle_status: facts.oracle_status.clone().unwrap_or_default(),
-            trading_status: facts.trading_status.clone().unwrap_or_default(),
-            outcome_status: status.clone().unwrap_or_default(),
-            payout,
-        }))
-    }
-
     /// Read all position pages; duplicate tokens and cursor loops are ambiguous.
     pub(super) async fn read_positions(&self) -> anyhow::Result<Vec<(String, U256)>> {
         let mut cursor: Option<String> = None;
@@ -598,6 +385,7 @@ impl PredictFunTrader {
                 )
                 .await.map_err(|error| super::request::account_read_error(error, "POSITIONS"))?;
             for position in page.data {
+                self.check_history_market(&position.market)?;
                 self.client.remember_market(&position.market);
                 if out
                     .iter()
@@ -623,198 +411,6 @@ impl PredictFunTrader {
         anyhow::bail!("READ_UNAVAILABLE:PAGE_CAP")
     }
 
-    /// Require complete account history and actually re-read every declared hash.
-    /// A declaration never makes an executable or incompletely accounted order safe.
-    pub(super) async fn reconcile_account_history(&self) -> anyhow::Result<HashMap<String, U256>> {
-        use super::{decimal_to_wei_exact, ApiMatch, ApiOrderData};
-        use crate::models::Side;
-        use crate::service::venue::{AttemptRecord, OrderIdentity, Submission};
-        let identity = self.identity();
-        let declared = self
-            .run_context
-            .read()
-            .as_ref()
-            .map(|context| context.reconciled_orders.clone())
-            .unwrap_or_default();
-        let mut hashes = std::collections::HashSet::new();
-        let mut cursor: Option<String> = None;
-        let mut cursors = std::collections::HashSet::new();
-        let mut fingerprints = std::collections::HashSet::new();
-        let mut complete = false;
-        for _ in 0..super::fills::MAX_PAGES {
-            let mut url = url::Url::parse("https://synthetic.invalid/orders/matches").unwrap();
-            {
-                let mut query = url.query_pairs_mut();
-                query
-                    .append_pair("first", "100")
-                    .append_pair("signerAddress", &identity.trading_address);
-                if let Some(cursor) = &cursor {
-                    query.append_pair("after", cursor);
-                }
-            }
-            let path = format!("{}?{}", url.path(), url.query().unwrap());
-            let page = self
-                .authed::<Vec<ApiMatch>>(reqwest::Method::GET, &path, None)
-                .await.map_err(|error| super::request::account_read_error(error, "MATCHES"))?;
-            for event in page.data {
-                if !fingerprints.insert(format!("{event:?}")) {
-                    anyhow::bail!("FACT_INCOMPLETE:AMBIGUOUS_MATCH_DUPLICATE");
-                }
-                self.client.remember_market(&event.market);
-                for leg in std::iter::once(&event.taker).chain(event.makers.iter()) {
-                    if leg.signer.eq_ignore_ascii_case(&identity.trading_address) {
-                        validate_order_hash(&leg.hash)?;
-                        hashes.insert(leg.hash.clone());
-                    }
-                }
-            }
-            match page.cursor.filter(|c| !c.is_empty()) {
-                None => {
-                    complete = true;
-                    break;
-                }
-                Some(next) => {
-                    if !cursors.insert(next.clone()) {
-                        anyhow::bail!("READ_UNAVAILABLE:PAGINATION_LOOP");
-                    }
-                    cursor = Some(next);
-                }
-            }
-        }
-        if !complete {
-            anyhow::bail!("READ_UNAVAILABLE:PAGE_CAP");
-        }
-        hashes.extend(declared.iter().cloned());
-        let mut totals: HashMap<String, (U256, U256)> = HashMap::new();
-        for hash in hashes {
-            // This run's bound orders are reconciled by its owning consumer.
-            if self.bound_orders.read().contains_key(&hash) {
-                continue;
-            }
-            if !declared
-                .iter()
-                .any(|declared| declared.eq_ignore_ascii_case(&hash))
-            {
-                anyhow::bail!("RECONCILIATION_REQUIRED:UNEXPLAINED_HISTORY");
-            }
-            // A closed order's own facts never change. An order this reader
-            // already proved final contributes its inventory without being
-            // read again; the `/orders/matches` scan above still runs every
-            // round, so a new, undeclared hash is refused exactly as before.
-            if let Some(proven) = self.history_proven.read().get(&hash).cloned() {
-                add_history_total(&mut totals, &proven.token, proven.side, proven.net_inventory)?;
-                continue;
-            }
-            let data = self
-                .authed::<ApiOrderData>(reqwest::Method::GET, &format!("/orders/{hash}"), None)
-                .await.map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?
-                .data;
-            let contract = data
-                .order
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:MISSING_CONTRACT_ORDER"))?;
-            let token = contract
-                .token_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:MISSING_TOKEN"))?;
-            // A declared zero-fill order has neither positions nor matches to seed the cache.
-            let market = match self.client.market_for_token(&token) {
-                Ok(market) => market,
-                Err(_) => self.client.get::<ApiMarket>(&format!("/markets/{}", data.market_id))
-                    .await.map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?
-                    .data,
-            };
-            if market.id != data.market_id || market.outcomes.len() != 2
-                || market.outcomes[0].on_chain_id == market.outcomes[1].on_chain_id
-                || !market.outcomes.iter().any(|outcome| outcome.on_chain_id == token)
-                || self.client.markets.read().values().any(|known|
-                    (known.id == market.id || known.outcomes.iter().any(|old|
-                        market.outcomes.iter().any(|fresh| old.on_chain_id == fresh.on_chain_id)))
-                    && (known.id != market.id || known.outcomes.len() != 2
-                        || known.outcomes.iter().zip(&market.outcomes)
-                            .any(|(old, fresh)| old.on_chain_id != fresh.on_chain_id)))
-            {
-                return Err(mismatch("TOKEN_MISMATCH").into());
-            }
-            self.client.remember_market(&market);
-            let side = match contract.side {
-                Some(0) => Side::Buy,
-                Some(1) => Side::Sell,
-                _ => anyhow::bail!("FACT_INCOMPLETE:SIDE"),
-            };
-            let maker = decimal_to_wei_exact(
-                contract
-                    .maker_amount
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:AMOUNT"))?,
-            )?;
-            let taker = decimal_to_wei_exact(
-                contract
-                    .taker_amount
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:AMOUNT"))?,
-            )?;
-            let requested = if side == Side::Buy { taker } else { maker };
-            let bound = super::fills::BoundOrder {
-                handle: Arc::new(parking_lot::Mutex::new(AttemptRecord {
-                    identity: OrderIdentity {
-                        local_attempt_id: 0,
-                        signed_hash: Some(hash.clone()),
-                        venue_order_id: Some(data.id.clone()),
-                        market_id: data.market_id,
-                        token_id: token,
-                        side,
-                        account: identity.clone(),
-                    },
-                    request_gross_atoms: requested,
-                    r0: maker,
-                    reserved_sell: U256::ZERO,
-                    phase: AttemptPhase::Submitted,
-                    submission: Submission::Unknown,
-                    last_reason: None,
-                })),
-                market,
-                requested,
-                maker_amount: maker,
-                taker_amount: taker,
-                expiration: contract
-                    .expiration
-                    .ok_or_else(|| anyhow::anyhow!("FACT_INCOMPLETE:EXPIRATION"))?,
-            };
-            let snapshot = self.read_order_execution(&hash, &bound).await
-                .map_err(|error| super::request::account_read_error(error, "HISTORY_ORDER"))?;
-            if !snapshot.pages_complete
-                || !snapshot.accounting_complete()
-                || !matches!(
-                    snapshot.closure,
-                    crate::service::venue::Closure::Final { .. }
-                )
-            {
-                anyhow::bail!("RECONCILIATION_REQUIRED:HISTORY_NOT_CLOSED");
-            }
-            let (bought, sold) = totals.entry(snapshot.identity.token_id.clone()).or_default();
-            let total = if side == Side::Buy { bought } else { sold };
-            let net_inventory = *snapshot.accounting.net_inventory.value().unwrap();
-            *total = total
-                .checked_add(net_inventory)
-                .ok_or_else(|| anyhow::anyhow!("HISTORICAL_INVENTORY_OVERFLOW"))?;
-            self.history_proven.write().insert(hash, ProvenHistoryOrder {
-                token: snapshot.identity.token_id.clone(), side, net_inventory,
-            });
-        }
-        totals
-            .into_iter()
-            .filter(|(_, (bought, sold))| bought != sold)
-            .map(|(token, (bought, sold))| {
-                Ok((
-                    token,
-                    bought
-                        .checked_sub(sold)
-                        .ok_or_else(|| anyhow::anyhow!("HISTORICAL_INVENTORY_CONFLICT"))?,
-                ))
-            })
-            .collect()
-    }
 }
 
 impl ChainRead<'_> {
@@ -2293,6 +1889,7 @@ pub(crate) mod tests {
             markets: parking_lot::RwLock::new(HashMap::new()),
             categories: parking_lot::RwLock::new(HashMap::new()),
             events: parking_lot::RwLock::new(HashMap::new()),
+            series_directory: Default::default(),
             synthetic: Some(transport.clone()),
         });
         let trader = PredictFunTrader {
@@ -2304,6 +1901,7 @@ pub(crate) mod tests {
             generations: parking_lot::RwLock::new(HashMap::new()),
             bound_orders: parking_lot::RwLock::new(HashMap::new()),
             history_proven: parking_lot::RwLock::new(HashMap::new()),
+            startup_history: parking_lot::RwLock::new(Default::default()),
             run_context: parking_lot::RwLock::new(Some(RunContext {
                 rpc_url: Some(parse_rpc_url("https://synthetic.invalid").unwrap()),
                 ..RunContext::default()

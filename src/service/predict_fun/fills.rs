@@ -63,6 +63,15 @@ pub(super) fn cash_with_fee(cash: U512, bps: u32) -> Result<U256> {
 
 #[async_trait]
 impl OrderVenue for PredictFunTrader {
+    fn begin_startup_history(&self, run_id: &str, risk_window_id: &str) -> Result<()> {
+        self.begin_history(run_id, risk_window_id)
+    }
+
+    fn commit_startup_history(&self, run_id: &str, risk_window_id: &str,
+        snapshot: &AccountSnapshot) -> Result<()> {
+        self.commit_history(run_id, risk_window_id, snapshot)
+    }
+
     fn id(&self) -> VenueId {
         VenueId::PredictFun
     }
@@ -1388,9 +1397,8 @@ fn fee_fact(leg: &super::ApiLeg) -> Result<FeeFact> {
 
 /// Add up the account's own legs.
 ///
-/// The gross cash is an exact rational: `sum(q_i * p_i) / 10^36`. The division
-/// keeps its remainder, so a price that isn't representable in collateral
-/// atoms isn't silently rounded away.
+/// Gross cash is the sum of per-leg integer quotients, a quote-derived candidate
+/// that must match the original settled() receipt and transfer checks exactly.
 pub fn cumulative(legs: &[OwnLeg], venue_gross_q: U256) -> Result<CumulativeFacts> {
     let mut gross_q_atoms = U256::ZERO;
     let mut gross_cash_atoms = U256::ZERO;
@@ -1402,13 +1410,10 @@ pub fn cumulative(legs: &[OwnLeg], venue_gross_q: U256) -> Result<CumulativeFact
         gross_q_atoms = gross_q_atoms
             .checked_add(leg.q_atoms)
             .ok_or_else(|| anyhow!("CUMULATIVE_OVERFLOW"))?;
-        // q and p are both 18-decimal, so their product is 36-decimal. Keep the
-        // product in collateral atoms: divide by 10^18 and keep the remainder.
+        // q and p are both 18-decimal. Floor each leg in collateral atoms;
+        // only the unchanged chain settlement checks can prove this candidate.
         let product = U512::from(leg.q_atoms) * U512::from(leg.p_atoms);
-        let (whole, remainder) = product.div_rem(U512::from(WEI));
-        if !remainder.is_zero() {
-            bail!("NON_ATOMIC_CASH");
-        }
+        let whole = product / U512::from(WEI);
         let whole = U256::from_str_radix(&whole.to_string(), 10)
             .map_err(|_| anyhow!("CUMULATIVE_OVERFLOW"))?;
         gross_cash_atoms = gross_cash_atoms
@@ -1574,7 +1579,7 @@ pub(crate) mod tests {
     pub(crate) struct Scenario {
         pub(crate) base: Arc<SyntheticRpc>,
         pub(crate) mode: Mutex<&'static str>,
-        paths: Mutex<Vec<String>>,
+        pub(crate) paths: Mutex<Vec<String>>,
         refreshes: AtomicUsize,
         get401: AtomicUsize,
         position_pages: AtomicUsize,
@@ -1591,6 +1596,52 @@ pub(crate) mod tests {
         }
         fn rpc(&self, method: &str, params: &Value) -> std::result::Result<Value, VenueError> {
             let mode = *self.mode.lock();
+            if mode.starts_with("history_r20") {
+                if method == "eth_getTransactionReceipt" {
+                    let tx = params[0].as_str().unwrap();
+                    self.paths.lock().push(format!("receipt:{tx}"));
+                    let mut receipt = self.base.rpc(method, params)?;
+                    let first = tx.ends_with('1');
+                    // Independent fixed actual amounts, not computed by cumulative().
+                    let (q, cash, fee) = if first {
+                        (349533875338742820u128, 132822872628722271u128, 6990677506774856u128)
+                    } else {
+                        (2280466124661257179, 866577127371277728, 45609322493225143)
+                    };
+                    let mut event_cash = cash;
+                    let mut transfer_cash = cash;
+                    let mut event_fee = fee;
+                    let mut inventory = q - fee;
+                    let delta = if mode.ends_with("minus") { -1i128 } else { 1 };
+                    let shift = |amount: u128| (amount as i128 + delta) as u128;
+                    if first && mode.contains("event_cash") {
+                        event_cash = shift(cash);
+                        transfer_cash = event_cash;
+                    }
+                    if first && mode.contains("transfer_cash") { transfer_cash = shift(cash); }
+                    if mode == "history_r20_offset" {
+                        event_cash = if first { cash + 1 } else { cash - 1 };
+                        transfer_cash = event_cash;
+                    }
+                    if first && mode.contains("event_fee") { event_fee = shift(fee); }
+                    if first && mode.contains("inventory") { inventory = shift(inventory); }
+                    let words = |values: &[u128]| json!(format!("0x{}",
+                        values.iter().map(|v| format!("{v:064x}")).collect::<String>()));
+                    receipt["logs"][0]["data"] = words(&[0, 77, event_cash, q, event_fee]);
+                    receipt["logs"][1]["data"] = words(&[transfer_cash]);
+                    receipt["logs"][2]["data"] = words(&[77, inventory]);
+                    return Ok(receipt);
+                }
+                if method == "eth_call" {
+                    use alloy_sol_types::SolCall;
+                    let data = params[0]["data"].as_str().unwrap();
+                    if data.starts_with(&format!("0x{}",
+                        hex::encode(account::ExchangeRead::getOrderStatusCall::SELECTOR))) {
+                        return Ok(json!(format!("0x{:064x}{:064x}",
+                            usize::from(mode != "history_r20_open"), 1)));
+                    }
+                }
+            }
             if method == "eth_call"
                 && ((mode == "fee_funds"
                     && params[0]["data"]
