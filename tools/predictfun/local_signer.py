@@ -26,9 +26,9 @@ from jeepney.io.blocking import DBusConnection, prep_socket
 
 BOT = Path(__file__).resolve().parents[2]
 REPORT_ROOT = BOT.parents[4] / "data/reports"
-RECONCILE_BINARY = (REPORT_ROOT / "2026-11-26-btc5m-history-not-closed-root-cause/evidence"
-                    / "candidate-r20/btc5m_reconcile")
-RECONCILE_SHA256 = "76be9d3a85f6c93194fae217f1d7b8e7360e2eb1ba1e4233b3639785cbb1efd2"
+RECONCILE_BINARY = (REPORT_ROOT / "2026-11-27-btc5m-fact-incomplete-stop/evidence"
+                    / "closed-reread-bound-candidate/btc5m_reconcile")
+RECONCILE_SHA256 = "178b251f0e23fdbc6a282471418b75aeecccc20a155ecbce316bd7c23b259f08"
 SIGNER = "0x5129330159f4E6a99eF873f86901E3cafa7f9A7D"
 TRADING_ADDRESS = "0xfc9eb66e6F22f96608058C0A711Ed048eED8c2E2"
 SERVICE = "org.freedesktop.Secret.Service"

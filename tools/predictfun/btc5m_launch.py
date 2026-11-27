@@ -747,7 +747,47 @@ def history_for_window(existing: dict, account: dict) -> list[str]:
     return _stopped_window(existing, account)["orders"]
 
 
-def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
+def _pre_send_window(previous: Path, reports: Path, existing: dict, old_bytes: bytes,
+                     now: dt.datetime) -> dict[str, Any]:
+    """Read only the exact frozen sources once, under the caller's original lock."""
+    import stat
+    import btc5m_pre_send_exit_recovery as recovery
+
+    seeds = list(reports.glob(f"*/evidence/launch-attempts/{recovery.RUN}/attempt-reserved.json"))
+    if ([previous] != [ROOT / recovery.R]
+            or seeds != [ROOT / recovery.A / "attempt-reserved.json"]):
+        raise Refused("HISTORY_MISSING_OR_AMBIGUOUS")
+    files, artifacts = {}, {}
+    try:
+        for name in sorted(recovery.BYTE_PATHS | recovery.ARTIFACTS.keys()):
+            path = ROOT / name
+            if path.resolve(strict=True) != path.absolute():
+                raise Refused("HISTORY_IDENTITY")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise Refused("HISTORY_IDENTITY")
+                if name in recovery.ARTIFACTS:
+                    if info.st_size > 256 * 1024 * 1024:
+                        raise Refused("HISTORY_IDENTITY")
+                    artifacts[name] = hashlib.file_digest(stream, "sha256").hexdigest(), stat.S_IMODE(info.st_mode)
+                else:
+                    limit = 64 * 1024 if path.name == "live-context.json" else 1024 * 1024
+                    raw = stream.read(limit + 1)
+                    if len(raw) > limit:
+                        raise Refused("HISTORY_IDENTITY")
+                    files[name] = raw
+        return recovery.qualify(files, artifacts, existing=existing, old_bytes=old_bytes,
+                                now=now, max_age=MAX_RECONCILIATION_AGE_SECONDS)
+    except OSError:
+        raise Refused("HISTORY_IDENTITY") from None
+    except recovery.Rejected as error:
+        raise Refused(error.reason) from None
+
+
+def _stopped_window(existing: dict, account: dict, *, old_bytes: bytes | None = None,
+                    now: dt.datetime | None = None) -> dict[str, Any]:
     """Read the stopped window's own audit and say what kind of stop it was.
 
     The returned facts are the window's committed cash, its unresolved orders
@@ -766,10 +806,12 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
     if len(paths) != 1:
         raise Refused("HISTORY_MISSING_OR_AMBIGUOUS")
     previous = paths[0].parent
-    started = live.strict_json(live._read_file(paths[0], 1024 * 1024))
-    ended = live.strict_json(live._read_file(previous / "ended.json", 1024 * 1024))
-    public = live.strict_json(live._read_file(previous / "public-config.json", 1024 * 1024))
-    context = live.strict_json(live._read_file(previous / "live-context.json", live.MAX_LINE_BYTES))
+    if run == "btc5m-live-4d0577d73dee4106" and old_bytes is not None and now is not None:
+        return _pre_send_window(previous, reports, existing, old_bytes, now)
+    metadata = {name: live._read_file(previous / name, limit) for name, limit in (
+        ("started.json", 1024 * 1024), ("ended.json", 1024 * 1024),
+        ("public-config.json", 1024 * 1024), ("live-context.json", live.MAX_LINE_BYTES))}
+    started, ended, public, context = map(live.strict_json, metadata.values())
     live.check_metadata(started, public, context)
     if (started.get("run_id") != run or ended.get("run_id") != run
             or started.get("account_identity") != account
@@ -783,9 +825,10 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
     seeds = list(reports.glob(f"*/evidence/launch-attempts/{run}/attempt-reserved.json"))
     budget = None
     seed_budget = None
-    seed = None
+    seed = seed_raw = None
     if len(seeds) == 1:
-        seed = live.strict_json(live._read_file(seeds[0], 1024 * 1024))
+        seed_raw = live._read_file(seeds[0], 1024 * 1024)
+        seed = live.strict_json(seed_raw)
         if seed.get("run_id") != run:
             raise Refused("HISTORY_IDENTITY")
         orders = seed["declared_orders"]
@@ -881,23 +924,26 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
                 or not _reconciled_identity_matches(old_native.get("account_identity"))):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         stop_raw = live._read_file(previous / "stop-output.json", 1024 * 1024)
+        source_sha256 = {name: hashlib.sha256(value).hexdigest() for name, value in {
+            **metadata, "stop-output.json": stop_raw, "seed": seed_raw, "native": raw}.items()}
+        source_sha256["events.jsonl"] = prefix_hash.hexdigest()
+        execution = run == payout_recovery.EXECUTION_RUN
+        if execution and live.canonical(checked["data"]) != live.canonical(public):
+            raise Refused("HISTORY_REQUIRES_TAKEOVER")
+        qualifier = payout_recovery.qualify_execution if execution else payout_recovery.qualify
         try:
-            recovery = payout_recovery.qualify(
-                started=started, ended=ended, relations=relations, last=event,
+            recovery = qualifier(started=started, ended=ended, relations=relations, last=event,
                 record=live.strict_json(stop_raw), old_native=old_native,
-                old_params=checked["params"], seed=seed, initial=first_reconciliation)
-        except live.LiveInvalid:
+                old_params=checked["params"], seed=seed, initial=first_reconciliation,
+                **({"order_events": order_events, "source_sha256": source_sha256, "root": ROOT}
+                   if execution else {}))
+        except (live.LiveInvalid, OSError):
             raise Refused("HISTORY_REQUIRES_TAKEOVER") from None
-        recovery["source_sha256"] = {name: hashlib.sha256(live._read_file(
-            previous / name, 1024 * 1024)).hexdigest() for name in
-            ("started.json", "public-config.json", "live-context.json", "ended.json", "stop-output.json")}
-        recovery["source_sha256"]["events.jsonl"] = prefix_hash.hexdigest()
-        recovery["source_sha256"]["seed"] = hashlib.sha256(live._read_file(seeds[0], 1024 * 1024)).hexdigest()
-        recovery["source_sha256"]["native"] = hashlib.sha256(raw).hexdigest()
+        recovery["source_sha256"] = source_sha256
         for owner in recovery["economic_orders"]:
             if owner["signed_hash"] not in orders:
                 orders.append(owner["signed_hash"])
-        return {"kind": "PAYOUT_AUDIT", "orders": orders,
+        return {"kind": "EXECUTION_AUDIT" if execution else "PAYOUT_AUDIT", "orders": orders,
                 "budget_atoms": int(recovery["next_budget_atoms"]),
                 "unresolved": [], "recovery": recovery}
     live.check_ended(ended, started, relations)
@@ -912,8 +958,9 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
         # qualify, but only on its own complete evidence.
         kind = _unsent_edge_kind(ended, final, accounting, exit_facts,
                                   order_events, event_kinds) or "REFUSE"
-    if kind == "REFUSE" and (account_recovery.known_ended(ended) or read_unavailable):
-        if seed is None or anchor is None or budget != seed_budget or not prefix_canonical:
+    r20_stop = account_recovery.known_r20_fact_incomplete(ended)
+    if kind == "REFUSE" and (account_recovery.known_ended(ended) or read_unavailable or r20_stop):
+        if seed is None or seed_raw is None or anchor is None or budget != seed_budget or not prefix_canonical:
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         native_path = seeds[0].parent / "reconciliation.json"
         raw = live._read_file(native_path, 1024 * 1024)
@@ -923,22 +970,22 @@ def _stopped_window(existing: dict, account: dict) -> dict[str, Any]:
         checked = preflight(previous / "public-config.json", native_path,
                             now=_parse_time(started["started_at"]), declared_orders=seed["declared_orders"])
         if (checked["reconciliation_sha256"] != hashlib.sha256(raw).hexdigest()
-                or not _reconciled_identity_matches(old_native.get("account_identity"))):
+                or not _reconciled_identity_matches(old_native.get("account_identity"))
+                or (r20_stop and live.canonical(checked["data"]) != live.canonical(public))):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         try:
-            qualifier = (account_recovery.qualify_read_unavailable if read_unavailable
-                         else account_recovery.qualify)
+            qualifier = (account_recovery.qualify_read_unavailable if read_unavailable else
+                         account_recovery.qualify_r20 if r20_stop else account_recovery.qualify)
             recovery = qualifier(started=started, ended=ended, relations=relations,
                 checkpoint=checkpoint, checkpoint_event=checkpoint_event, tail=tail,
                 old_native=old_native, old_params=checked["params"], seed=seed, initial=first_reconciliation,
                 **({"prefix": recovery_prefix} if read_unavailable else {}))
         except live.LiveInvalid:
             raise Refused("HISTORY_REQUIRES_TAKEOVER") from None
-        recovery["source_sha256"] = {name: hashlib.sha256(live._read_file(
-            previous / name, 1024 * 1024)).hexdigest() for name in
-            ("started.json", "public-config.json", "live-context.json", "ended.json")}
+        recovery["source_sha256"] = {name: hashlib.sha256(value).hexdigest()
+                                     for name, value in metadata.items()}
         recovery["source_sha256"].update(events=prefix_hash.hexdigest(), native=hashlib.sha256(raw).hexdigest(),
-            seed=hashlib.sha256(live._read_file(seeds[0], 1024 * 1024)).hexdigest())
+            seed=hashlib.sha256(seed_raw).hexdigest())
         window_orders = recovery.get("window_order_hashes",
                                      [owner["signed_hash"] for owner in recovery["economic_orders"]])
         for order in window_orders:
@@ -1030,6 +1077,34 @@ def _account_facts(account: dict) -> dict[str, Any]:
     return facts
 
 
+def _pre_send_fresh(result: dict, output: Path, orders: list[str], stopped: dict,
+                    earliest: dt.datetime) -> tuple[str, dict]:
+    """Bind the account facts to this particular complete native sample."""
+    import btc5m_live_events as live
+    import btc5m_pre_send_exit_recovery as recovery
+
+    if type(result['exit_code']) is not int or result['exit_code'] != 0:
+        raise Refused('RECONCILIATION_NOT_COMPLETE')
+    try:
+        raw = live._read_file(output, 1024 * 1024)
+        value = live.strict_json(raw)
+        if live.canonical(value) != live.canonical(result['projection']):
+            raise Refused('RECONCILIATION_FACTS')
+        recovery.sample(value, earliest=earliest, now=dt.datetime.now(dt.timezone.utc),
+                        max_age=MAX_RECONCILIATION_AGE_SECONDS)
+        matches = recovery.fresh_history_matches(stopped['recovery'], value)
+        cash, claims = _cash_snapshot(value, orders, require_complete=True)
+        if not matches:
+            raise Refused('HISTORY_REQUIRES_TAKEOVER')
+        if cash - claims != stopped['budget_atoms']:
+            raise Refused('CASH_BUDGET_MISMATCH')
+        return hashlib.sha256(raw).hexdigest(), value
+    except recovery.Rejected as error:
+        raise Refused(error.reason) from None
+    except (live.LiveInvalid, KeyError, TypeError, ValueError):
+        raise Refused('RECONCILIATION_FACTS') from None
+
+
 def prepare_account(args: argparse.Namespace, directory: Path, environment: dict,
                    stopped: dict[str, Any] | None = None) -> None:
     """Two fixed native reads, exact C0 and one declaration list; no order calls."""
@@ -1051,25 +1126,33 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
     # Unfilled orders retain old C0; a filled zero-payout candidate deducts only
     # its audited cost. Healthy/pending-payout preparation retains its old path.
     # A fresh balance never supplies the anchor for either restricted recovery.
+    presend = stopped if stopped is not None and stopped["kind"] == "PRE_SEND_EXIT" else None
     anchor = None
     if stopped is not None and stopped["kind"] in {"UNFILLED_ORDER", "FILLED_INVENTORY",
-                                                   "UNSENT_EDGE", "PAYOUT_AUDIT", "ACCOUNT_READ"}:
+            "UNSENT_EDGE", "PAYOUT_AUDIT", "ACCOUNT_READ", "EXECUTION_AUDIT", "PRE_SEND_EXIT"}:
         anchor = stopped["budget_atoms"]
     if anchor is not None:
         data["controlled_run"] = {"budget_usdt": _atoms_text(anchor),
                                   "duration_seconds": settings.get("duration_seconds", 86400),
                                   "operations_mode": args.operations_mode}
         control.check_fixed_values(data, control.MODE_SIGNED_FUTURE_LIVE)
-        if (stopped["kind"] in {"FILLED_INVENTORY", "PAYOUT_AUDIT", "ACCOUNT_READ"}
+        if (stopped["kind"] in {"FILLED_INVENTORY", "PAYOUT_AUDIT", "ACCOUNT_READ", "EXECUTION_AUDIT"}
                 and int(stopped["recovery"]["net_loss_atoms"]) >= control.parameters(data)["loss"]):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
     first_config = directory / "account-read-config.json"
     live._create_file(first_config, live.canonical(data) + b"\n")
+    first_path = directory / "reconciliation-pass-1.json"
+    first_started = dt.datetime.now(dt.timezone.utc) if presend else None
+    fresh_digests: list[str] = []
     first = control.local_signer.reconcile_account(
-        first_config, args.rpc_url, args.declared_order, directory / "reconciliation-pass-1.json",
-        environment=environment)
+        first_config, args.rpc_url, args.declared_order, first_path, environment=environment)
     first_value = first["projection"]
-    if anchor is not None:
+    if presend is not None and first_started is not None:
+        first_digest, first_value = _pre_send_fresh(first, first_path, args.declared_order,
+                                                    presend, first_started)
+        fresh_digests.append(first_digest)
+        budget = _atoms_text(presend["budget_atoms"])
+    elif anchor is not None:
         # An anchored first read is a complete reconciliation like the second:
         # a partial read may not open a new window.
         if first["exit_code"] != 0:
@@ -1084,7 +1167,7 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
         if (stopped["kind"] == "UNSENT_EDGE"
                 and not _history_preserved(stopped["recovery"], first_value)):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
-        if (stopped["kind"] in {"PAYOUT_AUDIT", "ACCOUNT_READ"}
+        if (stopped["kind"] in {"PAYOUT_AUDIT", "ACCOUNT_READ", "EXECUTION_AUDIT"}
                 and not payout_recovery.fresh_history_matches(stopped["recovery"], first_value)):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
     else:
@@ -1097,17 +1180,31 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
         "operations_mode": args.operations_mode}
     config = directory / "public-config.json"
     live._create_file(config, live.canonical(data) + b"\n")
+    second_path = directory / "reconciliation-pass-2.json"
+    second_started = dt.datetime.now(dt.timezone.utc) if presend else None
     second = control.local_signer.reconcile_account(
-        config, args.rpc_url, args.declared_order, directory / "reconciliation-pass-2.json",
-        environment=environment)
+        config, args.rpc_url, args.declared_order, second_path, environment=environment)
     value = second["projection"]
-    if second["exit_code"] != 0:
-        raise Refused("RECONCILIATION_NOT_COMPLETE")
-    _cash_snapshot(value, args.declared_order, require_complete=True)
+    if presend is not None and second_started is not None:
+        second_digest, value = _pre_send_fresh(second, second_path, args.declared_order, presend,
+            max(second_started, _parse_time(first_value["observation"]["finished_at"])))
+        if second_digest in fresh_digests:
+            raise Refused("STALE_RECONCILIATION")
+        fresh_digests.append(second_digest)
+    else:
+        if second["exit_code"] != 0:
+            raise Refused("RECONCILIATION_NOT_COMPLETE")
+        _cash_snapshot(value, args.declared_order, require_complete=True)
     # Explanation can change from false to true when C0 is supplied, but the
     # account facts themselves must not change between the two reads.
     if _account_facts(first_value["account"]) != _account_facts(value["account"]):
         raise Refused("RECONCILIATION_DRIFT")
+    if presend is not None:
+        if len(fresh_digests) != 2:
+            raise Refused("RECONCILIATION_NOT_COMPLETE")
+        proof = {key: item for key, item in presend["recovery"].items() if key != "history"}
+        proof["fresh_read_sha256"] = fresh_digests
+        live._create_file(directory / "pre-send-exit-recovery.json", live.canonical(proof) + b"\n")
     if stopped is not None and stopped["kind"] == "UNFILLED_ORDER":
         # The stopped window's order may only be closed by this fresh read.
         if not _fresh_read_closes_window(stopped, value):
@@ -1131,13 +1228,15 @@ def prepare_account(args: argparse.Namespace, directory: Path, environment: dict
         proof["fresh_read_sha256"] = [hashlib.sha256(
             (directory / f"reconciliation-pass-{index}.json").read_bytes()).hexdigest() for index in (1, 2)]
         live._create_file(directory / "unsent-edge-recovery.json", live.canonical(proof) + b"\n")
-    if stopped is not None and stopped["kind"] in {"PAYOUT_AUDIT", "ACCOUNT_READ"}:
+    if stopped is not None and stopped["kind"] in {"PAYOUT_AUDIT", "ACCOUNT_READ", "EXECUTION_AUDIT"}:
         if not payout_recovery.fresh_history_matches(stopped["recovery"], value):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         proof = dict(stopped["recovery"])
         proof["fresh_read_sha256"] = [hashlib.sha256(live._read_file(
             directory / f"reconciliation-pass-{index}.json", 1024 * 1024)).hexdigest() for index in (1, 2)]
-        proof_name = "payout-audit-recovery.json" if stopped["kind"] == "PAYOUT_AUDIT" else "account-read-recovery.json"
+        proof_name = {"PAYOUT_AUDIT": "payout-audit-recovery.json",
+                      "ACCOUNT_READ": "account-read-recovery.json",
+                      "EXECUTION_AUDIT": "execution-audit-recovery.json"}[stopped["kind"]]
         live._create_file(directory / proof_name, live.canonical(proof) + b"\n")
     value = {**value, "finished_at": value["observation"]["finished_at"]}
     record = directory / "reconciliation.json"
@@ -1232,7 +1331,10 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             raise Refused("STORAGE_BINDING")
         stopped = None
         if args.auto_prepare:
-            stopped = _stopped_window(existing, account)
+            if existing["run_id"] == "btc5m-live-4d0577d73dee4106":
+                stopped = _stopped_window(existing, account, old_bytes=old_bytes, now=now)
+            else:
+                stopped = _stopped_window(existing, account)
             orders = stopped["orders"]
             if args.declared_order is not None and args.declared_order != orders:
                 raise Refused("DECLARED_ORDERS_MISMATCH")

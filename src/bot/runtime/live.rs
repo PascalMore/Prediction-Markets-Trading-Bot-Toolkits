@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod claims;
+mod closed_execution;
 pub(crate) mod order_wait;
 
 pub(super) use order_wait::re_read_unread_facts;
@@ -35,8 +36,10 @@ pub struct LiveState {
     pub applied_collateral_fee: HashMap<u64, U256>,
     /// The cumulative share fee already applied, by attempt id.
     pub applied_share_fee: HashMap<u64, U256>,
-    /// The newest generation accepted, by attempt id.
+    /// The newest execution generation applied to the ledger, by attempt id.
     pub generation: HashMap<u64, u64>,
+    /// An applied authoritative Final, plus its latest validated degraded read.
+    closed_execution: HashMap<u64, closed_execution::ClosedExecution>,
     /// Intents that may have been submitted. Their key stops a new order for
     /// the same thing, however healthy the account looks later.
     pub tombstones: HashMap<String, u64>,
@@ -158,6 +161,8 @@ pub(crate) fn advance_watermark(
 /// wrapper around the same commit, not a second accounting.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppliedExecution {
+    /// No new fact or exposure after a previously applied authoritative Final.
+    closed_reread: bool,
     /// The original gross delta.
     pub delta: Delta,
     /// The net cash actually applied, when the reading was complete.
@@ -212,6 +217,9 @@ pub(super) fn apply_snapshot_detailed(
     let old = {
         state.live.watermarks.entry(id).or_default().clone()
     };
+    if let Some(result) = closed_execution::observe(state, &record, snapshot, &old)? {
+        return Ok(result);
+    }
     // A newer read that cannot state its quantity contradicts nothing: for an
     // order the venue already accepted, its fills may still be arriving. That
     // is an incomplete fact, so no watermark advances and nothing is applied.
@@ -234,6 +242,7 @@ pub(super) fn apply_snapshot_detailed(
                 .watermarks
                 .get(&id)
                 .is_some_and(|watermark| watermark.fields.len() == 5),
+            ..Default::default()
         });
     }
     let old_risk = old.risk_lower_bound();
@@ -366,6 +375,16 @@ pub(super) fn apply_snapshot_detailed(
     state.live.reservations.insert(id, residual);
     if closed {
         record.phase = AttemptPhase::Closed;
+        if state.live.controlled.is_some()
+            && record.submission == Submission::Accepted
+            && snapshot.submission == Submission::Accepted
+            && snapshot.accounting_gross_q == Some(q)
+            && snapshot.gross_q_before == q && snapshot.gross_q_after == q
+            && record.identity.signed_hash.is_some()
+            && record.identity.venue_order_id.is_some()
+        {
+            state.live.closed_execution.insert(id, closed_execution::ClosedExecution::new(snapshot));
+        }
     }
     state.live.watermarks.insert(
         id,
@@ -387,6 +406,7 @@ pub(super) fn apply_snapshot_detailed(
         applied,
         duplicate: false,
         accounting_complete: complete,
+        ..Default::default()
     })
 }
 
@@ -542,7 +562,7 @@ pub(super) fn consume_snapshot(
             Err(_) => Err("ORDER_IDENTITY_MISMATCH".into()),
         };
         if state.live.controlled.is_some()
-            && result.as_ref().is_ok_and(|applied| !applied.accounting_complete)
+            && result.as_ref().is_ok_and(|applied| !applied.accounting_complete && !applied.closed_reread)
         { state.halted = true; }
         if let Err(error) = &result {
             state.halted = true;
@@ -566,8 +586,11 @@ pub(super) fn consume_snapshot(
         let applied_complete = result
             .as_ref()
             .is_ok_and(|applied| applied.accounting_complete && applied.applied);
-        order_wait::note_snapshot(&mut state, snapshot, applied_complete,
-            expiration.as_ref().ok().copied().flatten());
+        let closed_reread = result.as_ref().is_ok_and(|applied| applied.closed_reread);
+        if !closed_reread {
+            order_wait::note_snapshot(&mut state, snapshot, applied_complete,
+                expiration.as_ref().ok().copied().flatten());
+        }
         if applied_complete && snapshot.submission == Submission::Accepted {
             if let Some(run) = state.live.controlled.as_mut() {
                 run.clear_failure(super::live_control::FailureKind::Execution);
@@ -576,8 +599,13 @@ pub(super) fn consume_snapshot(
         // A rejected reading still discloses its original facts, never a
         // fabricated applied delta. Identity mismatches are refused by projection.
         let unapplied = AppliedExecution::default();
-        let projected = super::live_events::prepare_execution(&state, snapshot,
-            result.as_ref().unwrap_or(&unapplied), previous, metadata.as_ref());
+        let projected = if result.as_ref().is_ok_and(|applied| applied.closed_reread && applied.duplicate) {
+            // An exact same-generation replay is not a new wire observation.
+            Ok(Vec::new())
+        } else {
+            super::live_events::prepare_execution(&state, snapshot,
+                result.as_ref().unwrap_or(&unapplied), previous, metadata.as_ref())
+        };
         let mut events = match projected {
             Ok(events) => events,
             Err(error) => {
@@ -981,7 +1009,9 @@ pub(super) async fn check_runtime_account(
         let mut observed = snapshot.clone();
         // Another task may have reserved while the read was in flight. Never
         // compare a pre-submit observation against post-submit bookkeeping.
-        if version != (state.live.next_attempt_id, state.live.generation.clone()) {
+        if version != (state.live.next_attempt_id, state.live.generation.clone())
+            || (controlled && claims::closed_inventory(&state) != closed)
+        {
             anyhow::bail!("RECONCILIATION_REQUIRED:ACCOUNT_READ_RACE");
         }
         // The window's own accepted, still-open order may legitimately be
@@ -1017,26 +1047,33 @@ pub(super) async fn check_runtime_account(
         let reconciled = check_account_delta_with_claims(
             state.live.baseline.as_ref().unwrap(), &snapshot, own_order.as_deref(), changes, claims)
             .and_then(|()| {
-                super::live_control::record_account_read(&mut state, &snapshot, checked)?;
-                // The account read proves the exact claimed atoms arrived; this
-                // is the one place a claimed payout becomes ledger cash, and the
-                // one place a wait only the missing claim caused can end.
-                for (id, inventory, cash) in fresh {
-                    let (booked, _) = if state.live.pending_claims.contains_key(&id) {
-                        super::live_control::promote_pending_claim(&mut state, id, inventory, cash)
-                    } else {
-                        super::live_control::credit_claim(&mut state, id, inventory, cash)
-                    };
-                    if let Some((inventory, cash)) = booked {
-                        booked_claims.push((id, inventory, cash));
+                let mut commit = || {
+                    super::live_control::record_account_read(&mut state, &snapshot, checked.clone())?;
+                    // The account read proves the exact claimed atoms arrived; this
+                    // is the one place a claimed payout becomes ledger cash, and the
+                    // one place a wait only the missing claim caused can end.
+                    for (id, inventory, cash) in fresh.iter().copied() {
+                        let (booked, _) = if state.live.pending_claims.contains_key(&id) {
+                            super::live_control::promote_pending_claim(&mut state, id, inventory, cash)
+                        } else {
+                            super::live_control::credit_claim(&mut state, id, inventory, cash)
+                        };
+                        if let Some((inventory, cash)) = booked {
+                            booked_claims.push((id, inventory, cash));
+                        }
                     }
+                    // Adapter history excludes this run's bound orders. Only the
+                    // exact baseline + committed atom deltas can explain their
+                    // positions here; do not project them as foreign after proof.
+                    snapshot.positions_explained = true;
+                    observed.positions_explained = true;
+                    Ok(())
+                };
+                if controlled {
+                    venue.with_runtime_claim_read_fence(&closed, &mut commit)
+                } else {
+                    commit()
                 }
-                // Adapter history excludes this run's bound orders. Only the
-                // exact baseline + committed atom deltas can explain their
-                // positions here; do not project them as foreign after proof.
-                snapshot.positions_explained = true;
-                observed.positions_explained = true;
-                Ok(())
             });
         if let Err(error) = &reconciled {
             if let Some(run) = state.live.controlled.as_mut() {

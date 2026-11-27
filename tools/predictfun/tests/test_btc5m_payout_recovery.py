@@ -15,6 +15,23 @@ import btc5m_live_events as live
 
 
 REAL_ROOT = control.BOT.parents[4]
+
+
+@pytest.fixture(autouse=True)
+def isolated_deployment_identity(monkeypatch):
+    """Synthetic deployment boundary: no Git or executable in isolated main tests.
+
+    Qualification still checks the actual historical started identity and all
+    audit/seed/authority bytes; this replaces only the NEW deployment lookup.
+    """
+    snapshot = json.loads((REAL_ROOT / 'data/reports/2026-11-26-btc5m-controlled-paper'
+        '/evidence/btc5m-live-4d633f8696984a73/started.json').read_text())
+    identity = copy.deepcopy(snapshot['candidate_identity'])
+    identity['binary_sha256'] = control.LIVE_BINARY_SHA256
+    identity['files'] = {name: hashlib.sha256((control.BOT / name).read_bytes()).hexdigest()
+                         for name in identity['files']}
+    monkeypatch.setattr(control, 'public_identity', lambda *a, **k: copy.deepcopy(identity))
+
 OLD_RUN = "btc5m-live-60ad1be52eb643f0"
 NEW_RUN = "btc5m-unattended-live-012"
 PRIOR = 94488600000000000000
@@ -70,6 +87,7 @@ def payout_recovery(native_main, monkeypatch):
     env.projections = [copy.deepcopy(fresh), copy.deepcopy(fresh)]
     env.reads, env.controllers = [], []
     env.native_exit = [0, 0]
+    env.next_budget = NEXT
     env.audit_bytes = {path: path.read_bytes() for directory in (previous, seed_dir)
                        for path in directory.iterdir() if path.is_file()}
     env.argv = ["--config", str(env.config), "--auto-prepare", "--run-id", NEW_RUN,
@@ -79,7 +97,7 @@ def payout_recovery(native_main, monkeypatch):
         index = len(env.reads)
         assert index < 2
         data = json.loads(Path(config).read_text())
-        assert control.parameters(data)["budget"] == NEXT
+        assert control.parameters(data)["budget"] == env.next_budget
         assert orders == env.orders
         env.reads.append((data, list(orders)))
         env.calls.append(f"read-{index + 1}")
@@ -341,3 +359,195 @@ def test_payout_recovery_accepts_original_unredacted_stop_token(payout_recovery)
     assert launch.main(env.argv) == 0
     proof = json.loads((env.root / "launch-attempts" / NEW_RUN / "payout-audit-recovery.json").read_text())
     assert proof["derived_token"] is False
+
+
+EXECUTION_RUN = 'btc5m-live-4d633f8696984a73'
+EXECUTION_NEXT = 87694700000000000001
+
+
+@pytest.fixture
+def execution_recovery(payout_recovery):
+    """Frozen real stop; synthetic storage and hypothetical future read boundaries.
+
+    The responses below are NOT the saved exit-4 read and NOT fresh live reads.
+    No stored production guard/activation is recreated: native_main supplies
+    explicitly synthetic objects that undergo the real schema/drift/CAS checks.
+    """
+    env = payout_recovery
+    source = REAL_ROOT / 'data/reports/2026-11-26-btc5m-controlled-paper/evidence'
+    previous = env.root / EXECUTION_RUN
+    seed_dir = env.root / 'launch-attempts' / EXECUTION_RUN
+    shutil.copytree(source / EXECUTION_RUN, previous)
+    shutil.copytree(source / 'launch-attempts' / EXECUTION_RUN, seed_dir)
+    proof_rel = Path('data/reports/2026-11-26-btc5m-history-not-closed-root-cause/evidence')
+    env.proof_dir = launch.ROOT / proof_rel
+    env.proof_dir.mkdir(parents=True)
+    for name in ('chain-orderfilled.json', 'venue-order-matches.json', 'root-cause-arithmetic.json'):
+        shutil.copyfile(REAL_ROOT / proof_rel / name, env.proof_dir / name)
+    env.previous, env.seed_dir = previous, seed_dir
+    started = json.loads((previous / 'started.json').read_text())
+    env.old.update({key: started[key] for key in ('run_id', 'risk_window_id', 'authorization_ref')})
+    env.old['candidate_digest'] = live.candidate_digest(started)
+    env.collection.record = copy.deepcopy(env.old)
+    activation = json.loads(env.activation.read_text())
+    activation.update({key: env.old[key] for key in
+                       ('authorization_ref', 'risk_window_id', 'candidate_digest')})
+    env.activation.write_text(json.dumps(activation))
+    env.old_bytes = env.activation.read_bytes()
+    seed = json.loads((seed_dir / 'attempt-reserved.json').read_text())
+    env.events = [json.loads(line) for line in (previous / 'events.jsonl').read_text().splitlines()]
+    accepted = [event for event in env.events if event['event_kind'] == 'order'
+                and event['payload']['submission'] == 'ACCEPTED']
+    assert len(accepted) == 1
+    owner = accepted[0]
+    env.orders = seed['declared_orders'] + [owner['payload']['signed_hash']]
+    assert len(env.orders) == 17
+    fresh = json.loads((seed_dir / 'reconciliation.json').read_text())
+    assert len(fresh['account']['claimed_win']) == 5
+    assert len(fresh['account']['settled_zero']) == 6
+    fresh['reconciliation']['declared_orders'] = env.orders
+    fresh['account']['settled_zero'].append({'market_id': int(owner['market_id']),
+        'token': owner['token'], 'oracle_status': 'RESOLVED', 'trading_status': 'CLOSED',
+        'outcome_status': 'LOST', 'payout_millionths': 0})
+    fresh['account']['positions'] = []
+    fresh['account']['collateral_atoms'] = str(EXECUTION_NEXT + sum(
+        int(item['claim_atoms']) for item in fresh['account']['claimed_win']))
+    env.next_budget = EXECUTION_NEXT
+    env.projections = [copy.deepcopy(fresh), copy.deepcopy(fresh)]
+    env.audit_bytes = {path: path.read_bytes() for directory in (previous, seed_dir)
+                       for path in directory.iterdir() if path.is_file()}
+    return env
+
+
+def test_execution_frozen_stop_native_main_prepares_new_window(execution_recovery, capsys):
+    env = execution_recovery
+    result = launch.main(env.argv)
+    output = capsys.readouterr().out
+    assert result == 0, (output, env.calls)
+    assert env.calls == ['read-1', 'read-2', 'activation', 'delete', 'controller']
+    proof = json.loads((env.root / 'launch-attempts' / NEW_RUN /
+                        'execution-audit-recovery.json').read_text())
+    assert proof['proof_kind'] == 'LEGACY_PARTIAL_EXECUTION_PLUS_FRESH_NATIVE_REQUIRED'
+    assert proof['prior_budget_atoms'] == '88694100000000000000'
+    assert proof['next_budget_atoms'] == str(EXECUTION_NEXT)
+    assert proof['gross_spend_atoms'] == '999399999999999999'
+    assert proof['prefix_event_seq'] == 51 and proof['failure_event_seq'] == 52
+    assert proof['native_final_missing'] is True and proof['old_audit_complete'] is False
+    assert proof['derived_token'] is True
+    assert len(proof['expected_history']['claimed_win']) == 5
+    assert len(proof['expected_history']['settled_zero']) == 7
+    assert len(proof['fresh_read_sha256']) == 2
+    assert len(env.controllers) == 1
+    assert all(path.read_bytes() == raw for path, raw in env.audit_bytes.items())
+
+
+
+@pytest.mark.parametrize("member", ["binary", "controller", "reader"])
+def test_execution_refuses_changed_historical_identity(execution_recovery, capsys, member):
+    env = execution_recovery
+    path = env.previous / "started.json"
+    started = json.loads(path.read_bytes())
+    identity = started["candidate_identity"]
+    if member == "binary":
+        identity["binary_sha256"] = "f" * 64
+    else:
+        name = {"controller": "btc5m_control.py", "reader": "btc5m_live_events.py"}[member]
+        identity["files"][f"tools/predictfun/{name}"] = "f" * 64
+    path.write_bytes(live.canonical(started) + b"\n")
+    # Even coherent synthetic guard/activation rewrites cannot substitute for
+    # the pinned historical identity seen by the original launch.
+    digest = live.candidate_digest(started)
+    context_path = env.previous / "live-context.json"
+    context = json.loads(context_path.read_bytes())
+    context["candidate_digest"] = digest
+    context_path.write_bytes(live.canonical(context) + b"\n")
+    env.old["candidate_digest"] = digest
+    env.collection.record = copy.deepcopy(env.old)
+    activation = json.loads(env.activation.read_bytes())
+    activation["candidate_digest"] = digest
+    env.old_bytes = live.canonical(activation) + b"\n"
+    env.activation.write_bytes(env.old_bytes)
+    assert launch.main(env.argv) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == "HISTORY_REQUIRES_TAKEOVER"
+    assert env.calls == []
+    assert_no_handoff(env)
+
+
+@pytest.mark.parametrize("damage, reason", [
+    ("stop", "HISTORY_REQUIRES_TAKEOVER"), ("malformed", "LAUNCH_PREPARATION_FAILED"),
+    ("no_accepted", "HISTORY_REQUIRES_TAKEOVER"), ("cost_atom", "HISTORY_REQUIRES_TAKEOVER"),
+    ("venue_missing", "HISTORY_REQUIRES_TAKEOVER"),
+])
+def test_execution_refuses_changed_frozen_evidence(execution_recovery, capsys, damage, reason):
+    env = execution_recovery
+    if damage == "stop":
+        path = env.previous / "stop-output.json"
+        stop = json.loads(path.read_bytes())
+        stop["bytes"] += 1
+        path.write_bytes(live.canonical(stop) + b"\n")
+    elif damage == "malformed":
+        path = env.previous / "events.jsonl"
+        path.write_bytes(path.read_bytes() + b"{malformed}\n")
+    elif damage == "no_accepted":
+        path = env.previous / "events.jsonl"
+        # Retain the valid, ambiguous MAY_HAVE_SUBMITTED prefix, no accepted owner.
+        path.write_bytes(b"".join(path.read_bytes().splitlines(keepends=True)[:49]))
+    elif damage == "cost_atom":
+        path = env.proof_dir / "chain-orderfilled.json"
+        chain = json.loads(path.read_bytes())
+        row = chain["rows"][0]
+        row["makerAmountFilled"] = str(int(row["makerAmountFilled"]) + 1)
+        path.write_bytes(live.canonical(chain) + b"\n")
+    else:
+        (env.proof_dir / "venue-order-matches.json").unlink()
+    assert launch.main(env.argv) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == reason
+    assert env.calls == []
+    assert_no_handoff(env)
+
+
+@pytest.mark.parametrize("damage, reason, count", [
+    ("first_incomplete", "RECONCILIATION_NOT_COMPLETE", 1),
+    ("second_incomplete", "RECONCILIATION_NOT_COMPLETE", 2),
+    ("first_atom", "CASH_BUDGET_MISMATCH", 1), ("second_atom", "RECONCILIATION_DRIFT", 2),
+    ("missing_zero", "HISTORY_REQUIRES_TAKEOVER", 1),
+    ("second_history_drift", "RECONCILIATION_DRIFT", 2),
+    ("missing_positions", "HISTORY_REQUIRES_TAKEOVER", 1),
+    ("guard_drift", "BARRIER_DRIFT", 2),
+])
+def test_execution_fresh_refuses_before_any_business_write(execution_recovery, monkeypatch, capsys,
+                                                          damage, reason, count):
+    env = execution_recovery
+    first, second = env.projections
+    if damage == "first_incomplete":
+        env.native_exit[0] = 4
+    elif damage == "second_incomplete":
+        second["reconciliation"]["complete"] = False
+    elif damage in ("first_atom", "second_atom"):
+        account = (first if damage == "first_atom" else second)["account"]
+        account["collateral_atoms"] = str(int(account["collateral_atoms"]) + 1)
+    elif damage == "missing_zero":
+        first["account"]["settled_zero"].pop()
+    elif damage == "second_history_drift":
+        second["account"]["settled_zero"].pop()
+    elif damage == "missing_positions":
+        first["account"].pop("positions")
+    else:
+        original = env.collection.find_one
+
+        def drift(query, *args):
+            if len(env.reads) == 2:
+                env.collection.record["scope"]["host"] = "different-offline-host"
+            return original(query, *args)
+
+        monkeypatch.setattr(env.collection, "find_one", drift)
+    assert launch.main(env.argv) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == reason
+    assert env.calls == [f"read-{index}" for index in range(1, count + 1)]
+    if damage == "guard_drift":
+        assert env.collection.record["scope"]["host"] == "different-offline-host"
+        assert env.activation.read_bytes() == env.old_bytes
+        assert not env.controllers
+    else:
+        assert_no_handoff(env)
+    assert all(path.read_bytes() == raw for path, raw in env.audit_bytes.items())

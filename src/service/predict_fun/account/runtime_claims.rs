@@ -4,6 +4,22 @@ use super::*;
 use crate::service::venue::{BoundClaimEvidence, RuntimeAccountObservation, RuntimeClaimInventory};
 
 impl PredictFunTrader {
+    /// Hold the read counter stable through synchronous local bookkeeping.
+    pub(crate) fn commit_at_claim_read_generation(
+        &self, closed: &[RuntimeClaimInventory], commit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let generations = self.generations.read();
+        for inventory in closed {
+            let hash = inventory.identity.signed_hash.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("RECONCILIATION_REQUIRED:UNBOUND_ORDER"))?;
+            if generations.get(hash).copied() != Some(inventory.validated_read_generation) {
+                anyhow::bail!("RECONCILIATION_REQUIRED:CLAIM_GENERATION");
+            }
+        }
+        let committed = commit();
+        drop(generations);
+        committed
+    }
     /// Read the original account legs once; runtime evidence never polls execution.
     pub(crate) async fn read_runtime_account_observation(
         &self,
@@ -62,7 +78,7 @@ impl PredictFunTrader {
                     .ok_or_else(|| anyhow::anyhow!("RECONCILIATION_REQUIRED:UNBOUND_ORDER"))?;
                 let record = bound.handle.lock().clone();
                 if record.identity != inventory.identity || record.phase != AttemptPhase::Closed
-                    || self.generations.read().get(hash).copied() != Some(inventory.execution_generation)
+                    || self.generations.read().get(hash).copied() != Some(inventory.validated_read_generation)
                 {
                     anyhow::bail!("RECONCILIATION_REQUIRED:CLAIM_GENERATION");
                 }
@@ -91,7 +107,7 @@ impl PredictFunTrader {
                 if settlement.market_id != inventory.identity.market_id
                     || bound.market.outcomes.len() != 2 || yes.on_chain_id == no.on_chain_id
                     || ![&yes.on_chain_id, &no.on_chain_id].contains(&&inventory.identity.token_id)
-                    || self.generations.read().get(hash).copied() != Some(inventory.execution_generation)
+                    || self.generations.read().get(hash).copied() != Some(inventory.validated_read_generation)
                     || bound.handle.lock().identity != inventory.identity
                     || bound.handle.lock().phase != AttemptPhase::Closed
                 {
@@ -119,13 +135,7 @@ impl PredictFunTrader {
                 });
             }
             // Recheck the whole batch: an earlier owner must not race a later await.
-            for inventory in closed.unwrap_or_default() {
-                let hash = inventory.identity.signed_hash.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("RECONCILIATION_REQUIRED:UNBOUND_ORDER"))?;
-                if self.generations.read().get(hash).copied() != Some(inventory.execution_generation) {
-                    anyhow::bail!("RECONCILIATION_REQUIRED:CLAIM_GENERATION");
-                }
-            }
+            self.commit_at_claim_read_generation(closed.unwrap_or_default(), &mut || Ok(()))?;
             let observation = RuntimeAccountObservation {
                 snapshot: AccountSnapshot {
                     identity: identity.clone(), collateral_atoms: Some(collateral_atoms),

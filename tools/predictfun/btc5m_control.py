@@ -52,8 +52,9 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = BOT.parents[4] / "data/reports/2026-11-26-btc5m-history-not-closed-root-cause/evidence/candidate-r20/polymarket-toolkits"
-LIVE_BINARY_SHA256 = "e7528b592527f362e1442a0aa35fea66ebc5aee9d39042bbe5dde76f6bd2ff6c"
+LIVE_BINARY = (BOT.parents[4] / "data/reports/2026-11-27-btc5m-fact-incomplete-stop/evidence"
+               / "context-root-fixed-candidate/polymarket-toolkits")
+LIVE_BINARY_SHA256 = "66f1286dae49bfc9b4ce2d7e66897c42d1034d20cccd341bfeac8f65d3482f21"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
@@ -73,6 +74,8 @@ LIVE_PATHS = (
     # part of what a live run's frozen identity must bind.
     "src/config/run_parameters.rs", "src/config/run_parameters/tests.rs",
     "tools/predictfun/btc5m_launch.py", "tools/predictfun/tests/test_btc5m_launch.py",
+    "tools/predictfun/btc5m_pre_send_exit_recovery.py",
+    "tools/predictfun/tests/test_btc5m_pre_send_exit_recovery.py",
     "tools/predictfun/tests/test_btc5m_takeover.py",
     "tools/predictfun/btc5m_payout_recovery.py",
     "tools/predictfun/tests/test_btc5m_payout_recovery.py",
@@ -82,7 +85,8 @@ LIVE_PATHS = (
     "tools/predictfun/tests/test_btc5m_read_unavailable_recovery.py",
     "tools/predictfun/tests/test_btc5m_parameterization.py",
     # R15/R16 loaded recovery, claim, diagnostics and regression modules.
-    "src/bot/runtime/live/claims.rs", "src/bot/runtime/live_control/cash_wait.rs",
+    "src/bot/runtime/live/claims.rs", "src/bot/runtime/live/closed_execution.rs",
+    "src/bot/runtime/live_control/cash_wait.rs",
     "src/bot/runtime/live/order_wait.rs", "src/bot/runtime/live_control/tests/order_wait.rs",
     "src/service/predict_fun/fills/order_wait_tests.rs",
     "src/bot/runtime/live_control/diagnostics.rs", "src/bot/runtime/live_events/order.rs",

@@ -110,6 +110,7 @@ class R16RelationsTests(unittest.TestCase):
             ("original_drive_cash_first_recovers_and_posts_without_restart", 2, 2),
             ("actual_adapter_two_claims_paid_separately_keep_wait_until_every_owner_closes", 2, 2),
             ("actual_adapter_zero_payout_removes_inventory_without_inventing_a_cash_claim", 1, 0),
+            ("closed_reread_preserves_final_without_reapplying_or_stopping", 1, 1),
         )
         for fixture, attempts, confirmed in names:
             with self.subTest(fixture=fixture):
@@ -142,6 +143,18 @@ class R16RelationsTests(unittest.TestCase):
                         store.finish(ended)
                         read = live.read_live_run(store.directory)
                         self.assertEqual(read["status"], "COMPLETE", read["reasons"])
+                        if fixture == "closed_reread_preserves_final_without_reapplying_or_stopping":
+                            events = [live.validate_live_event(frame) for frame in frames]
+                            executions = [e["payload"] for e in events if e["event_kind"] == "execution"]
+                            proven = next(i for i, e in enumerate(executions) if e["closure"] == "FINAL")
+                            degraded = [e for e in executions[proven + 1:] if e["closure"] == "UNPROVEN"]
+                            self.assertEqual(len(degraded), 2)
+                            self.assertTrue(all(not e["pages_complete"] for e in degraded))
+                            self.assertTrue(all(all(v is None for v in e["delta"].values()) for e in degraded))
+                            self.assertEqual(executions[-1]["closure"], "FINAL")
+                            self.assertEqual(set(executions[-1]["delta"].values()), {"0"})
+                            self.assertEqual([e["payload"]["reason"] for e in events if e["event_kind"] == "stop"],
+                                             ["CASH_PENDING", "DEADLINE"])
                     finally:
                         store.close()
 

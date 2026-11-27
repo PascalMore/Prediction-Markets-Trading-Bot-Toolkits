@@ -100,6 +100,290 @@ def account_recovery(native_main, monkeypatch, request):
     return env
 
 
+R20_RUN = "btc5m-live-6baf1ef8d6724dfb"
+
+
+@pytest.fixture
+def r20_main(native_main, monkeypatch):
+    """Exact old audit; model future native success only at the read boundary."""
+    from types import SimpleNamespace
+
+    env = native_main
+    bot = Path(__file__).resolve().parents[3]
+    # A verified git archive has no .git or build products. The staging parent
+    # holds frozen public fixtures; the binary is an input read, never executed.
+    fixture_root = bot.parent
+    reports = fixture_root / "data/reports"
+    old = reports / "2026-11-27-btc5m-controlled-paper/evidence"
+    env.previous = env.root / R20_RUN
+    env.seed_dir = env.root / "launch-attempts" / R20_RUN
+    shutil.copytree(old / R20_RUN, env.previous)
+    shutil.copytree(old / "launch-attempts" / R20_RUN, env.seed_dir)
+    shutil.copyfile(env.previous / "public-config.json", env.config)
+    started = live.strict_json((env.previous / "started.json").read_bytes())
+    env.old.update({key: started[key] for key in ("run_id", "risk_window_id", "authorization_ref")})
+    env.old["candidate_digest"] = live.candidate_digest(started)
+    env.collection.record = copy.deepcopy(env.old)
+    activation = json.loads(env.activation.read_bytes())
+    activation.update({key: env.old[key] for key in ("risk_window_id", "authorization_ref", "candidate_digest")})
+    env.activation.write_text(json.dumps(activation))
+    env.old_bytes = env.activation.read_bytes()
+    env.audit_bytes = {path: path.read_bytes() for directory in (env.previous, env.seed_dir)
+                       for path in directory.iterdir() if path.is_file()}
+    diagnostic = reports / ("2026-11-27-btc5m-fact-incomplete-stop/evidence/"
+                            "account-readonly-20261127T021307265594Z/reconciliation-pass-1.json")
+    raw = diagnostic.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == "f841f5ab4e242adb170005363cc515611f796ae6ae877fc960ff44cfd1d36489"
+    fresh = live.strict_json(raw)
+    assert fresh["reconciliation"]["complete"] is False
+    env.orders = fresh["reconciliation"]["declared_orders"]
+    # Only independent account facts are borrowed. Completion, freshness,
+    # positions explanation and exit are the explicitly synthetic boundary.
+    fresh["reconciliation"].update(complete=True, positions_match_history=True)
+    fresh["account"]["positions_explained"] = True
+    env.projections = [copy.deepcopy(fresh), copy.deepcopy(fresh)]
+    env.reads, env.controllers = [], []
+    env.native_exit = [0, 0]
+    env.argv = ["--config", str(env.config), "--auto-prepare", "--run-id", NEW_RUN,
+                "--authorization-ref", "offline-new-authorization", "--evidence-root", str(env.root)]
+
+    # Real candidate file hashing and binary pin; simulate only absent git
+    # metadata when testing an export, and never run the artifact itself.
+    if not (bot / ".git").exists():
+        import os
+
+        project = Path(os.environ["BTC5M_TEST_PROJECT_ROOT"])
+        monkeypatch.setattr(control, "LIVE_BINARY", project / control.LIVE_BINARY.relative_to(bot.parents[4]))
+        def git_head(argv, **kwargs):
+            assert argv[0] == "/usr/bin/git" and argv[3:] == ["rev-parse", "HEAD"]
+            key = "bot_head" if Path(argv[2]) == bot else "main_head"
+            return SimpleNamespace(stdout=started["candidate_identity"][key].encode())
+        monkeypatch.setattr(control.subprocess, "run", git_head)
+    monkeypatch.setattr(control.local_signer, "_read_owned", lambda: pytest.fail("unexpected key read"))
+
+    def reconcile(config, rpc_url, orders, output, *, environment):
+        index = len(env.reads)
+        assert index < 2
+        assert control.parameters(json.loads(Path(config).read_bytes()))["budget"] == 80760100000000000001
+        assert orders == env.orders
+        env.reads.append(list(orders))
+        env.calls.append(f"read-{index + 1}")
+        value = copy.deepcopy(env.projections[index])
+        value["observation"]["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        Path(output).write_text(json.dumps(value))
+        return {"exit_code": env.native_exit[index], "projection": value}
+
+    def controller(argv, *, environment, evidence_root):
+        assert env.collection.record is None
+        assert json.loads(env.activation.read_bytes())["authorization_ref"] == "offline-new-authorization"
+        assert [argv[i + 1] for i, key in enumerate(argv) if key == "--predict-reconciled-order"] == env.orders
+        env.calls.append("controller")
+        env.controllers.append(argv)
+        return {"launcher_exit": 0}
+
+    replace = launch.os.replace
+    def publish(source, target):
+        assert Path(target) == env.activation
+        env.calls.append("activation")
+        return replace(source, target)
+
+    monkeypatch.setattr(control.local_signer, "reconcile_account", reconcile)
+    monkeypatch.setattr(control, "run", controller)
+    monkeypatch.setattr(launch.os, "replace", publish)
+    return env
+
+
+def test_r20_closed_rereads_recover_at_original_main(r20_main, capsys):
+    env = r20_main
+    result = launch.main(env.argv)
+    assert result == 0, capsys.readouterr().out
+    assert env.calls == ["read-1", "read-2", "activation", "delete", "controller"]
+    proof = json.loads((env.root / "launch-attempts" / NEW_RUN / "account-read-recovery.json").read_bytes())
+    assert proof["checkpoint_event_seq"] == 2479 and proof["final_event_seq"] == 2499
+    assert proof["prior_budget_atoms"] == "87694700000000000001"
+    assert proof["next_budget_atoms"] == "80760100000000000001"
+    assert proof["gross_spend_atoms"] == "6934600000000000000"
+    assert len(proof["economic_orders"]) == 7 and len(proof["zero_fill_orders"]) == 1
+    assert proof["window_order_hashes"] == env.orders[-8:]
+    assert len(proof["fresh_read_sha256"]) == 2
+    assert all(path.read_bytes() == raw for path, raw in env.audit_bytes.items())
+
+
+@pytest.mark.parametrize("damage,reads,reason", [
+    ("cash_plus", 1, "CASH_BUDGET_MISMATCH"), ("cash_minus", 1, "CASH_BUDGET_MISMATCH"),
+    ("second_cash", 2, "RECONCILIATION_DRIFT"), ("first_incomplete", 1, "RECONCILIATION_NOT_COMPLETE"),
+    ("second_incomplete", 2, "RECONCILIATION_NOT_COMPLETE"), ("declarations", 1, "RECONCILIATION_FACTS"),
+    ("positions_missing", 1, "HISTORY_REQUIRES_TAKEOVER"), ("open_orders", 1, "RECONCILIATION_FACTS"),
+    ("native_identity", 1, "RECONCILIATION_FACTS"), ("offset_claims", 1, "HISTORY_REQUIRES_TAKEOVER"),
+    ("duplicate_zero", 1, "HISTORY_REQUIRES_TAKEOVER"), ("missing_zero", 1, "HISTORY_REQUIRES_TAKEOVER"),
+    ("wrong_official", 1, "HISTORY_REQUIRES_TAKEOVER"), ("second_history", 2, "RECONCILIATION_DRIFT"),
+    ("activation_drift", 2, "ACTIVATION_DRIFT"), ("guard_drift", 2, "BARRIER_DRIFT"),
+    ("cas_failure", 2, "BARRIER_ROTATION"),
+])
+def test_r20_fresh_and_handoff_refusals(r20_main, monkeypatch, capsys, damage, reads, reason):
+    from types import SimpleNamespace
+
+    env = r20_main
+    first, second = env.projections
+    account = first["account"]
+    if damage.startswith("cash_") or damage == "second_cash":
+        affected = second["account"] if damage == "second_cash" else account
+        affected["collateral_atoms"] = str(int(affected["collateral_atoms"]) + (-1 if damage == "cash_minus" else 1))
+    elif damage.endswith("_incomplete"):
+        env.native_exit[damage.startswith("second")] = 4
+    elif damage == "declarations":
+        first["reconciliation"]["declared_orders"].pop()
+    elif damage == "positions_missing":
+        account.pop("positions")
+    elif damage == "open_orders":
+        account["open_orders"].append(env.orders[-1])
+    elif damage == "native_identity":
+        first["account_identity"]["chain_id"] = 1
+    elif damage == "offset_claims":
+        for item, delta in zip(account["claimed_win"][:2], (1, -1)):
+            item["claim_atoms"] = item["inventory_atoms"] = str(int(item["claim_atoms"]) + delta)
+    elif damage == "duplicate_zero":
+        account["settled_zero"].append(copy.deepcopy(account["settled_zero"][0]))
+    elif damage == "missing_zero":
+        account["settled_zero"].pop()
+    elif damage in ("wrong_official", "second_history"):
+        selected = second["account"] if damage == "second_history" else account
+        selected["settled_zero"][0]["oracle_status"] = "UNRESOLVED"
+    elif damage == "guard_drift":
+        read = env.collection.find_one
+        monkeypatch.setattr(env.collection, "find_one", lambda query: (
+            {**read(query), "armed_at": "drift"} if len(env.reads) == 2 else read(query)))
+    elif damage == "activation_drift":
+        read = control.local_signer.reconcile_account
+        def drift(*args, **kwargs):
+            value = read(*args, **kwargs)
+            if len(env.reads) == 2:
+                env.activation.write_bytes(env.old_bytes + b"\n")
+            return value
+        monkeypatch.setattr(control.local_signer, "reconcile_account", drift)
+    elif damage == "cas_failure":
+        def fail_cas(record):
+            assert record == env.old
+            assert json.loads(env.activation.read_bytes())["authorization_ref"] == "offline-new-authorization"
+            env.calls.append("cas-miss")
+            return SimpleNamespace(deleted_count=0)
+        monkeypatch.setattr(env.collection, "delete_one", fail_cas)
+    assert launch.main(env.argv) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == reason
+    expected = [f"read-{index}" for index in range(1, reads + 1)]
+    if damage == "cas_failure":
+        expected += ["activation", "cas-miss"]
+    assert env.calls == expected and env.collection.record == env.old and not env.controllers
+    attempt = env.root / "launch-attempts" / NEW_RUN
+    assert not (attempt / "launch-dispatch.json").exists()
+    if reads == 1 or damage in ("second_history", "second_cash", "second_incomplete"):
+        assert not (attempt / "account-read-recovery.json").exists()
+    if damage != "cas_failure":
+        assert env.activation.read_bytes() == env.old_bytes + (b"\n" if damage == "activation_drift" else b"")
+
+
+@pytest.mark.parametrize("damage,reason", [
+    ("wrong_coverage", "HISTORY_REQUIRES_TAKEOVER"), ("late_fill", "HISTORY_REQUIRES_TAKEOVER"),
+    ("wrong_final_fact", "HISTORY_REQUIRES_TAKEOVER"), ("fee", "LAUNCH_PREPARATION_FAILED"),
+    ("generation", "LAUNCH_PREPARATION_FAILED"), ("execution_identity", "LAUNCH_PREPARATION_FAILED"),
+    ("wrong_final", "LAUNCH_PREPARATION_FAILED"), ("second_hard_stop", "HISTORY_REQUIRES_TAKEOVER"),
+    ("off_branch", "HISTORY_REQUIRES_TAKEOVER"), ("seed_hash", "HISTORY_REQUIRES_TAKEOVER"),
+    ("old_collection", "HISTORY_REQUIRES_TAKEOVER"), ("checkpoint_atom", "HISTORY_REQUIRES_TAKEOVER"),
+    ("metadata", "LAUNCH_PREPARATION_FAILED"), ("binary", "HISTORY_REQUIRES_TAKEOVER"),
+    ("files", "HISTORY_REQUIRES_TAKEOVER"), ("unknown_submit", "HISTORY_REQUIRES_TAKEOVER"),
+    ("unopened_unknown", "HISTORY_REQUIRES_TAKEOVER"), ("unapplied_final", "HISTORY_REQUIRES_TAKEOVER"),
+])
+def test_r20_historical_refusals_never_prepare(r20_main, capsys, damage, reason):
+    env = r20_main
+    if damage == "seed_hash":
+        path = env.seed_dir / "attempt-reserved.json"
+        seed = live.strict_json(path.read_bytes())
+        seed["reconciliation_sha256"] = "0" * 64
+        path.write_bytes(live.canonical(seed))
+    elif damage == "old_collection":
+        path = env.seed_dir / "reconciliation.json"
+        value = live.strict_json(path.read_bytes())
+        value["account"].pop("settled_zero")
+        path.write_bytes(live.canonical(value))
+        seed_path = env.seed_dir / "attempt-reserved.json"
+        seed = live.strict_json(seed_path.read_bytes())
+        seed["reconciliation_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        seed_path.write_bytes(live.canonical(seed))
+    elif damage == "metadata":
+        path = env.previous / "live-context.json"
+        value = live.strict_json(path.read_bytes())
+        value["candidate_digest"] = "0" * 64
+        path.write_bytes(live.canonical(value))
+    elif damage in ("binary", "files"):
+        path = env.previous / "started.json"
+        value = live.strict_json(path.read_bytes())
+        identity = value["candidate_identity"]
+        if damage == "binary":
+            identity["binary_sha256"] = "0" * 64
+        else:
+            identity["files"][next(iter(identity["files"]))] = "0" * 64
+        path.write_bytes(live.canonical(value))
+        digest = live.candidate_digest(value)
+        context_path = env.previous / "live-context.json"
+        context = live.strict_json(context_path.read_bytes())
+        context["candidate_digest"] = digest
+        context_path.write_bytes(live.canonical(context))
+        env.old["candidate_digest"] = env.collection.record["candidate_digest"] = digest
+        activation = json.loads(env.old_bytes)
+        activation["candidate_digest"] = digest
+        env.old_bytes = live.canonical(activation)
+        env.activation.write_bytes(env.old_bytes)
+    elif damage == "off_branch":
+        path = env.previous / "ended.json"
+        value = live.strict_json(path.read_bytes())
+        value["incomplete_reason"] = "OUTPUT_INVALID"
+        path.write_bytes(live.canonical(value))
+    else:
+        path = env.previous / "events.jsonl"
+        rows = [live.strict_json(line) for line in path.read_bytes().splitlines()]
+        degraded = rows[2481]["payload"]
+        final = rows[2479]["payload"]
+        if damage == "wrong_coverage":
+            degraded["facts"]["net_cash"]["coverage_gross_atoms"] = "0"
+        elif damage == "late_fill":
+            last_unproven = next(row["payload"] for row in reversed(rows[2479:])
+                                 if row["event_kind"] == "execution" and row["payload"]["closure"] == "UNPROVEN")
+            last_unproven["gross_q_atoms"] = str(int(last_unproven["gross_q_atoms"]) + 1)
+        elif damage == "wrong_final_fact":
+            last_final = next(row["payload"] for row in reversed(rows[2479:])
+                              if row["event_kind"] == "execution" and row["payload"]["closure"] == "FINAL")
+            last_final["settlement_status"] = "CONFLICT"
+        elif damage == "fee":
+            degraded["facts"]["share_fee"]["atoms"] = str(int(degraded["facts"]["share_fee"]["atoms"]) + 1)
+        elif damage == "generation":
+            degraded["generation"] -= 2
+        elif damage == "execution_identity":
+            degraded["venue_order_id"] = "1"
+        elif damage == "wrong_final":
+            final["final_gross_q_atoms"] = "1"
+        elif damage == "second_hard_stop":
+            rows[2483].update(event_kind="stop", market_id=None, token=None,
+                              payload={**rows[2482]["payload"], "reason": "READ_UNAVAILABLE", "stop_detail": None})
+        elif damage == "checkpoint_atom":
+            value = rows[2478]["payload"]
+            value["collateral_atoms"] = str(int(value["collateral_atoms"]) + 1)
+        elif damage == "unapplied_final":
+            row = next(row for row in reversed(rows[:2478]) if row["event_kind"] == "execution")
+            row["payload"]["delta"] = dict.fromkeys(row["payload"]["delta"])
+        elif damage in ("unknown_submit", "unopened_unknown"):
+            order = next(row["payload"] for row in reversed(rows[:2478]) if row["event_kind"] == "order"
+                         and row["payload"]["submission"] == "ACCEPTED")
+            order["submission"] = "UNKNOWN"
+            if damage == "unopened_unknown":
+                order["venue_order_id"] = None
+        path.write_bytes(b"".join(live.canonical(row) + b"\n" for row in rows))
+    assert launch.main(env.argv) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == reason
+    assert env.calls == [] and env.collection.record == env.old
+    assert env.activation.read_bytes() == env.old_bytes
+    assert not (env.root / "launch-attempts" / NEW_RUN).exists()
+
+
 def assert_no_handoff(env):
     assert env.activation.read_bytes() == env.old_bytes
     assert not env.controllers

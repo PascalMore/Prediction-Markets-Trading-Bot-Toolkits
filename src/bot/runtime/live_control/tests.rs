@@ -19,6 +19,7 @@ mod live004_regression;
 
 #[path = "tests/live012_regression.rs"]
 mod live012_regression;
+#[path = "tests/settlement_recheck.rs"] mod settlement_recheck;
 
 #[path = "tests/send_timing_bench.rs"]
 mod send_timing_bench;

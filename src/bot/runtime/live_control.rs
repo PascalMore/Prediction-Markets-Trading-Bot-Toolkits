@@ -135,6 +135,15 @@ pub(super) struct FailureStreak {
     pub since: DateTime<Utc>,
 }
 
+/// A single market awaiting the next original settlement poll. This holds
+/// neither a position nor a valuation and is never renewed by another read.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SettlementRecheck {
+    pub market_id: u64,
+    pub started: crate::service::observation::CheckTime,
+    pub last: crate::service::observation::CheckTime,
+}
+
 /// The controlled live run's own metadata.
 ///
 /// It lives inside the broker's state lock, next to the ledger: the pending
@@ -172,6 +181,7 @@ pub struct ControlledLiveState {
     /// facts remain the only truth about the order, and only the original
     /// Final path still releases the risk.
     pub order_wait: Option<crate::bot::runtime::live::order_wait::OrderWait>,
+    pub(super) settlement_recheck: Option<SettlementRecheck>,
     /// The original deadline on the run clock; it never restarts with a wait.
     pub run_deadline_elapsed_ms: u64,
     /// When this tick's first account read was issued.
@@ -354,6 +364,58 @@ impl ControlledLiveState {
         self.control.lock().may_add_risk()
             && !self.degraded
             && self.order_wait.is_none()
+            && self.settlement_recheck.is_none()
+    }
+
+    /// Bound the next scheduled read and its reconciliation by both original clocks.
+    pub(super) fn recheck_budget(&self) -> Result<std::time::Duration, &'static str> {
+        let wait = self.settlement_recheck.ok_or("DATA_UNAVAILABLE")?;
+        let now = self.phase1.clock.now().map_err(|_| "DATA_UNAVAILABLE")?;
+        self.recheck_budget_at(wait, now)
+    }
+
+    fn recheck_budget_at(&self, wait: SettlementRecheck, now: crate::service::observation::CheckTime)
+        -> Result<std::time::Duration, &'static str> {
+        if now.utc < wait.last.utc || now.elapsed_ms < wait.last.elapsed_ms {
+            return Err("DATA_UNAVAILABLE");
+        }
+        if now.utc >= self.options.deadline_at || now.elapsed_ms >= self.run_deadline_elapsed_ms {
+            return Err("DEADLINE");
+        }
+        // Reuse the existing bounded observation ceiling, not a timer at the
+        // nominal poll interval (which excludes drive and response latency).
+        let ceiling = super::live_accounting::LIVE_TAIL_BUDGET;
+        let wall_age = (now.utc - wait.started.utc).to_std().map_err(|_| "DATA_UNAVAILABLE")?;
+        let elapsed_age = std::time::Duration::from_millis(now.elapsed_ms - wait.started.elapsed_ms);
+        let wall_left = (self.options.deadline_at - now.utc).to_std().map_err(|_| "DEADLINE")?;
+        let elapsed_left = std::time::Duration::from_millis(self.run_deadline_elapsed_ms - now.elapsed_ms);
+        let left = ceiling.saturating_sub(wall_age.max(elapsed_age)).min(wall_left).min(elapsed_left);
+        if left.is_zero() { Err("DATA_UNAVAILABLE") } else { Ok(left) }
+    }
+
+    pub(super) fn stop_expired_recheck(&mut self) {
+        if self.settlement_recheck.is_none() { return; }
+        let Ok(now) = self.phase1.clock.now() else {
+            self.stop("DATA_UNAVAILABLE", true, Utc::now());
+            return;
+        };
+        self.advance_recheck_at(now);
+    }
+
+    /// Apply the original recheck guard to a sample the caller already owns.
+    pub(super) fn advance_recheck_at(&mut self, now: crate::service::observation::CheckTime) -> bool {
+        let budget = self.settlement_recheck.ok_or("DATA_UNAVAILABLE")
+            .and_then(|wait| self.recheck_budget_at(wait, now));
+        match budget {
+            Ok(_) => {
+                self.settlement_recheck.as_mut().unwrap().last = now;
+                true
+            }
+            Err(reason) => {
+                self.stop(reason, true, now.utc);
+                false
+            }
+        }
     }
 
     /// Whether the window must be finished at once.
@@ -361,7 +423,9 @@ impl ControlledLiveState {
     /// A degraded window is not finished: it observes until its facts come
     /// back, and only a stop or a broken output lane ends it.
     pub fn must_end(&self) -> bool {
-        self.control.lock().must_end() || self.phase1.clock.now().map_or(true, |now| {
+        self.control.lock().must_end()
+            || (self.settlement_recheck.is_some() && self.recheck_budget().is_err())
+            || self.phase1.clock.now().map_or(true, |now| {
             now.utc >= self.options.deadline_at || now.elapsed_ms >= self.run_deadline_elapsed_ms
                 || self.cash_wait.as_ref().is_some_and(|wait| !wait.may_continue(
                     now, self.options.deadline_at, self.run_deadline_elapsed_ms))
@@ -1200,6 +1264,7 @@ impl ControlledLiveState {
             account_read: None,
             cash_wait: None,
             order_wait: None,
+            settlement_recheck: None,
             run_deadline_elapsed_ms,
             tick_started_elapsed_ms: None,
             opening_claim_cash: U256::ZERO,
@@ -1246,6 +1311,15 @@ impl ControlledLiveState {
     /// Stop adding risk with the failure code that was already in hand.
     pub fn stop_with_detail(&mut self, reason: &str, detail: &str,
                             takeover_required: bool, at: DateTime<Utc>) {
+        if let Ok(cutoff) = RECHECK_ACCOUNT_CUTOFF.try_with(|cutoff| cutoff.get()) {
+            // Reject the late receipt before ledger application, but do not
+            // mislabel the clock cutoff as an account reconciliation failure.
+            if let Some((reason, at)) = cutoff {
+                self.stop(reason, true, at);
+                return;
+            }
+            self.stop_expired_recheck();
+        }
         let before = self.control.lock().stop.clone();
         self.stop(reason, takeover_required, at);
         let mut control = self.control.lock();
@@ -1255,9 +1329,35 @@ impl ControlledLiveState {
     }
 }
 
+tokio::task_local! {
+    // Only the account owner called by the active recheck gets this deadline.
+    pub(super) static RECHECK_ACCOUNT_CUTOFF: std::cell::Cell<Option<(&'static str, DateTime<Utc>)>>;
+}
+
 /// Capture the controlled clock at the official account response, before later awaits.
 pub(super) fn account_receipt(state: &State) -> Result<Option<crate::service::observation::CheckTime>> {
-    state.live.controlled.as_ref().map(|run| run.phase1.clock.now()).transpose()
+    let Some(run) = state.live.controlled.as_ref() else { return Ok(None); };
+    let now = run.phase1.clock.now();
+    RECHECK_ACCOUNT_CUTOFF.try_with(|cutoff| {
+        let boundary = match &now {
+            Ok(now) => run.settlement_recheck.ok_or("DATA_UNAVAILABLE")
+                .and_then(|wait| run.recheck_budget_at(wait, *now))
+                .and_then(|_| {
+                    if state.entry_stop_reason.is_some() || run.must_end() {
+                        Err("DATA_UNAVAILABLE")
+                    } else {
+                        Ok(())
+                    }
+                }).err().map(|reason| (reason, now.utc)),
+            Err(_) => Some(("DATA_UNAVAILABLE", Utc::now())),
+        };
+        if let Some((reason, at)) = boundary {
+            cutoff.set(Some((reason, at)));
+            anyhow::bail!(reason);
+        }
+        Ok(())
+    }).unwrap_or(Ok(()))?;
+    now.map(Some)
 }
 
 /// Credit one authoritative claimed payout and release the wait it caused.
@@ -1464,7 +1564,10 @@ pub(super) fn refresh_live_risk(state: &mut State) {
 
 /// Check existing exposure only, without reclassifying an in-flight partial read.
 pub(super) fn refresh_live_exposure(state: &mut State, at: DateTime<Utc>) {
-    let Some(params) = state.live.controlled.as_ref().map(|run| run.options.params) else { return; };
+    let Some(params) = state.live.controlled.as_mut().map(|run| {
+        run.stop_expired_recheck();
+        run.options.params
+    }) else { return; };
     // Proposed next orders are not part of the original ledger's risk.
     if super::live_accounting::risk_exposure(&state.live).is_some_and(|risk|
         risk.cost.saturating_add(risk.reserved) >= params.total)

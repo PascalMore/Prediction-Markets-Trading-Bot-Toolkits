@@ -17,6 +17,7 @@ pub(crate) struct Facts {
     pub rest_calls: Mutex<Vec<String>>,
     /// Fault only the public official-settlement GET, never signing or POST.
     pub market_fault: Mutex<Option<&'static str>>,
+    pub miss_receipt: Mutex<bool>,
 }
 
 impl Facts {
@@ -50,6 +51,9 @@ impl SyntheticTransport for R16Transport {
     }
     fn rpc(&self, method: &str, params: &Value) -> std::result::Result<Value, VenueError> {
         self.facts.rpc_calls.lock().unwrap().push(method.into());
+        if method == "eth_getTransactionReceipt" && *self.facts.miss_receipt.lock().unwrap() {
+            return Err(VenueError::new(VenueErrorCode::ReadUnavailable, "controlled_receipt", "RECEIPT_UNKNOWN"));
+        }
         if method == "eth_call" {
             let data = params[0]["data"].as_str().unwrap();
             let selector = &data[2..10];

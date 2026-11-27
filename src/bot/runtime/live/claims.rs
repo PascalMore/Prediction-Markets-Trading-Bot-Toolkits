@@ -14,6 +14,8 @@ pub(super) fn closed_inventory(state: &State) -> Vec<RuntimeClaimInventory> {
             && state.live.reservations.get(id).copied().unwrap_or_default().is_zero())
             .then(|| RuntimeClaimInventory {
                 identity: record.identity.clone(), execution_generation: generation,
+                validated_read_generation: state.live.closed_execution.get(id)
+                    .map_or(generation, |execution| execution.read_generation()),
                 inventory_atoms: inventory,
             })
     }).collect()

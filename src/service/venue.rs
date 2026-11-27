@@ -654,8 +654,10 @@ impl SendCheckObservation {
 pub struct RuntimeClaimInventory {
     /// The attempt this inventory belongs to.
     pub identity: OrderIdentity,
-    /// The execution generation the attempt's facts were read at.
+    /// The execution generation applied to the ledger and named by the claim.
     pub execution_generation: u64,
+    /// The latest read generation validated by the Broker for this owner.
+    pub validated_read_generation: u64,
     /// The net inventory the attempt still holds.
     pub inventory_atoms: U256,
 }
@@ -845,6 +847,16 @@ pub trait OrderVenue: Send + Sync {
             snapshot: self.account_snapshot().await?,
             bound_claims: Vec::new(),
         })
+    }
+
+    /// Commit under the adapter execution-read fence, if it maintains one.
+    /// The synchronous callback must not call back into the venue.
+    fn with_runtime_claim_read_fence(
+        &self,
+        _closed: &[RuntimeClaimInventory],
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        commit()
     }
 
     /// Build and sign `planned`. Transmits it only when `live` is true, so a

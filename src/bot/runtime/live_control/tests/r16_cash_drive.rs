@@ -2,8 +2,8 @@
 use super::*;
 use crate::bot::runtime::live;
 use crate::models::VenueId;
-use crate::service::venue::{AccountSnapshot, BoundClaimEvidence, OrderTicket, OrderVenue,
-    RuntimeAccountObservation, RuntimeClaimInventory};
+use crate::service::venue::{AccountSnapshot, AttemptPhase, BoundClaimEvidence, Closure, OrderTicket,
+    OrderVenue, RuntimeAccountObservation, RuntimeClaimInventory};
 
 struct ExactAccount {
     snapshot: AccountSnapshot,
@@ -130,6 +130,151 @@ async fn send_round(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16
     assert!(matches!(outcome.result, crate::bot::runtime::TakeResult::Filled { .. }));
     live::sync_predict(broker).await.unwrap();
     market
+}
+
+#[tokio::test]
+async fn closed_reread_preserves_final_without_reapplying_or_stopping() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    let market = send_round(&broker, &clock, &facts, &mut core, 1).await;
+    let (hash, generation, quantity, cash, inventory) = {
+        let state = broker.state.lock();
+        let record = state.live.attempts[&1].lock();
+        assert_eq!(record.phase, AttemptPhase::Closed);
+        (record.identity.signed_hash.clone().unwrap(), state.live.generation[&1],
+            state.live.applied_q[&1], state.live.net_cash[&1], state.live.net_inventory[&1])
+    };
+    *facts.miss_receipt.lock().unwrap() = true;
+    let reading = trader.execution_snapshot(&hash).await.unwrap();
+    assert!(matches!(reading.closure, Closure::Unproven));
+    assert_eq!(reading.gross_q(), Some(quantity));
+    assert!(!reading.pages_complete && !reading.accounting_complete());
+    let lane = broker.live_operation_lane().unwrap();
+    let operation = lane.lock().await;
+    let applied = live::consume_snapshot(&broker, &reading).unwrap();
+    assert!(!applied.applied && !applied.accounting_complete);
+    assert_eq!((applied.net_cash_delta, applied.net_inventory_delta), (None, None));
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert!(!run.must_end(), "a degraded re-read must not stop a proven Final");
+        assert!(!state.halted);
+        assert_eq!(state.live.attempts[&1].lock().phase, AttemptPhase::Closed);
+        assert_eq!(state.live.reservations[&1], U256::ZERO);
+        assert_eq!((state.live.generation[&1], state.live.net_cash[&1], state.live.net_inventory[&1]),
+            (generation, cash, inventory));
+    }
+    // Same-generation exact replay is idempotent, including on the wire.
+    assert!(live::consume_snapshot(&broker, &reading).unwrap().duplicate);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    drop(operation);
+    broker.sync_live().await.unwrap();
+    assert_eq!(broker.state.lock().live.generation[&1], generation);
+    // Prove and book a real, exact claim while the last validated read generation
+    // is newer than the execution generation used for payout ownership.
+    facts.round(resolved(market, 1.0));
+    broker.settle_resolved(r16_fixture::data(&trader).as_ref()).await.unwrap();
+    facts.pay(77);
+    live::check_runtime_account(&broker, false).await.unwrap();
+    assert_eq!(broker.state.lock().live.claims[&1], (inventory, inventory));
+    *facts.miss_receipt.lock().unwrap() = false;
+    broker.sync_live().await.unwrap();
+    {
+        let state = broker.state.lock();
+        assert!(!state.live.controlled.as_ref().unwrap().must_end());
+        assert_eq!((state.live.net_cash[&1], state.live.net_inventory[&1]), (cash, inventory));
+        assert_eq!(state.live.claims.len(), 1);
+    }
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    broker.stop_entries(crate::bot::runtime::ControlledStop::Deadline);
+    broker.finish_controlled_live_with(r16_fixture::data(&trader).as_ref(),
+        std::time::Duration::from_secs(1), std::time::Duration::ZERO).await;
+    assert!(broker.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished());
+}
+
+#[tokio::test]
+async fn closed_reread_still_refuses_conflicting_or_unread_facts() {
+    use crate::service::venue::{Field, Quantity, Submission};
+    for case in ["reopen", "new_final", "fee", "uncovered", "scan_race", "regression",
+        "same_generation", "unknown_quantity", "identity", "submission", "quantity_increase"]
+    {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+            order_usd: 1.0, ..Default::default()
+        });
+        send_round(&broker, &clock, &facts, &mut core, 1).await;
+        let (hash, generation, quantity, cash, inventory) = {
+            let state = broker.state.lock();
+            let record = state.live.attempts[&1].lock();
+            (record.identity.signed_hash.clone().unwrap(), state.live.generation[&1],
+                state.live.applied_q[&1], state.live.net_cash[&1], state.live.net_inventory[&1])
+        };
+        let lane = broker.live_operation_lane().unwrap();
+        let _operation = lane.lock().await;
+        *facts.miss_receipt.lock().unwrap() = true;
+        let mut reading = trader.execution_snapshot(&hash).await.unwrap();
+        live::consume_snapshot(&broker, &reading).unwrap();
+        if case != "same_generation" { reading.generation += 1; }
+        let one = U256::from(1);
+        match case {
+            "reopen" => reading.closure = Closure::Open,
+            "new_final" => reading.closure = Closure::Final { evidence: "RPC_FIXED_BLOCK:0x42".into(),
+                final_gross_q: quantity + one },
+            "fee" | "same_generation" => reading.accounting.collateral_fee =
+                Field::Known(*reading.accounting.collateral_fee.value().unwrap() + one),
+            "uncovered" => reading.accounting_gross_q = None,
+            "scan_race" => reading.gross_q_before -= one,
+            "regression" => reading.generation = generation,
+            "unknown_quantity" => reading.quantity = Quantity::Unknown,
+            "identity" => reading.identity.token_id = "999".into(),
+            "submission" => reading.submission = Submission::Unknown,
+            "quantity_increase" => if let Quantity::Known { gross_q_atoms, .. } = &mut reading.quantity {
+                *gross_q_atoms += one;
+            },
+            _ => unreachable!(),
+        }
+        assert!(live::consume_snapshot(&broker, &reading).is_err(), "{case}");
+        let state = broker.state.lock();
+        assert!(state.live.controlled.as_ref().unwrap().must_end(), "{case}");
+        assert_eq!((state.live.generation[&1], state.live.net_cash[&1], state.live.net_inventory[&1]),
+            (generation, cash, inventory), "{case}");
+        assert_eq!(state.live.attempts[&1].lock().phase, AttemptPhase::Closed);
+        assert_eq!(state.live.reservations[&1], U256::ZERO);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn closed_reread_unconsumed_generation_refuses_observation_and_commit() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let mut core = crate::bot::arbitrage::DecisionCore::phase1(crate::config::BtcArbConfig {
+        order_usd: 1.0, ..Default::default()
+    });
+    send_round(&broker, &clock, &facts, &mut core, 1).await;
+    let frozen = {
+        let state = broker.state.lock();
+        let identity = state.live.attempts[&1].lock().identity.clone();
+        let generation = state.live.generation[&1];
+        RuntimeClaimInventory { identity, execution_generation: generation,
+            validated_read_generation: generation, inventory_atoms: state.live.net_inventory[&1] }
+    };
+    let batch = &[frozen];
+    assert!(trader.runtime_account_observation(batch).await.unwrap().snapshot.complete);
+    *facts.miss_receipt.lock().unwrap() = true;
+    let _unconsumed = trader.execution_snapshot(batch[0].identity.signed_hash.as_deref().unwrap())
+        .await.unwrap();
+    let mut committed = false;
+    let reject = trader.with_runtime_claim_read_fence(batch, &mut || { committed = true; Ok(()) });
+    assert!(reject.unwrap_err().to_string().contains("CLAIM_GENERATION"));
+    assert!(!committed);
+    assert_eq!(live::check_runtime_account(&broker, false).await.unwrap_err().to_string(),
+        "CLAIM_GENERATION");
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.must_end() && run.account_read.is_none() && state.live.claims.is_empty());
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
 }
 
 async fn actual_adapter_two_rounds(cash_first: bool) {
@@ -373,7 +518,8 @@ async fn unburned_loss_native_account_requires_exact_or_zero_balance_and_officia
             let state = broker.state.lock();
             let identity = state.live.attempts[&1].lock().identity.clone();
             RuntimeClaimInventory { identity,
-                execution_generation: state.live.generation[&1], inventory_atoms: state.live.net_inventory[&1] }
+                execution_generation: state.live.generation[&1], validated_read_generation: state.live.generation[&1],
+                inventory_atoms: state.live.net_inventory[&1] }
         };
         assert!(!inventory.inventory_atoms.is_zero());
         let balance = match balance_kind {
@@ -399,7 +545,7 @@ async fn unburned_loss_native_account_requires_exact_or_zero_balance_and_officia
             assert!(observation.bound_claims.is_empty(), "zero payout is not a cash claim");
             for field in ["generation", "identity"] {
                 let mut wrong = inventory.clone();
-                if field == "generation" { wrong.execution_generation += 1; }
+                if field == "generation" { wrong.validated_read_generation += 1; }
                 else { wrong.identity.market_id += 1; }
                 assert!(trader.runtime_account_observation(&[wrong]).await.is_err());
             }

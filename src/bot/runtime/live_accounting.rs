@@ -608,11 +608,12 @@ impl crate::bot::runtime::Broker {
             let mut state = self.state.lock();
             let run = state.live.controlled.as_mut().unwrap();
             if run.emitter.is_finished() { return; }
+            run.stop_expired_recheck();
             if run.control.lock().stop.is_none() { run.stop("MANUAL_STOP", true, chrono::Utc::now()); }
         }
         let cleanup = tokio::time::timeout(cleanup_budget, async {
             self.sync_live().await?;
-            self.settle_resolved(data).await
+            self.settle_live_results(data, false).await
         }).await;
         let cleanup_complete = matches!(cleanup, Ok(Ok(())));
         // Cleanup consumes the same W0 window. Read the original clocks only
@@ -648,7 +649,7 @@ impl crate::bot::runtime::Broker {
                     };
                     if !pending { break; }
                     self.sync_live().await?;
-                    self.settle_resolved(data).await?;
+                    self.settle_live_results(data, false).await?;
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
                 Ok::<(), anyhow::Error>(())
@@ -671,14 +672,36 @@ impl crate::bot::runtime::Broker {
     pub(super) async fn settle_controlled_live(
         &self, data: &dyn crate::service::venue::MarketData,
     ) -> anyhow::Result<()> {
+        self.settle_live_results(data, true).await
+    }
+
+    async fn settle_live_results(
+        &self, data: &dyn crate::service::venue::MarketData, original_poll: bool,
+    ) -> anyhow::Result<()> {
+        use super::live_events::{flush_events, prepare_lifecycle};
+
         let lane = self.live_operation_lane().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
         let _operation = lane.lock().await;
-        if self.state.lock().live.controlled.as_ref().unwrap().emitter.is_finished() { return Ok(()); }
-        let mut ids: Vec<_> = self.state.lock().live.controlled.as_ref().unwrap()
-            .traded.keys().copied().collect();
+        let (mut ids, retry) = {
+            let state = self.state.lock();
+            let run = state.live.controlled.as_ref().unwrap();
+            if run.emitter.is_finished() { return Ok(()); }
+            let retry = run.settlement_recheck.filter(|_| original_poll).map(|wait| wait.market_id);
+            (run.traded.keys().copied().collect::<Vec<_>>(), retry)
+        };
         ids.sort_unstable();
         for id in ids {
-            let market = match data.settlement_market(id).await {
+            let read = if retry.is_some() {
+                let Some(budget) = self.settlement_batch_budget()? else { return Ok(()); };
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(budget) => Err(anyhow::anyhow!("DATA_UNAVAILABLE")),
+                    read = data.settlement_market(id) => read,
+                }
+            } else {
+                data.settlement_market(id).await
+            };
+            let market = match read {
                 Ok(market) => market,
                 Err(error) => {
                     let error = crate::service::predict_fun::settlement_read_error(error);
@@ -688,6 +711,10 @@ impl crate::bot::runtime::Broker {
                         let mut state = self.state.lock();
                         let run = state.live.controlled.as_mut().unwrap();
                         run.account_read = None;
+                        run.stop_expired_recheck();
+                        if retry.is_some() {
+                            run.stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                        }
                         if transient {
                             run.note_failure(super::live_control::FailureKind::Settlement,
                                 "READ_UNAVAILABLE", chrono::Utc::now());
@@ -703,25 +730,110 @@ impl crate::bot::runtime::Broker {
                     return Err(error);
                 }
             };
-            let events = {
+            let (events, stopped) = {
                 let mut state = self.state.lock();
-                if market.id != id {
-                    state.live.controlled.as_mut().unwrap().stop("FACT_CONFLICT", true, chrono::Utc::now());
-                    super::live_events::prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?
-                } else {
-                    apply_official_result(&mut state, &market).map_err(anyhow::Error::msg)?
+                let mut events = Vec::new();
+                let mut cutoff = false;
+                if retry.is_none() {
+                    state.live.controlled.as_mut().unwrap().stop_expired_recheck();
                 }
+                if retry.is_none() || self.active_recheck_budget(&mut state).is_some() {
+                    if market.id != id {
+                        state.live.controlled.as_mut().unwrap().stop("FACT_CONFLICT", true, chrono::Utc::now());
+                    } else {
+                        match apply_official_result(&mut state, &market, retry.is_some(), retry == Some(id)) {
+                            Ok(Some(prepared)) => events = prepared,
+                            Ok(None) => cutoff = true,
+                            Err(_) if retry.is_some() => {
+                                state.live.controlled.as_mut().unwrap().stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                            }
+                            Err(error) => return Err(anyhow::Error::msg(error)),
+                        }
+                    }
+                    if !cutoff && retry == Some(id) {
+                        let run = state.live.controlled.as_ref().unwrap();
+                        let confirmed = state.live.attempts.iter().any(|(attempt, handle)| {
+                            handle.lock().identity.market_id == id && run.attempt_outcomes.contains_key(attempt)
+                        });
+                        if !confirmed {
+                            state.live.controlled.as_mut().unwrap().stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                        }
+                    }
+                }
+                let stopped = cutoff || (retry.is_some() && self.active_recheck_budget(&mut state).is_none());
+                if stopped || market.id != id {
+                    events.extend(prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?);
+                }
+                (events, stopped)
             };
-            super::live_events::flush_events(events).map_err(anyhow::Error::msg)?;
+            flush_events(events).map_err(anyhow::Error::msg)?;
+            if stopped { return Ok(()); }
         }
-        // Cash-first evidence must be re-proved after the official outcome is
-        // published, not promoted from a stored tuple on an older read.
-        if !self.state.lock().live.pending_claims.is_empty() {
+        // Require a new receipt from the original account owner; never fall
+        // through to the normal pending-claims read on a stopped recheck.
+        if retry.is_some() {
+            let Some(budget) = self.settlement_batch_budget()? else { return Ok(()); };
+            self.state.lock().live.controlled.as_mut().unwrap().account_read = None;
+            let account = super::live_control::RECHECK_ACCOUNT_CUTOFF.scope(
+                std::cell::Cell::new(None), super::live::check_runtime_account(self, false));
+            let result = tokio::select! {
+                biased;
+                _ = tokio::time::sleep(budget) => Err(anyhow::anyhow!("DATA_UNAVAILABLE")),
+                result = account => result,
+            };
+            let (events, stopped) = {
+                let mut state = self.state.lock();
+                let within_budget = self.active_recheck_budget(&mut state).is_some();
+                let run = state.live.controlled.as_ref().unwrap();
+                let current = within_budget && run.phase1.clock.now().ok().is_some_and(|now| {
+                    run.account_read.as_ref().is_some_and(|read| read.matches(&state.live, now))
+                });
+                let recovered = result.is_ok() && current && self.active_recheck_budget(&mut state).is_some();
+                let run = state.live.controlled.as_mut().unwrap();
+                if recovered {
+                    run.settlement_recheck = None;
+                } else {
+                    run.stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+                }
+                (prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?, !recovered)
+            };
+            flush_events(events).map_err(anyhow::Error::msg)?;
+            result?;
+            if stopped { return Ok(()); }
+        } else if !self.state.lock().live.pending_claims.is_empty() {
+            // Preserve original cash-first proof on non-recovery reads/cleanup.
             super::live::check_runtime_account(self, false).await?;
         }
         self.state.lock().live.controlled.as_mut().unwrap()
             .clear_failure(super::live_control::FailureKind::Settlement);
         Ok(())
+    }
+
+    fn active_recheck_budget(&self, state: &mut super::State) -> Option<std::time::Duration> {
+        let entries_stopped = state.entry_stop_reason.is_some();
+        let run = state.live.controlled.as_mut().unwrap();
+        run.stop_expired_recheck();
+        if !entries_stopped && self.controlled_run().is_none_or(|run| run.stopped()) {
+            run.stop("DEADLINE", true, chrono::Utc::now());
+        }
+        if entries_stopped || run.must_end() { return None; }
+        match run.recheck_budget() {
+            Ok(budget) => Some(budget),
+            Err(reason) => {
+                run.stop(reason, true, chrono::Utc::now());
+                None
+            }
+        }
+    }
+
+    fn settlement_batch_budget(&self) -> anyhow::Result<Option<std::time::Duration>> {
+        let events = {
+            let mut state = self.state.lock();
+            if let Some(budget) = self.active_recheck_budget(&mut state) { return Ok(Some(budget)); }
+            super::live_events::prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?
+        };
+        super::live_events::flush_events(events).map_err(anyhow::Error::msg)?;
+        Ok(None)
     }
 }
 
@@ -739,16 +851,31 @@ fn normal_unpublished_result(market: &crate::service::venue::TradableMarket) -> 
 
 /// Apply immutable official result metadata to the existing applied inventory.
 /// The caller owns the operation lane and flushes only after releasing State.
+/// `Ok(None)` means the active batch stopped before consuming this result.
 fn apply_official_result(
     state: &mut crate::bot::runtime::State,
     market: &crate::service::venue::TradableMarket,
-) -> Result<Vec<super::live_events::PreparedLiveEvent>, String> {
+    active_batch: bool,
+    retry: bool,
+) -> Result<Option<Vec<super::live_events::PreparedLiveEvent>>, String> {
     use super::live_control::LiveOutcome;
     use super::live_events::{self, LivePayload, PayoutPayload};
     use super::paper::{self, Settlement};
-    let run = state.live.controlled.as_ref().ok_or("CONTEXT_MISSING")?;
+    let run = state.live.controlled.as_mut().ok_or("CONTEXT_MISSING")?;
+    let now = match run.phase1.clock.now() {
+        Ok(now) => now,
+        Err(_) if active_batch => {
+            run.stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
+            return Ok(None);
+        }
+        Err(_) => return Err("DATA_UNAVAILABLE".into()),
+    };
+    // Use the decision/audit sample before any result side effect, including
+    // for non-target markets in this batch. Cleanup has its own budget.
+    if active_batch && !run.advance_recheck_at(now) {
+        return Ok(None);
+    }
     let original = run.traded.get(&market.id).ok_or("CONTEXT_MISSING")?;
-    let now = run.phase1.clock.now().map_err(|_| "DATA_UNAVAILABLE")?;
     let prices = market.start_price.zip(market.end_price);
     let identity = paper::same_round(original, market);
     let mut result = if identity == paper::RoundIdentity::Contradiction {
@@ -770,6 +897,35 @@ fn apply_official_result(
         (record.identity.market_id == market.id).then_some((*id, record))
     }).collect();
     attempts.sort_by_key(|(id, _)| *id);
+    let closed_execution = state.live.baseline.is_some() && state.live.pending_claims.is_empty()
+        && state.live.reservations.values().all(U256::is_zero)
+        && state.live.attempts.values().all(|handle| {
+            let record = handle.lock();
+            record.phase == crate::service::venue::AttemptPhase::Closed
+                && record.submission != crate::service::venue::Submission::Unknown
+        })
+        && attempts.iter().all(|(id, record)| {
+            record.identity.account == run.identity
+                && (record.identity.token_id == original.yes_token || record.identity.token_id == original.no_token)
+                && (record.submission != crate::service::venue::Submission::Accepted
+                    || (state.live.watermarks.get(id).is_some_and(|watermark| watermark.is_complete())
+                        && state.live.net_inventory.contains_key(id) && state.live.net_cash.contains_key(id)))
+        });
+    let eligible = !retry && closed_execution && run.settlement_recheck.is_none()
+        && run.order_wait.is_none() && run.cash_wait.is_none() && !run.loss_latched
+        && state.entry_stop_reason.is_none() && !run.must_end()
+        && market.ends_at.is_some_and(|end| now.utc >= end)
+        && market.end_price.is_none() && market.payout_yes.is_none() && !market.contested
+        && market.round_facts.as_ref().is_some_and(|facts| {
+            facts.oracle_status.as_deref() == Some("REGISTERED")
+                && facts.trading_status.as_deref() == Some("CLOSED")
+                && facts.yes_status.is_none() && facts.no_status.is_none()
+        })
+        && attempts.iter().any(|(id, record)| {
+            record.submission == crate::service::venue::Submission::Accepted
+                && !run.attempt_outcomes.contains_key(id)
+                && state.live.net_inventory.get(id).is_some_and(|quantity| !quantity.is_zero())
+        });
     let mut payloads = Vec::new();
     for (id, record) in attempts {
         let inventory = state.live.net_inventory.get(&id).copied().unwrap_or(U256::ZERO);
@@ -801,9 +957,16 @@ fn apply_official_result(
             if claim.is_zero() { "CONFIRMED" } else { "CASH_PENDING" }, payout, Some(claim)));
     }
     let run = state.live.controlled.as_mut().unwrap();
-    if result == Settlement::Pending && !payloads.iter().any(|(_, _, status, _, _)| *status == "CONFLICT")
-        && !(identity == paper::RoundIdentity::Match && normal_unpublished_result(market))
-    {
+    let conflict = payloads.iter().any(|(_, _, status, _, _)| *status == "CONFLICT");
+    if !conflict && result == Settlement::Pending {
+        if eligible && identity == paper::RoundIdentity::Match {
+            run.settlement_recheck = Some(super::live_control::SettlementRecheck { market_id: market.id, started: now, last: now });
+            run.pending_candidate = None;
+            tracing::info!(market_id = market.id, "closed result unpublished; awaiting next settlement poll");
+        } else if retry || !(identity == paper::RoundIdentity::Match && normal_unpublished_result(market)) {
+            run.stop("DATA_UNAVAILABLE", true, now.utc);
+        }
+    } else if retry && !conflict && !closed_execution {
         run.stop("DATA_UNAVAILABLE", true, now.utc);
     }
     for (id, _, status, payout, claim) in &payloads {
@@ -842,7 +1005,7 @@ fn apply_official_result(
             }))?);
     }
     events.extend(live_events::prepare_lifecycle(state)?);
-    Ok(events)
+    Ok(Some(events))
 }
 
 /// Whether one order's worst cash fits the window's caps.

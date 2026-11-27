@@ -579,6 +579,13 @@ impl OrderVenue for PredictFunTrader {
     ) -> Result<crate::service::venue::RuntimeAccountObservation> {
         self.read_runtime_account_observation(Some(closed)).await
     }
+
+    fn with_runtime_claim_read_fence(
+        &self, closed: &[crate::service::venue::RuntimeClaimInventory],
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.commit_at_claim_read_generation(closed, commit)
+    }
 }
 
 use super::{limit_amounts, limit_order_body, tradable, ApiRemoved, ReplayPolicy};
