@@ -13,6 +13,11 @@ LEGACY_FILES_SHA256 = "6de472f32a0076c26ba1888844b5c91c2468f0aa092144d769bc9d5e0
 SETTLED_BINARY_SHA256 = "9e437aa8fc047bbeccc60d5895e9d3418848819e7be9b16bf080fb2b4fbd78e3"
 SETTLED_FILES_SHA256 = "83b07c5e21547216526189db6d111b82a8b7140c4a5dd17b9394a7e9e745d960"
 
+SETTLED_DATA_RUN = "btc5m-live-6f81c6cf5f724702"
+SETTLED_DATA_GAS = ("data/reports/2026-11-27-btc5m-data-unavailable-stop/evidence/"
+                    "takeover-gas-6f81c6cf5f724702/chain-audit-projection.json")
+SETTLED_DATA_GAS_SHA256 = "7d0e49b72b0cab4064f0066624fce8787c3cd5b920bc0363dee08f4f695f6eb8"
+
 
 READ_UNAVAILABLE_BINARY_SHA256 = "bee8cbc4ab916133dcf2bd86306c65d0d0923d1009f2300880601c506e652dd1"
 READ_UNAVAILABLE_FILES_SHA256 = "c43ab1fcfa475880520420aa5422e3c7bdc376c88f7aee0c6485f00ff31fd662"
@@ -324,6 +329,113 @@ def qualify(*, started: dict, ended: dict, relations: Any, checkpoint: Any,
     return _qualify_settled(started=started, ended=ended, relations=relations, checkpoint=checkpoint,
                             checkpoint_event=checkpoint_event, tail=tail, old_native=old_native,
                             old_params=old_params, seed=seed, initial=initial, r20=False)
+
+
+def qualify_settled_data(*, started: dict, ended: dict, relations: Any,
+                         checkpoint_event: dict | None, initial: dict | None,
+                         old_native: dict, old_params: dict, seed: dict,
+                         gas_raw: bytes, sources: dict[str, str]) -> dict:
+    """Qualify just the frozen settled stop; neither finish it nor admit live risk."""
+    gas_digest = hashlib.sha256(gas_raw).hexdigest()
+    live.require(gas_digest == SETTLED_DATA_GAS_SHA256 and started["run_id"] == SETTLED_DATA_RUN)
+    gas = live.strict_json(gas_raw)
+    payer = started["account_identity"]["signer_address"].lower()
+    live.require(gas["source_sha256"] == sources and gas["run_id"] == SETTLED_DATA_RUN
+                 and gas["payer_binding_sha256"] == hashlib.sha256(payer.encode()).hexdigest()
+                 and gas["chain_id"] == started["account_identity"]["chain_id"] == 56
+                 and gas["scope"] == "DIRECT_BSC_L1_TRANSACTION_FEES_OF_ENROLLED_SIGNER_ONLY")
+    if initial is None or checkpoint_event is None or relations.final is None:
+        raise live.LiveInvalid()
+    live.require(not relations.latched and not relations.cash_pending
+                 and relations.positions == relations.reconciled_open_hashes == [])
+    final = relations.final["payload"]
+    book = relations.final["accounting"]
+    live.require(final == {"audit_complete": True, "cash_complete": True, "execution_complete": True,
+                           "positions": [], "run_status": "STOPPED", "stop_detail": None,
+                           "stop_reason": "DATA_UNAVAILABLE", "takeover_required": True, "unresolved": []}
+                 and ended["exit_facts"] == {"child_returncode": 0, "child_signal": None,
+                     "forced_cleanup": False, "launcher_exit": 0, "stop_reason": "DATA_UNAVAILABLE"}
+                 and book["gas_status"] == "NOT_MEASURED" and book["gas_paid_atoms"] is None
+                 and book["status"] == "COMPLETE" and book["reason"] == "NONE"
+                 and not book["loss_latched"] and book["pending_claim_value"] is None
+                 and book["cost"] == book["reserved"] == book["unrealized"] == "0")
+    account = old_native["account"]
+    history = {key: list(account[key]) for key in ("claimed_win", "settled_zero")}
+    prior_claims = _r20_prior_claims(history)
+    budget, orders = old_params["budget"], seed["declared_orders"]
+    opening = initial["payload"]
+    live.require(len(orders) == len(set(orders)) == 25 and seed["committed_budget_atoms"] == budget
+                 and orders == old_native["reconciliation"]["declared_orders"]
+                 and account["positions"] == account["open_orders"] == []
+                 and opening["scope"] == "STARTUP" and opening["complete"] is True
+                 and opening["foreign_risk"] is False and opening["positions"] == opening["open_hashes"] == []
+                 and opening["collateral_atoms"] == account["collateral_atoms"] == str(budget + prior_claims)
+                 and initial["accounting"]["cash"] == str(budget))
+
+    spend = received = 0
+    economic_orders, zero_fill_orders, window_orders, claim_owners = [], [], [], set()
+    for key, attempt in relations.attempts.items():
+        if relations._zero_risk_unsent(attempt):
+            live.require(attempt["hash"] not in orders)
+            continue
+        execution, applied = attempt["execution"], attempt["applied"]
+        order_hash = attempt["hash"]
+        live.require(attempt["submission"] == "ACCEPTED" and attempt["remaining"] == 0
+                     and order_hash is not None and order_hash not in orders + window_orders
+                     and attempt["venue"] is not None and execution is not None
+                     and relations._execution_closed(execution)
+                     and execution["signed_hash"] == order_hash
+                     and execution["venue_order_id"] == attempt["venue"]
+                     and int(execution["gross_q_atoms"]) == applied["gross_q_atoms"]
+                     and all(int(execution["facts"][name]["atoms"]) == applied[name + "_atoms"]
+                             for name in ("gross_cash", "collateral_fee", "share_fee", "net_cash", "net_inventory")))
+        window_orders.append(order_hash)
+        market, token = attempt["identity"]
+        entry = {"signed_hash": order_hash, "venue_order_id": attempt["venue"],
+                 "market_id": int(market), "token": token, "final_generation": execution["generation"]}
+        if execution["quantity_class"] == "ZERO":
+            live.require(all(amount == 0 for amount in applied.values()) and key not in relations.claims)
+            zero_fill_orders.append(entry)
+            continue
+        cost, shares = applied["net_cash_atoms"], applied["net_inventory_atoms"]
+        live.require(cost > 0 and shares > 0 and key in relations.claims)
+        claim = relations.claims[key]
+        settled, paid, _ = claim["value"]
+        live.require(settled == shares and paid in (0, shares) and (not paid or claim["confirmed"]))
+        claim_owners.add(key)
+        spend += cost
+        received += paid
+        record = {"market_id": int(market), "token": token, "oracle_status": "RESOLVED",
+                  "trading_status": "CLOSED", "outcome_status": "WON" if paid else "LOST",
+                  "payout_millionths": 1000000 if paid else 0}
+        if paid:
+            record.update(inventory_atoms=str(shares), claim_atoms=str(paid))
+        history["claimed_win" if paid else "settled_zero"].append(record)
+        economic_orders.append({**entry, "net_cost_atoms": str(cost),
+                                "net_inventory_atoms": str(shares), "claim_atoms": str(paid)})
+
+    net_loss, next_budget = spend - received, budget - spend
+    checkpoint = checkpoint_event["payload"]
+    live.require((len(economic_orders), len(zero_fill_orders)) == (6, 1)
+                 and set(relations.claims) == claim_owners and next_budget > 0
+                 and 0 < net_loss < old_params["loss"]
+                 and book["cash"] == book["nav"] == book["available"] == str(next_budget + received)
+                 and book["realized"] == book["net_pnl"] == str(-net_loss)
+                 and _r20_prior_claims(history) == prior_claims + received
+                 and checkpoint["foreign_risk"] is False
+                 and checkpoint["positions"] == checkpoint["open_hashes"] == []
+                 and checkpoint["collateral_atoms"] == str(next_budget + prior_claims + received))
+    return {"proof_kind": "SETTLED_DATA_UNAVAILABLE_PLUS_FRESH_NATIVE_REQUIRED",
+            "old_run_id": SETTLED_DATA_RUN, "old_final_preserved": True,
+            "final_event_seq": relations.seq, "prior_budget_atoms": str(budget),
+            "next_budget_atoms": str(next_budget), "net_loss_atoms": str(net_loss),
+            "gross_spend_atoms": str(spend), "confirmed_window_claim_atoms": str(received),
+            "economic_orders": economic_orders, "zero_fill_orders": zero_fill_orders,
+            "window_order_hashes": window_orders, "expected_history": history,
+            "gas_proof_sha256": gas_digest,
+            "historical_gas": {"original_status": book["gas_status"],
+                               "original_paid_atoms": book["gas_paid_atoms"],
+                               "direct_fee_atoms": gas["direct_signer_fee_atoms_derived"]}}
 
 
 def _qualify_settled(*, started: dict, ended: dict, relations: Any, checkpoint: Any,

@@ -1623,9 +1623,9 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 log_summary(name, ctx);
                 return Ok(());
             }
+            _ = live::order_wait::r22_wakeup(ctx.broker.as_ref()), if controlled.is_some() => { live::order_wait::observe_r22(ctx.broker.as_ref(), ctx.data.as_ref(), &mut last_settle).await; }
             _ = ticker.tick() => {
-                if let Some(run) = &controlled {
-                    if run.stopped() {
+                if let Some(run) = &controlled { if run.stopped() {
                         ctx.broker.stop_entries(ControlledStop::Deadline);
                         ctx.broker.finish_controlled(ctx.data.as_ref()).await;
                         return Ok(());
@@ -1645,7 +1645,7 @@ pub async fn drive(strategy: &mut dyn Strategy, ctx: &Ctx) -> Result<()> {
                 }
                 let result = if waiting_cash || waiting_order
                     || live_control::cash_wait::waiting(ctx.broker.as_ref())
-                    || live::order_wait::waiting(ctx.broker.as_ref()) {
+                    || live::order_wait::waiting(ctx.broker.as_ref()) || live::order_wait::r22_waiting(ctx.broker.as_ref()) {
                     Ok(()) } else if ctx.broker.is_live() {
                     // Dropping a tick midway could lose track of an order it just
                     // posted, so a live run finishes it. Every call in it is

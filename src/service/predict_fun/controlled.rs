@@ -547,7 +547,7 @@ impl BookTransport {
     fn filled(&self) -> bool {
         matches!(self.1, "controlled_fill" | "controlled_partial" | "controlled_missing_fee" | "live003"
             | "book_bid_moved" | "book_moved_then_frozen" | "book_inside_limit_thin_then_frozen"
-            | "controlled_missing_facts")
+            | "controlled_missing_facts" | "r22_incident_fill")
     }
 
     /// Whether the venue's fill read still lags behind its acceptance.
@@ -603,7 +603,11 @@ impl BookTransport {
         let divisor = U256::from(if self.partial() { 2 } else { 1 });
         let gross = requested / divisor;
         let cash = signed_cash / divisor;
-        (gross, cash, gross / U256::from(100))
+        let fee = if self.1 == "r22_incident_fill" && order["tokenId"] == "77" {
+            // D22-01 only: the raw venue fee leaves exactly the incident inventory.
+            gross.checked_sub(U256::from(r16_fixture::REDEMPTION_ATOMS)).unwrap()
+        } else { gross / U256::from(100) };
+        (gross, cash, fee)
     }
 
     /// The venue's own market document for one round.

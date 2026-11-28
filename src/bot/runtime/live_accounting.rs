@@ -678,12 +678,32 @@ impl crate::bot::runtime::Broker {
     async fn settle_live_results(
         &self, data: &dyn crate::service::venue::MarketData, original_poll: bool,
     ) -> anyhow::Result<()> {
-        use super::live_events::{flush_events, prepare_lifecycle};
-
         let lane = self.live_operation_lane().ok_or_else(|| anyhow::anyhow!("CONTEXT_MISSING"))?;
-        let _operation = lane.lock().await;
+        let operation = lane.lock().await;
+        self.settle_live_results_on_lane(data, original_poll, operation).await
+    }
+
+    pub(super) async fn settle_live_results_on_lane(
+        &self, data: &dyn crate::service::venue::MarketData, original_poll: bool,
+        _operation: tokio::sync::MutexGuard<'_, ()>,
+    ) -> anyhow::Result<()> {
+        use super::live_events::{flush_events, prepare_lifecycle};
+        use crate::service::predict_fun::account::runtime_claims::{capture_native_market, OfficialBatch, OFFICIAL_BATCH};
+
+        let check_r22 = |state: &mut super::State| -> anyhow::Result<()> {
+            // Cleanup is a separate consumer, not a recovery probe. Honor the
+            // existing R3 cutoff before the R22 boundary if both are armed.
+            if original_poll {
+                let run = state.live.controlled.as_mut().unwrap();
+                if run.r22_wait.is_some() { run.stop_expired_recheck(); }
+                super::live_control::check_r22_boundary(state)?;
+            }
+            Ok(())
+        };
+        let mut official_batch = OfficialBatch::new();
         let (mut ids, retry) = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
+            check_r22(&mut state)?;
             let run = state.live.controlled.as_ref().unwrap();
             if run.emitter.is_finished() { return Ok(()); }
             let retry = run.settlement_recheck.filter(|_| original_poll).map(|wait| wait.market_id);
@@ -691,15 +711,16 @@ impl crate::bot::runtime::Broker {
         };
         ids.sort_unstable();
         for id in ids {
-            let read = if retry.is_some() {
+            check_r22(&mut self.state.lock())?;
+            let (read, native) = if retry.is_some() {
                 let Some(budget) = self.settlement_batch_budget()? else { return Ok(()); };
                 tokio::select! {
                     biased;
-                    _ = tokio::time::sleep(budget) => Err(anyhow::anyhow!("DATA_UNAVAILABLE")),
-                    read = data.settlement_market(id) => read,
+                    _ = tokio::time::sleep(budget) => (Err(anyhow::anyhow!("DATA_UNAVAILABLE")), None),
+                    read = capture_native_market(data.settlement_market(id)) => read,
                 }
             } else {
-                data.settlement_market(id).await
+                capture_native_market(data.settlement_market(id)).await
             };
             let market = match read {
                 Ok(market) => market,
@@ -709,6 +730,7 @@ impl crate::bot::runtime::Broker {
                         .is_some_and(|error| error.code == crate::service::venue::VenueErrorCode::ReadUnavailable);
                     let events = {
                         let mut state = self.state.lock();
+                        check_r22(&mut state)?;
                         let run = state.live.controlled.as_mut().unwrap();
                         run.account_read = None;
                         run.stop_expired_recheck();
@@ -732,6 +754,7 @@ impl crate::bot::runtime::Broker {
             };
             let (events, stopped) = {
                 let mut state = self.state.lock();
+                check_r22(&mut state)?;
                 let mut events = Vec::new();
                 let mut cutoff = false;
                 if retry.is_none() {
@@ -740,7 +763,10 @@ impl crate::bot::runtime::Broker {
                 if retry.is_none() || self.active_recheck_budget(&mut state).is_some() {
                     if market.id != id {
                         state.live.controlled.as_mut().unwrap().stop("FACT_CONFLICT", true, chrono::Utc::now());
-                    } else {
+                    } else if !state.live.controlled.as_ref().unwrap().r22_wait.as_ref()
+                        .is_some_and(|wait| wait.proof.owner.identity.market_id == id && retry != Some(id)) {
+                        // The R22 owner's result is a fact in this batch, not a ledger update
+                        // until the same account read proves both the canonical legs and the balance.
                         match apply_official_result(&mut state, &market, retry.is_some(), retry == Some(id)) {
                             Ok(Some(prepared)) => events = prepared,
                             Ok(None) => cutoff = true,
@@ -768,14 +794,21 @@ impl crate::bot::runtime::Broker {
             };
             flush_events(events).map_err(anyhow::Error::msg)?;
             if stopped { return Ok(()); }
+            official_batch.insert(id, (market, native));
         }
+        let runtime_batch = OFFICIAL_BATCH.scope(official_batch, super::live::check_runtime_account(self, false));
         // Require a new receipt from the original account owner; never fall
         // through to the normal pending-claims read on a stopped recheck.
         if retry.is_some() {
             let Some(budget) = self.settlement_batch_budget()? else { return Ok(()); };
-            self.state.lock().live.controlled.as_mut().unwrap().account_read = None;
+            let combined_r22 = {
+                let mut state = self.state.lock();
+                let run = state.live.controlled.as_mut().unwrap();
+                run.account_read = None;
+                run.r22_wait.is_some()
+            };
             let account = super::live_control::RECHECK_ACCOUNT_CUTOFF.scope(
-                std::cell::Cell::new(None), super::live::check_runtime_account(self, false));
+                std::cell::Cell::new(None), runtime_batch);
             let result = tokio::select! {
                 biased;
                 _ = tokio::time::sleep(budget) => Err(anyhow::anyhow!("DATA_UNAVAILABLE")),
@@ -785,14 +818,16 @@ impl crate::bot::runtime::Broker {
                 let mut state = self.state.lock();
                 let within_budget = self.active_recheck_budget(&mut state).is_some();
                 let run = state.live.controlled.as_ref().unwrap();
-                let current = within_budget && run.phase1.clock.now().ok().is_some_and(|now| {
+                let current = within_budget && run.r22_wait.is_none() && run.phase1.clock.now().ok().is_some_and(|now| {
                     run.account_read.as_ref().is_some_and(|read| read.matches(&state.live, now))
                 });
                 let recovered = result.is_ok() && current && self.active_recheck_budget(&mut state).is_some();
                 let run = state.live.controlled.as_mut().unwrap();
                 if recovered {
                     run.settlement_recheck = None;
+                    if combined_r22 { run.account_read = None; }
                 } else {
+                    run.account_read = None;
                     run.stop("DATA_UNAVAILABLE", true, chrono::Utc::now());
                 }
                 (prepare_lifecycle(&mut state).map_err(anyhow::Error::msg)?, !recovered)
@@ -800,9 +835,13 @@ impl crate::bot::runtime::Broker {
             flush_events(events).map_err(anyhow::Error::msg)?;
             result?;
             if stopped { return Ok(()); }
-        } else if !self.state.lock().live.pending_claims.is_empty() {
+        } else if {
+            let state = self.state.lock();
+            !state.live.pending_claims.is_empty()
+                || (original_poll && state.live.controlled.as_ref().is_some_and(|run| run.r22_wait.is_some()))
+        } {
             // Preserve original cash-first proof on non-recovery reads/cleanup.
-            super::live::check_runtime_account(self, false).await?;
+            runtime_batch.await?;
         }
         self.state.lock().live.controlled.as_mut().unwrap()
             .clear_failure(super::live_control::FailureKind::Settlement);
@@ -849,10 +888,34 @@ fn normal_unpublished_result(market: &crate::service::venue::TradableMarket) -> 
         })
 }
 
+/// Read-only verdict shared with the runtime settlement consumer.
+pub(super) fn judge_official_round(
+    original: &crate::service::venue::TradableMarket, market: &crate::service::venue::TradableMarket,
+) -> (super::paper::RoundIdentity, super::paper::Settlement, Option<(f64, f64)>, Option<f64>) {
+    use super::paper::{self, Settlement};
+    let prices = market.start_price.zip(market.end_price);
+    let identity = paper::same_round(original, market);
+    let mut result = if identity == paper::RoundIdentity::Contradiction {
+        Settlement::Conflict
+    } else if identity == paper::RoundIdentity::Incomplete {
+        Settlement::Pending
+    } else if let (Some(facts), Some((start, end))) = (market.round_facts.as_ref(), prices) {
+        paper::settle_from_facts(market, facts, start, end)
+    } else { Settlement::Pending };
+    let payout = prices.and_then(|(start, end)| paper::settlement_payout(market, start, end));
+    if result == Settlement::Confirmed {
+        let (start, end) = prices.unwrap();
+        let expected = if end > start { 1.0 } else if end < start { 0.0 } else { 0.5 };
+        if payout.is_none() { result = Settlement::Pending; }
+        else if payout != Some(expected) { result = Settlement::Conflict; }
+    }
+    (identity, result, prices, payout)
+}
+
 /// Apply immutable official result metadata to the existing applied inventory.
 /// The caller owns the operation lane and flushes only after releasing State.
 /// `Ok(None)` means the active batch stopped before consuming this result.
-fn apply_official_result(
+pub(super) fn apply_official_result(
     state: &mut crate::bot::runtime::State,
     market: &crate::service::venue::TradableMarket,
     active_batch: bool,
@@ -876,22 +939,7 @@ fn apply_official_result(
         return Ok(None);
     }
     let original = run.traded.get(&market.id).ok_or("CONTEXT_MISSING")?;
-    let prices = market.start_price.zip(market.end_price);
-    let identity = paper::same_round(original, market);
-    let mut result = if identity == paper::RoundIdentity::Contradiction {
-        Settlement::Conflict
-    } else if identity == paper::RoundIdentity::Incomplete {
-        Settlement::Pending
-    } else if let (Some(facts), Some((start, end))) = (market.round_facts.as_ref(), prices) {
-        paper::settle_from_facts(market, facts, start, end)
-    } else { Settlement::Pending };
-    let payout = prices.and_then(|(start, end)| paper::settlement_payout(market, start, end));
-    if result == Settlement::Confirmed {
-        let (start, end) = prices.unwrap();
-        let expected = if end > start { 1.0 } else if end < start { 0.0 } else { 0.5 };
-        if payout.is_none() { result = Settlement::Pending; }
-        else if payout != Some(expected) { result = Settlement::Conflict; }
-    }
+    let (identity, result, prices, payout) = judge_official_round(original, market);
     let mut attempts: Vec<_> = state.live.attempts.iter().filter_map(|(id, handle)| {
         let record = handle.lock().clone();
         (record.identity.market_id == market.id).then_some((*id, record))

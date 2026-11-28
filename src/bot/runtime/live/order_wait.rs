@@ -576,7 +576,133 @@ async fn wait_budget_stop(broker: &Broker) {
     }
 }
 
-/// Dispatch one original drive observation without expanding the parent runtime.
+pub(in crate::bot::runtime) fn r22_waiting(broker: &Broker) -> bool {
+    broker.state.lock().live.controlled.as_ref().is_some_and(|run| run.r22_wait.is_some())
+}
+
+// Dispatch one original drive observation without expanding the parent runtime.
+tokio::task_local! { pub(super) static R22_PROBE: (); }
+
+pub(in crate::bot::runtime) async fn r22_wakeup(broker: &Broker) {
+    use std::time::Duration;
+    loop {
+        let due = {
+            let state = broker.state.lock();
+            state.live.controlled.as_ref().and_then(|run| {
+                let wait = run.r22_wait.as_ref()?;
+                if run.settlement_recheck.is_some() || wait.slots >= 2 || run.must_end() { return None; }
+                let now = run.phase1.clock.now().ok()?;
+                let second = wait.proof.sampled.elapsed_ms.checked_add(30_000)?;
+                Some(if wait.slots == 0 { 0 } else { second.saturating_sub(now.elapsed_ms) })
+            })
+        };
+        match due {
+            Some(0) => return,
+            Some(ms) => tokio::time::sleep(Duration::from_millis(ms.min(100))).await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct R22BatchBudget {
+    utc: DateTime<Utc>,
+    elapsed_ms: u64,
+    timer: tokio::time::Instant,
+}
+
+tokio::task_local! { static R22_BATCH_BUDGET: R22BatchBudget; }
+
+#[derive(Debug, thiserror::Error)]
+#[error("R22 batch budget exhausted")]
+pub(in crate::bot::runtime) struct R22BatchExpired;
+
+impl R22BatchBudget {
+    fn remaining(self, now: CheckTime) -> Duration {
+        let utc = (self.utc - now.utc).to_std().unwrap_or_default();
+        let elapsed = Duration::from_millis(self.elapsed_ms.saturating_sub(now.elapsed_ms));
+        utc.min(elapsed).min(self.timer.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    async fn wait(self, clock: &dyn crate::service::observation::Clock) {
+        loop {
+            let Ok(now) = clock.now() else { return; };
+            let remaining = self.remaining(now);
+            if remaining.is_zero() { return; }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+}
+
+pub(in crate::bot::runtime) fn check_r22_batch(now: CheckTime) -> anyhow::Result<()> {
+    if R22_BATCH_BUDGET.try_with(|budget| budget.remaining(now).is_zero()).unwrap_or(false) {
+        return Err(R22BatchExpired.into());
+    }
+    Ok(())
+}
+
+pub(in crate::bot::runtime) async fn observe_r22(broker: &Broker, data: &dyn crate::service::venue::MarketData,
+    last_settle: &mut std::time::Instant) {
+    use super::super::live_control::check_r22_boundary;
+    let Some(lane) = broker.live_operation_lane() else { return; };
+    let timer = tokio::time::Instant::now();
+    let planned = (|| {
+        let mut state = broker.state.lock();
+        check_r22_boundary(&mut state).ok()?;
+        let run = state.live.controlled.as_ref()?;
+        let wait = run.r22_wait.as_ref()?;
+        if run.settlement_recheck.is_some() || wait.slots >= 2 { return None; }
+        let now = run.phase1.clock.now().ok()?;
+        let second = wait.proof.sampled.elapsed_ms.checked_add(30_000)?;
+        let (slot, ms) = if now.elapsed_ms >= second { (2, 30_000) }
+            else if wait.slots == 0 { (1, second - now.elapsed_ms) } else { return None; };
+        let budget = R22BatchBudget {
+            utc: now.utc.checked_add_signed(chrono::Duration::milliseconds(ms as i64))?,
+            elapsed_ms: now.elapsed_ms.checked_add(ms)?,
+            timer: timer.checked_add(Duration::from_millis(ms))?,
+        };
+        Some((run.phase1.clock.clone(), wait.proof.sampled, wait.slots, slot, budget))
+    })();
+    let Some((clock, t0, previous, slot, budget)) = planned else { return; };
+    let batch = async {
+        let guard = lane.lock().await;
+        {
+            let mut state = broker.state.lock();
+            check_r22_boundary(&mut state)?;
+            let run = state.live.controlled.as_mut().unwrap();
+            let Some(wait) = run.r22_wait.as_mut() else { return Ok(()); };
+            if run.settlement_recheck.is_some() || wait.slots != previous || wait.proof.sampled != t0 { return Ok(()); }
+            wait.slots = slot;
+        }
+        if last_settle.elapsed() >= super::super::SETTLE_CHECK_EVERY {
+            *last_settle = std::time::Instant::now();
+            broker.settle_live_results_on_lane(data, true, guard).await
+        } else {
+            R22_PROBE.scope((), super::check_runtime_account(broker, false)).await
+        }
+    };
+    let expired = tokio::select! {
+        biased;
+        _ = broker.wait_controlled_stop() => false,
+        _ = budget.wait(clock.as_ref()) => true,
+        result = R22_BATCH_BUDGET.scope(budget, batch) => match result {
+            Err(error) if error.is::<R22BatchExpired>() => true,
+            Err(error) => { tracing::warn!(error = ?error, "R22 account boundary"); false },
+            Ok(()) => false,
+        },
+    };
+    if expired {
+        let mut state = broker.state.lock();
+        // A queued batch can expire without ever acquiring the lane. Retire only
+        // its own slot; a run stop or a competing observation retains precedence.
+        if check_r22_boundary(&mut state).is_ok() {
+            if let Some(wait) = state.live.controlled.as_mut().and_then(|run| run.r22_wait.as_mut()) {
+                if wait.proof.sampled == t0 && wait.slots == previous { wait.slots = slot; }
+            }
+        }
+    }
+}
+
 pub(crate) async fn observe_tick(
     broker: &Broker, data: &dyn crate::service::venue::MarketData,
 ) -> (bool, bool) {

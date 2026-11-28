@@ -920,6 +920,7 @@ impl PredictFunClient {
                 Err(_) => None,
             }
         };
+        if settlement { account::runtime_claims::project_native_market(id, &market); }
         Ok(tradable(&market, event.as_ref(), chrono::Utc::now()))
     }
 }

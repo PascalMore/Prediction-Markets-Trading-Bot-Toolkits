@@ -52,15 +52,16 @@ EFFECTIVE_START_SKEW_SECONDS = 120
 PAPER72_SECONDS = 259_200
 PAPER72_FINAL_BYTES = 1024 * 1024
 PAPER72_BINARY = BOT.parents[4] / "data/reports/2026-11-19-btc5m-live-parity-and-operations/evidence/candidate-v2/polymarket-toolkits"
-LIVE_BINARY = (BOT.parents[4] / "data/reports/2026-11-27-btc5m-fact-incomplete-stop/evidence"
-               / "context-root-fixed-candidate/polymarket-toolkits")
-LIVE_BINARY_SHA256 = "66f1286dae49bfc9b4ce2d7e66897c42d1034d20cccd341bfeac8f65d3482f21"
+LIVE_BINARY = (BOT.parents[4] / "data/reports/2026-11-27-btc5m-data-unavailable-stop/evidence"
+               / "release-r3-4194/polymarket-toolkits")
+LIVE_BINARY_SHA256 = "4e9d2dd2d6557354c221b070062069344d232366406fdff60436b3529c83b48c"
 LIVE_PATHS = (
     "src/config/controlled_live.rs", "src/bot/runtime/taker.rs",
     "src/bot/runtime/phase1_control.rs", "src/bot/runtime/live.rs",
     "src/bot/runtime/timing.rs",
     "src/bot/runtime/live_control.rs", "src/bot/runtime/live_control/channel.rs",
     "src/bot/runtime/live_control/tests.rs", "src/bot/runtime/live_accounting.rs",
+    "src/bot/runtime/live_control/tests/settlement_recheck.rs",
     "src/bot/runtime/live_control/tests/live003_regression.rs",
     "src/bot/runtime/live_control/tests/live004_regression.rs",
     "src/bot/runtime/live_events.rs", "src/bot/runtime/live_events/types.rs",

@@ -698,6 +698,7 @@ impl super::Broker {
                 // stop or a broken output lane ends the wait.
                 if let Some(run) = state.live.controlled.as_mut() {
                     super::live_control::cash_wait::observe_budget(run);
+                    if run.r22_wait.is_some() { let _ = run.advance_r22_boundary(); }
                 }
                 state.live.controlled.as_ref().is_some_and(|run| run.must_end())
             };

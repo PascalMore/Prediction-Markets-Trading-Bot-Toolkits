@@ -959,7 +959,8 @@ def _stopped_window(existing: dict, account: dict, *, old_bytes: bytes | None = 
         kind = _unsent_edge_kind(ended, final, accounting, exit_facts,
                                   order_events, event_kinds) or "REFUSE"
     r20_stop = account_recovery.known_r20_fact_incomplete(ended)
-    if kind == "REFUSE" and (account_recovery.known_ended(ended) or read_unavailable or r20_stop):
+    settled_data = run == account_recovery.SETTLED_DATA_RUN
+    if settled_data or (kind == "REFUSE" and (account_recovery.known_ended(ended) or read_unavailable or r20_stop)):
         if seed is None or seed_raw is None or anchor is None or budget != seed_budget or not prefix_canonical:
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         native_path = seeds[0].parent / "reconciliation.json"
@@ -971,16 +972,26 @@ def _stopped_window(existing: dict, account: dict, *, old_bytes: bytes | None = 
                             now=_parse_time(started["started_at"]), declared_orders=seed["declared_orders"])
         if (checked["reconciliation_sha256"] != hashlib.sha256(raw).hexdigest()
                 or not _reconciled_identity_matches(old_native.get("account_identity"))
-                or (r20_stop and live.canonical(checked["data"]) != live.canonical(public))):
+                or ((r20_stop or settled_data) and live.canonical(checked["data"]) != live.canonical(public))):
             raise Refused("HISTORY_REQUIRES_TAKEOVER")
         try:
-            qualifier = (account_recovery.qualify_read_unavailable if read_unavailable else
-                         account_recovery.qualify_r20 if r20_stop else account_recovery.qualify)
-            recovery = qualifier(started=started, ended=ended, relations=relations,
-                checkpoint=checkpoint, checkpoint_event=checkpoint_event, tail=tail,
-                old_native=old_native, old_params=checked["params"], seed=seed, initial=first_reconciliation,
-                **({"prefix": recovery_prefix} if read_unavailable else {}))
-        except live.LiveInvalid:
+            common: dict[str, Any] = dict(started=started, ended=ended, relations=relations,
+                checkpoint_event=checkpoint_event, old_native=old_native, old_params=checked["params"],
+                seed=seed, initial=first_reconciliation)
+            if settled_data:
+                sources = {name: hashlib.sha256(payload).hexdigest() for name, payload in metadata.items()}
+                sources.update({"events.jsonl": prefix_hash.hexdigest(),
+                    "attempt-reserved.json": hashlib.sha256(seed_raw).hexdigest(),
+                    "reconciliation.json": hashlib.sha256(raw).hexdigest()})
+                gas_raw = live._read_file(ROOT / account_recovery.SETTLED_DATA_GAS, 64 * 1024)
+                recovery = account_recovery.qualify_settled_data(**common, gas_raw=gas_raw, sources=sources)
+            else:
+                qualifier = (account_recovery.qualify_read_unavailable if read_unavailable else
+                             account_recovery.qualify_r20 if r20_stop else account_recovery.qualify)
+                if read_unavailable:
+                    common["prefix"] = recovery_prefix
+                recovery = qualifier(checkpoint=checkpoint, tail=tail, **common)
+        except (live.LiveInvalid, OSError):
             raise Refused("HISTORY_REQUIRES_TAKEOVER") from None
         recovery["source_sha256"] = {name: hashlib.sha256(value).hexdigest()
                                      for name, value in metadata.items()}

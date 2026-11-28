@@ -1202,6 +1202,114 @@ def unfilled_stop(tmp_path, monkeypatch):
     return env
 
 
+@pytest.fixture
+def settled_data_unavailable_archive(tmp_path, monkeypatch):
+    import btc5m_live_events as live
+
+    run = 'btc5m-live-6f81c6cf5f724702'
+    reports = Path('data/reports')
+    evidence = reports / '2026-11-27-btc5m-controlled-paper/evidence'
+    archive = evidence / run
+    attempt = evidence / 'launch-attempts' / run
+    gas = (reports / '2026-11-27-btc5m-data-unavailable-stop/evidence'
+           / 'takeover-gas-6f81c6cf5f724702/chain-audit-projection.json')
+    inputs = [archive / name for name in ('started.json', 'ended.json', 'events.jsonl',
+                                          'public-config.json', 'live-context.json')]
+    inputs.extend((attempt / 'attempt-reserved.json', attempt / 'reconciliation.json', gas))
+    for path in inputs:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((REAL_ROOT / path).read_bytes())
+    started = json.loads((tmp_path / archive / 'started.json').read_bytes())
+    old = {key: started[key] for key in ('run_id', 'risk_window_id', 'authorization_ref')}
+    old['candidate_digest'] = live.candidate_digest(started)
+    monkeypatch.setattr(launch, 'ROOT', tmp_path)
+    return SimpleNamespace(root=tmp_path, old=old, account=started['account_identity'],
+                           gas=tmp_path / gas, archive=tmp_path / archive,
+                           attempt=tmp_path / attempt)
+
+
+def test_settled_data_unavailable_enters_anchored_read_only_preparation(
+        settled_data_unavailable_archive):
+    env = settled_data_unavailable_archive
+    result = launch._stopped_window(env.old, env.account)
+    assert result['kind'] == 'ACCOUNT_READ'
+    assert result['budget_atoms'] == 74839800000000000001
+    assert len(set(result['orders'])) == len(result['orders']) == 32
+    assert result['unresolved'] == []
+    proof = result['recovery']
+    assert proof['net_loss_atoms'] == '4599166666666666666'
+    assert [len(proof['expected_history'][key]) for key in ('claimed_win', 'settled_zero')] == [9, 16]
+    assert proof['historical_gas'] == {'original_status': 'NOT_MEASURED',
+                                      'original_paid_atoms': None, 'direct_fee_atoms': '0'}
+
+
+@pytest.mark.parametrize('damage', ['missing_gas', 'changed_gas', 'modified_native'])
+def test_settled_data_unavailable_refuses_unbound_proof(settled_data_unavailable_archive, damage):
+    env = settled_data_unavailable_archive
+    if damage == 'missing_gas':
+        env.gas.unlink()
+    else:
+        target = env.gas if damage == 'changed_gas' else env.attempt / 'reconciliation.json'
+        target.write_bytes(target.read_bytes() + b' ')
+    with pytest.raises(launch.Refused, match='HISTORY_REQUIRES_TAKEOVER'):
+        launch._stopped_window(env.old, env.account)
+
+
+@pytest.mark.parametrize('fault,read_count', [(None, 2), ('gas_missing', 0),
+                                            ('first_partial', 1), ('history_drift', 2)])
+def test_settled_data_unavailable_real_main(native_main, settled_data_unavailable_archive,
+                                             monkeypatch, fault, read_count):
+    import hashlib
+    import btc5m_control as control
+
+    env, archive = native_main, settled_data_unavailable_archive
+    env.old.update(archive.old)
+    env.collection.record = copy.deepcopy(env.old)
+    original = json.loads(env.activation.read_bytes())
+    original.update({key: env.old[key] for key in ('risk_window_id', 'authorization_ref', 'candidate_digest')})
+    env.activation.write_text(json.dumps(original))
+    activation_before = env.activation.read_bytes()
+    replay = launch._stopped_window(env.old, env.account)
+    calls = []
+    digests = []
+
+    def fake_read(config, rpc_url, orders, output, *, environment):
+        assert env.collection.record == env.old and env.activation.read_bytes() == activation_before
+        assert orders == replay['orders']
+        assert json.loads(Path(config).read_bytes())['controlled_run']['budget_usdt'] == '74.839800000000000001'
+        calls.append(output)
+        facts = reconciliation(cash='92652512986227323799')
+        facts['account_identity'] = {key: value for key, value in env.account.items() if key != 'venue'}
+        facts['reconciliation']['declared_orders'] = list(orders)
+        facts['account'].update(positions=[], **copy.deepcopy(replay['recovery']['expected_history']))
+        facts['observation'] = {'finished_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        if fault == 'history_drift' and len(calls) == 2:
+            facts['account']['settled_zero'].pop()
+        raw = json.dumps(facts).encode()
+        output.write_bytes(raw)
+        digests.append(hashlib.sha256(raw).hexdigest())
+        return {'projection': facts, 'exit_code': 4 if fault == 'first_partial' else 0}
+
+    monkeypatch.setattr(control.local_signer, 'reconcile_account', fake_read)
+    if fault == 'gas_missing':
+        archive.gas.unlink()
+    args = ['--config', str(env.config), '--auto-prepare', '--run-id', 'btc5m-unattended-live-012',
+            '--authorization-ref', 'pascal-unattended-24h-20261122-012', '--evidence-root', str(env.root)]
+    assert launch.main(args) == (1 if fault else 0)
+    assert len(calls) == read_count
+    if fault:
+        assert env.calls == [] and env.children == []
+        assert env.activation.read_bytes() == activation_before and env.collection.record == env.old
+    else:
+        assert env.calls == ['delete', 'arm', 'child'] and len(env.children) == 1
+        proof = json.loads((calls[0].parent / 'account-read-recovery.json').read_bytes())
+        assert proof['fresh_read_sha256'] == digests
+        command = env.children[0][0]
+        assert [command[i + 1] for i, part in enumerate(command)
+                if part == '--predict-reconciled-order'] == replay['orders']
+
+
 def test_unfilled_stop_is_read_as_an_unfilled_order_not_a_takeover_refusal(unfilled_stop):
     """The real stopped window classifies as one unfilled order, not a refusal."""
     env = unfilled_stop

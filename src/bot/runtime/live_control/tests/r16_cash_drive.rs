@@ -75,12 +75,19 @@ use crate::service::predict_fun::controlled::r16_fixture;
 use crate::service::venue::{MarketData, MarketQuery, TradableMarket};
 use crate::service::observation::{Clock, FixtureClock};
 
-async fn adapter_fixture() -> (Arc<Broker>, Arc<FixtureClock>,
+pub(super) async fn adapter_fixture() -> (Arc<Broker>, Arc<FixtureClock>,
+    Arc<crate::service::predict_fun::PredictFunTrader>,
+    Arc<crate::service::predict_fun::account::tests::SyntheticRpc>, Arc<r16_fixture::Facts>) {
+    adapter_fixture_for_incident(false).await
+}
+
+async fn adapter_fixture_for_incident(incident: bool) -> (Arc<Broker>, Arc<FixtureClock>,
     Arc<crate::service::predict_fun::PredictFunTrader>,
     Arc<crate::service::predict_fun::account::tests::SyntheticRpc>, Arc<r16_fixture::Facts>) {
     let (mut broker, clock) = candidate_tests::risk_fixture();
     clock.set_utc(Utc::now() - chrono::Duration::minutes(10));
-    let (trader, transport, _, facts) = r16_fixture::trader();
+    let (trader, transport, _, facts) = if incident { r16_fixture::trader_with_r22_incident(true) }
+        else { r16_fixture::trader() };
     let baseline = trader.account_snapshot().await.unwrap();
     broker.identity = Some(trader.identity());
     broker.gate = Some(trader.gate.clone());
@@ -99,7 +106,7 @@ async fn adapter_fixture() -> (Arc<Broker>, Arc<FixtureClock>,
     (Arc::new(broker), clock, trader, transport, facts)
 }
 
-fn resolved(mut market: TradableMarket, payout: f64) -> TradableMarket {
+pub(super) fn resolved(mut market: TradableMarket, payout: f64) -> TradableMarket {
     market.open = false;
     market.end_price = Some(if payout == 1.0 { 101.0 } else if payout == 0.0 { 99.0 } else { 100.0 });
     market.payout_yes = Some(payout);
@@ -112,7 +119,7 @@ fn resolved(mut market: TradableMarket, payout: f64) -> TradableMarket {
     market
 }
 
-async fn send_round(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16_fixture::Facts,
+pub(super) async fn send_round(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16_fixture::Facts,
     core: &mut crate::bot::arbitrage::DecisionCore, id: u64) -> TradableMarket {
     let (market, book, evaluation) = candidate_tests::evaluate_live_round_with_core(clock, true, id, core);
     facts.round(market.clone());
@@ -750,6 +757,10 @@ impl crate::bot::runtime::Strategy for NextRound {
     async fn tick(&mut self, ctx: &crate::bot::runtime::Ctx) -> anyhow::Result<()> {
         assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0,
             "waiting drive must not run a strategy, and the original deadline ends after round two");
+        if ctx.broker.state.lock().live.claims.len() == 2 {
+            self.clock.advance(3_600_000);
+            return Ok(());
+        }
         self.clock.advance(300_000);
         let market = send_round(&ctx.broker, &self.clock, &self.facts, &mut self.core, 2).await;
         self.facts.round(resolved(market, 1.0));
@@ -810,6 +821,284 @@ async fn original_drive_cash_recovery(cash_first: bool) {
 #[tokio::test]
 async fn original_drive_result_first_recovers_and_posts_without_restart() {
     original_drive_cash_recovery(false).await;
+}
+
+use crate::bot::arbitrage::DecisionCore;
+use r16_fixture::{RedemptionFixture, RedemptionStage};
+
+async fn r22_place_rounds(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16_fixture::Facts,
+    two: bool) -> (DecisionCore, TradableMarket, Option<TradableMarket>) {
+    let mut core = DecisionCore::phase1(crate::config::BtcArbConfig { order_usd: 1.0, ..Default::default() });
+    let first = send_round(broker, clock, facts, &mut core, 1).await;
+    let second = if two {
+        clock.advance(300_000);
+        Some(send_round(broker, clock, facts, &mut core, 2).await)
+    } else { None };
+    (core, first, second)
+}
+
+async fn r22_prepare_settlement(broker: &Arc<Broker>, clock: &Arc<FixtureClock>, facts: &r16_fixture::Facts,
+    two: bool) -> (DecisionCore, Option<TradableMarket>, U256) {
+    let (core, first, second) = r22_place_rounds(broker, clock, facts, two).await;
+    clock.advance(270_000);
+    facts.round(resolved(first, 1.0));
+    (core, second, broker.state.lock().live.net_inventory[&1])
+}
+
+async fn r22_read_anchor(broker: &Broker, facts: &r16_fixture::Facts, script: RedemptionFixture) {
+    facts.script_redemption(script);
+    live::check_runtime_account(broker, false).await.unwrap();
+}
+
+fn r22_assert_cash_and_risk_blocked(state: &State, run: &ControlledLiveState) {
+    assert!(state.live.claims.is_empty());
+    assert!(run.account_read.is_none() && !run.may_add_risk());
+}
+
+#[tokio::test]
+async fn r22_projects_only_current_applied_canonical_fill_legs() {
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let (_, _, _) = r22_place_rounds(&broker, &clock, &facts, false).await;
+    let initial = {
+        let state = broker.state.lock();
+        let proof = &state.live.controlled.as_ref().unwrap().applied_fill_cash[&1];
+        assert_eq!(proof.generation, state.live.generation[&1]);
+        let [leg] = proof.legs.as_slice() else { panic!("expected one attributed leg"); };
+        assert_eq!(leg.log_index, U256::from(1));
+        assert!(!leg.incoming);
+        assert_eq!(leg.atoms, state.live.net_cash[&1]);
+        proof.clone()
+    };
+    use crate::service::predict_fun::account::runtime_claims::capture_fill_evidence;
+    let (read, proof) = capture_fill_evidence(trader.execution_snapshot(initial.identity.signed_hash.as_deref().unwrap())).await;
+    let unconsumed = read.unwrap();
+    assert!(proof.is_some());
+    assert!(unconsumed.generation > initial.generation);
+    assert_eq!(broker.state.lock().live.controlled.as_ref().unwrap().applied_fill_cash[&1].generation, initial.generation);
+    *facts.mixed_fill_receipt.lock().unwrap() = true;
+    live::sync_predict(&broker).await.unwrap();
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(state.live.generation[&1] > unconsumed.generation, "legacy net still passes");
+    assert!(!run.applied_fill_cash.contains_key(&1));
+    assert!(state.live.claims.is_empty());
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn r22_runtime_batch_binds_only_single_lag_at_applied_generation() {
+    use live::claims::{bind_position_lag, closed_inventory, read_runtime_batch};
+    use crate::service::predict_fun::account::runtime_claims::{cash_census_tests::assert_native_market_binding, PositionLag};
+    let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+    let (_, first, second) = r22_place_rounds(&broker, &clock, &facts, true).await;
+    facts.round(resolved(first, 1.0));
+    facts.round(resolved(second.unwrap(), 1.0));
+    assert_native_market_binding(r16_fixture::data(&trader).as_ref()).await;
+    let closed = closed_inventory(&broker.state.lock());
+    facts.stale_positions.lock().unwrap().extend([77, 177]);
+    facts.pay(77);
+    let lag = read_runtime_batch(&broker, trader.as_ref(), &closed).await.0.unwrap_err()
+        .downcast::<PositionLag>().unwrap();
+    let owner = bind_position_lag(&broker.state.lock(), &closed, &lag).unwrap();
+    assert_eq!(owner.identity.local_attempt_id, 1);
+    assert_eq!(lag.quantity, broker.state.lock().live.net_inventory[&1]);
+    {
+        let mut state = broker.state.lock();
+        let proofs = &mut state.live.controlled.as_mut().unwrap().applied_fill_cash;
+        let proof = proofs.remove(&1).unwrap();
+        assert!(bind_position_lag(&state, &closed, &lag).is_none());
+        state.live.controlled.as_mut().unwrap().applied_fill_cash.insert(1, proof);
+    }
+    let fresh = trader.execution_snapshot(owner.identity.signed_hash.as_deref().unwrap()).await.unwrap();
+    assert!(fresh.generation > owner.validated_read_generation);
+    let fence = read_runtime_batch(&broker, trader.as_ref(), &closed).await.0.unwrap_err();
+    assert!(!fence.is::<PositionLag>(), "adapter fence must reject the unapplied read");
+    facts.pay(177);
+    let second = read_runtime_batch(&broker, trader.as_ref(), &closed).await.0.unwrap_err();
+    assert!(!second.is::<PositionLag>());
+    assert!(second.to_string().contains("INVENTORY_MISMATCH"));
+    live::check_runtime_account(&broker, false).await.unwrap_err();
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    r22_assert_cash_and_risk_blocked(&state, run);
+    assert_eq!(transport.signs.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn r22_native_official_batch_proves_lag_without_releasing_stop() {
+    use live::claims::{closed_inventory, read_runtime_batch};
+    use crate::service::predict_fun::account::runtime_claims::cash_census_tests::assert_lag_cash_evidence;
+    use r16_fixture::{RedemptionFixture, RedemptionStage::Before};
+    for (fault, wall) in [(None, true), (None, false), (Some("condition"), false), (Some("token"), false), (Some("route"), false), (Some("block"), false), (Some("generation"), false), (Some("foreign"), false)] {
+        let (broker, clock, trader, transport, facts) = adapter_fixture().await;
+        r22_prepare_settlement(&broker, &clock, &facts, false).await;
+        let lane = broker.live_operation_lane().unwrap();
+        let _lane = lane.lock().await;
+        r22_read_anchor(&broker, &facts, RedemptionFixture::new(Before)).await;
+        let (left, closed) = {
+            let state = broker.state.lock();
+            (state.live.controlled.as_ref().unwrap().cash_anchor.as_ref().unwrap().0.clone(), closed_inventory(&state))
+        };
+        if fault == Some("generation") { trader.execution_snapshot(closed[0].identity.signed_hash.as_deref().unwrap()).await.unwrap(); }
+        facts.script_lag_fault(closed[0].inventory_atoms, fault);
+        let error = read_runtime_batch(&broker, trader.as_ref(), &closed).await.0.unwrap_err();
+        assert_lag_cash_evidence(error, fault, &left, &closed[0]);
+        let result = live::check_runtime_account(&broker, false).await;
+        if fault.is_none() {
+            result.unwrap(); { let mut state = broker.state.lock(); let run = state.live.controlled.as_mut().unwrap(); assert!(run.r22_wait.is_some() && run.account_read.is_none() && !run.may_add_risk()); for kind in [FailureKind::Read, FailureKind::Execution, FailureKind::Settlement, FailureKind::Valuation] { run.clear_failure(kind); } }
+            let sampled = clock.now().unwrap(); if wall { clock.set_utc(sampled.utc + chrono::Duration::seconds(120)); } else { clock.advance(120_000); clock.set_utc(sampled.utc); }
+            broker.wait_controlled_stop().await; let state = broker.state.lock(); let run = state.live.controlled.as_ref().unwrap(); let control = run.control.lock();
+            assert_eq!(control.stop.as_ref().unwrap().reason, "RECONCILIATION_REQUIRED"); assert_eq!(control.stop.as_ref().unwrap().detail.as_deref(), Some("INVENTORY_MISMATCH")); drop(control); assert!(run.account_read.is_none() && !run.may_add_risk());
+        } else { result.unwrap_err(); assert!(broker.state.lock().live.controlled.as_ref().unwrap().must_end()); }
+        assert!(broker.state.lock().live.claims.is_empty());
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1); assert_eq!(transport.signs.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn r22_incident_second_probe_then_original_send() {
+    r22_incident_drive(false, None, false).await;
+}
+
+#[tokio::test]
+async fn r22_refuses_conflicts_and_late_proof() {
+    r22_incident_drive(true, None, false).await;
+}
+
+#[tokio::test]
+async fn r22_independent_c_cash_requires_its_own_redemption() {
+    for foreign in [false, true] { r22_incident_drive(false, Some(foreign), false).await; }
+}
+
+#[tokio::test]
+async fn r22_rejects_independent_c_cash_without_early_target_proof() {
+    r22_incident_drive(false, Some(false), true).await;
+}
+
+async fn r22_incident_drive(late: bool, independent: Option<bool>, target_unpaid_at_a: bool) {
+    use std::time::Duration;
+    let _trace = tracing::subscriber::set_default(tracing_subscriber::fmt()
+        .with_ansi(false).with_max_level(tracing::Level::WARN).finish());
+    use r16_fixture::{RedemptionFixture, RedemptionStage, REDEMPTION_ATOMS};
+    let (broker, clock, trader, transport, facts) = adapter_fixture_for_incident(independent.is_none()).await;
+    let (core, second, expected) = r22_prepare_settlement(&broker, &clock, &facts, independent.is_some()).await;
+    if independent.is_none() { assert_eq!(expected, U256::from(REDEMPTION_ATOMS)); }
+    let initial_posts = if second.is_some() { 2 } else { 1 };
+    let script = |stage| RedemptionFixture::for_target(stage, 0xcc, expected);
+    r22_read_anchor(&broker, &facts, script(RedemptionStage::Before)).await;
+    facts.lag_target(script(RedemptionStage::Complete), !target_unpaid_at_a);
+    let a_cash = {
+        let lane = broker.live_operation_lane().unwrap(); let _operation = lane.lock().await;
+        live::check_runtime_account(&broker, false).await.unwrap();
+        let state = broker.state.lock(); let wait = state.live.controlled.as_ref().unwrap().r22_wait.as_ref().unwrap();
+        assert_eq!(wait.slots, 0);
+        assert_eq!(wait.proof.cash.payout.as_ref().map(|leg| leg.atoms), (!target_unpaid_at_a).then_some(expected));
+        wait.a.collateral
+    };
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut strategy = NextRound { core, clock: clock.clone(), facts: facts.clone(), calls: calls.clone() };
+    let client = r16_fixture::data(&trader);
+    let mut cfg = candidate_tests::ctx_fixture(broker.identity.as_ref().unwrap());
+    cfg.strategies.poll_secs = 1;
+    let ctx = crate::bot::runtime::Ctx { cfg, client: client.clone(), data: client, broker: broker.clone() };
+    let drive = crate::bot::runtime::drive(&mut strategy, &ctx);
+    tokio::pin!(drive);
+    let returned = tokio::time::timeout(Duration::from_millis(2100), &mut drive).await.ok();
+    {
+        let state = broker.state.lock();
+        let run = state.live.controlled.as_ref().unwrap();
+        assert_eq!((transport.posts.load(Ordering::SeqCst), transport.signs.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst)), (initial_posts, initial_posts, 0));
+        assert!(state.live.claims.is_empty() && run.attempt_outcomes.is_empty());
+        assert!(returned.is_none() && !run.must_end(),
+            "stale REST must keep drive waiting; drive={returned:?}; stop={:?}",
+            run.control.lock().stop.as_ref().map(|stop| (&stop.reason, &stop.detail)));
+        assert!(!run.may_add_risk() && run.account_read.is_none());
+        assert_eq!((run.r22_wait.as_ref().unwrap().slots, state.live.attempts.len()), (1, initial_posts));
+        assert!(state.live.reservations.values().all(U256::is_zero));
+    }
+    let mut closing = script(RedemptionStage::After);
+    if let (Some(round), Some(foreign)) = (second, independent) {
+        facts.round(resolved(round, 1.0));
+        closing.next = Some((broker.state.lock().live.net_inventory[&2], foreign));
+        facts.pay(177);
+    }
+    facts.clear_target_lag(closing, target_unpaid_at_a);
+    let wall = clock.now().unwrap().utc;
+    clock.advance(if late { 120_000 } else { 30_000 });
+    if late { clock.set_utc(wall); } // Isolate the elapsed cutoff from the original wall failure budget.
+    tokio::time::timeout(Duration::from_secs(5), &mut drive).await.unwrap().unwrap();
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    assert!(run.emitter.is_finished());
+    let (final_posts, final_signs, strategy_calls) = (transport.posts.load(Ordering::SeqCst), transport.signs.load(Ordering::SeqCst), calls.load(Ordering::SeqCst));
+    if late || independent == Some(true) || target_unpaid_at_a {
+        let stop = run.control.lock().stop.clone().unwrap();
+        assert_eq!((stop.reason.as_str(), stop.detail.as_deref()), ("RECONCILIATION_REQUIRED", Some("INVENTORY_MISMATCH")));
+        r22_assert_cash_and_risk_blocked(&state, run);
+        assert_eq!((final_posts, final_signs, strategy_calls), (initial_posts, initial_posts, 0));
+    } else {
+        assert_eq!((final_posts, final_signs, strategy_calls), (2, 2, 1));
+        assert_eq!(state.live.claims.len(), 2);
+        assert_eq!(state.live.claims.get(&1), Some(&(expected, expected)));
+        if independent.is_some() {
+            let quantity = state.live.net_inventory[&2];
+            assert!(!quantity.is_zero() && run.r22_wait.is_none());
+            assert_eq!(run.cash_anchor.as_ref().unwrap().0.collateral, a_cash + quantity);
+            assert_eq!(state.live.claims.get(&2), Some(&(quantity, quantity)));
+            assert!(run.attempt_outcomes[&1].cash_confirmed && run.attempt_outcomes[&2].cash_confirmed);
+        }
+    }
+}
+
+#[tokio::test]
+async fn r22_rejects_independent_payout_at_admission() {
+    r22_assert_admission_refused(false).await;
+}
+
+#[tokio::test]
+async fn r22_rejects_existing_r16_cash_wait_for_another_attempt() {
+    r22_assert_admission_refused(true).await;
+}
+
+async fn r22_assert_admission_refused(existing_r16_wait: bool) {
+    let (broker, clock, _, transport, facts) = adapter_fixture().await;
+    let (_, second, expected) = r22_prepare_settlement(&broker, &clock, &facts, true).await;
+    let second = resolved(second.unwrap(), 1.0);
+    facts.round(second.clone());
+    let script = |stage| RedemptionFixture::for_target(stage, 0xcc, expected);
+    let lane = broker.live_operation_lane().unwrap();
+    let _operation = lane.lock().await;
+    r22_read_anchor(&broker, &facts, script(RedemptionStage::Before)).await;
+    let wait = if existing_r16_wait {
+        let events = crate::bot::runtime::live_accounting::apply_official_result(
+            &mut broker.state.lock(), &second, false, false).unwrap().unwrap();
+        crate::bot::runtime::live_events::flush_events(events).unwrap();
+        Some(broker.state.lock().live.controlled.as_ref().unwrap().cash_wait.clone().unwrap())
+    } else {
+        None
+    };
+    let mut admission = script(if existing_r16_wait { RedemptionStage::Complete } else { RedemptionStage::After });
+    if wait.is_none() {
+        admission.next = Some((broker.state.lock().live.net_inventory[&2], false));
+    }
+    facts.lag_target(admission, true);
+    if wait.is_none() { facts.pay(177); }
+    live::check_runtime_account(&broker, false).await.unwrap_err();
+    let state = broker.state.lock();
+    let run = state.live.controlled.as_ref().unwrap();
+    let stop = run.control.lock().stop.clone().unwrap();
+    assert_eq!((stop.reason.as_str(), stop.detail.as_deref()), ("RECONCILIATION_REQUIRED", Some("INVENTORY_MISMATCH")));
+    if let Some(wait) = wait {
+        assert_eq!(run.cash_wait.as_ref(), Some(&wait));
+        assert!(!run.attempt_outcomes[&2].cash_confirmed && !run.attempt_outcomes.contains_key(&1));
+    } else {
+        assert!(run.attempt_outcomes.is_empty());
+        assert_eq!(run.cash_anchor.as_ref().unwrap().0.number, 0x124);
+    }
+    assert!(run.r22_wait.is_none() && run.account_read.is_none() && !run.may_add_risk());
+    assert!(state.live.claims.is_empty() && state.live.reservations.values().all(U256::is_zero));
+    assert_eq!((transport.posts.load(Ordering::SeqCst), transport.signs.load(Ordering::SeqCst)), (2, 2));
 }
 
 #[tokio::test]

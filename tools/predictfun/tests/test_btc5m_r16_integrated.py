@@ -2,15 +2,70 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 from test_btc5m_live_events import native_stream, metadata, ended_from_native
+import btc5m_control as control
 import btc5m_live_events as live
+
+
+# The pipe child replays intact Rust frames, never trading or signing. At an
+# ACK it checks the on-disk prefix before emitting any subsequent frame.
+_R22_PIPE_CHILD = r'''
+import json
+import signal
+import sys
+from pathlib import Path
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+wire, events_path, fault_at = sys.argv[1:]
+fault_at = int(fault_at)
+expected = []
+for index, frame in enumerate(Path(wire).read_bytes().splitlines(keepends=True)):
+    if index == fault_at:
+        sys.stdout.buffer.write(b"BTC5M_EVENT {\n")
+        sys.stdout.buffer.flush()
+        # EOF is the supervisor's stop barrier. Send the original closure and
+        # following order frames only after it; no further ACK is allowed.
+        if sys.stdin.buffer.read() != b"":
+            sys.exit(43)
+    sys.stdout.buffer.write(frame)
+    sys.stdout.buffer.flush()
+    if 0 <= fault_at <= index:
+        continue
+    event = json.loads(frame[len(b"BTC5M_EVENT "):])
+    expected.append(event["event_seq"])
+    payload = event["payload"]
+    if (event["event_kind"] == "order" and payload["attempt_phase"] == "PREPARED"
+            and payload["signed_hash"] is not None and payload["reason"] == "NONE"):
+        ack = f"A {event['event_seq']} {payload['signed_hash']}\n".encode("ascii")
+        if sys.stdin.buffer.readline() != ack:
+            sys.exit(42)
+        persisted = [json.loads(line) for line in Path(events_path).read_bytes().splitlines()]
+        if [row["event_seq"] for row in persisted] != expected or (
+                persisted[-1]["payload"]["signed_hash"] != payload["signed_hash"]):
+            sys.exit(44)
+'''
+
+
+def _r22_prepared(event: dict) -> bool:
+    payload = event["payload"]
+    return (event["event_kind"] == "order" and payload["attempt_phase"] == "PREPARED"
+            and payload["signed_hash"] is not None and payload["reason"] == "NONE")
+
+
+def _r22_new_risk(event: dict) -> bool:
+    kind, payload = event["event_kind"], event["payload"]
+    return (_r22_prepared(event)
+            or (kind == "reservation" and payload["action"] == "RESERVE")
+            or (kind == "decision" and payload["decision"]["phase"] == "FINAL_SEND"))
 
 
 class R16RelationsTests(unittest.TestCase):
@@ -158,6 +213,181 @@ class R16RelationsTests(unittest.TestCase):
                     finally:
                         store.close()
 
+
+    def _r22_frames(self, fixture: str) -> list[bytes]:
+        name = "bot::runtime::live_control::r16_cash_drive::" + fixture
+        result = subprocess.run(
+            ["cargo", "test", "--locked", "--offline", "--target-dir", os.environ["CARGO_TARGET_DIR"],
+             "--lib", name, "--", "--exact", "--nocapture"],
+            cwd=Path(__file__).resolve().parents[3], capture_output=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode() + result.stdout.decode())
+        self.assertIn(b"1 passed", result.stdout)
+        frames = [line for line in result.stdout.splitlines(keepends=True)
+                  if line.startswith(live.EVENT_PREFIX)]
+        self.assertTrue(frames)
+        return frames
+
+    def _supervise_r22(self, frames: list[bytes], *, fault_at: int = -1) -> tuple:
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"], prefix="r22-pipe-") as root:
+            directory = Path(root) / "run"
+            wire = Path(root) / "native.txt"
+            wire.write_bytes(b"".join(frames))
+            store = live.LiveEventStore(directory, *metadata(frames[0]))
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-B", "-c", _R22_PIPE_CHILD, str(wire),
+                     str(directory / "events.jsonl"), str(fault_at)],
+                    env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                now = datetime.datetime.now(datetime.timezone.utc)
+                facts, final = control.supervise(process, store, now, control.boottime(),
+                                                 run_seconds=10)
+                control.finish_live_evidence(store, facts, final)
+                read = live.read_live_run(directory)
+                persisted = (directory / "events.jsonl").read_bytes()
+                self.assertEqual(persisted, b"".join(live.canonical(event) + b"\n"
+                                                    for event in read["events"]))
+                self.assertEqual(facts["events"], len(read["events"]))
+                self.assertEqual(facts["child_returncode"], 0, (facts, read["reasons"]))
+                self.assertFalse(facts["forced_cleanup"])
+                return facts, final, read, len(store.relations.attempts)
+            finally:
+                store.close()
+
+    def test_r22_original_drive_stream_and_irreversible_stop(self) -> None:
+        frames = self._r22_frames("r22_incident_second_probe_then_original_send")
+        facts, final, read, attempts = self._supervise_r22(frames)
+        self.assertEqual(facts["launcher_exit"], 0, facts)
+        self.assertIsNotNone(final)
+        self.assertEqual(final["payload"]["stop_reason"], "DEADLINE")
+        self.assertTrue(final["payload"]["takeover_required"])
+        self.assertTrue(final["payload"]["cash_complete"])
+        self.assertEqual(final["payload"]["positions"], [])
+        self.assertEqual(attempts, 2)
+        self.assertEqual(read["status"], "COMPLETE", read["reasons"])
+        events = read["events"]
+        self.assertEqual(events, [live.validate_live_event(frame) for frame in frames])
+        target = [event for event in events if event["event_kind"] == "payout"
+                  and event["token"] == "77"]
+        self.assertEqual([event["payload"]["status"] for event in target],
+                         ["CASH_PENDING", "CASH_CONFIRMED"])
+        self.assertEqual(target[-1]["payload"]["cash_received_atoms"], "2332400000000000000")
+        send = next(event for event in events if event["market_id"] == "2"
+                    and event["event_kind"] == "decision"
+                    and event["payload"]["decision"]["phase"] == "FINAL_SEND")
+        prepared = [event for event in events if _r22_prepared(event)]
+        self.assertEqual([event["market_id"] for event in prepared], ["1", "2"])
+        fault_at = events.index(target[-1])
+        self.assertLess(prepared[0]["event_seq"], target[-1]["event_seq"])
+        self.assertLess(target[-1]["event_seq"], prepared[1]["event_seq"])
+        self.assertLess(target[-1]["event_seq"], send["event_seq"])
+
+        # After the malformed line closes the control channel, replay the exact
+        # remaining bytes (including closure, PREPARED, FINAL_SEND and final).
+        facts, final, read, attempts = self._supervise_r22(frames, fault_at=fault_at)
+        self.assertEqual((facts["launcher_exit"], facts["stop_reason"], facts["stop_output"]),
+                         (1, "OUTPUT_INVALID", "WRITTEN"))
+        self.assertIsNone(final)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(read["events"], events[:fault_at])
+        self.assertEqual(read["status"], "INCOMPLETE", read["reasons"])
+        ended = read["ended"]
+        self.assertEqual(ended["exit_facts"]["stop_reason"], "OUTPUT_INVALID")
+        self.assertEqual(ended["incomplete_reason"], "AUDIT_UNAVAILABLE")
+        self.assertIsNone(ended["final_event_seq"])
+        self.assertFalse(ended["cash_complete"])
+        self.assertTrue(ended["takeover_required"])
+
+        late_frames = self._r22_frames("r22_refuses_conflicts_and_late_proof")
+        facts, final, read, attempts = self._supervise_r22(late_frames)
+        self.assertEqual(facts["launcher_exit"], 0, facts)
+        self.assertEqual(read["events"], [live.validate_live_event(frame) for frame in late_frames])
+        stops = [event for event in read["events"] if event["event_kind"] == "stop"]
+        self.assertTrue(stops)
+        for stop in stops:
+            self.assertEqual(stop["payload"]["reason"], "RECONCILIATION_REQUIRED")
+            self.assertEqual(stop["payload"]["stop_detail"], "INVENTORY_MISMATCH")
+        hard_stop = stops[0]
+        self.assertFalse(any(_r22_new_risk(event) for event in read["events"]
+                             if event["event_seq"] > hard_stop["event_seq"]))
+        self.assertFalse(any(event["event_kind"] == "payout"
+                             and event["payload"]["status"] == "CASH_CONFIRMED"
+                             for event in read["events"]))
+        self.assertIsNotNone(final)
+        self.assertEqual(final["payload"]["stop_reason"], "RECONCILIATION_REQUIRED")
+        self.assertTrue(final["payload"]["takeover_required"])
+        self.assertFalse(final["payload"]["cash_complete"])
+        self.assertEqual(attempts, 1)
+        self.assertEqual(read["status"], "INCOMPLETE", read["reasons"])
+        self.assertEqual(read["ended"]["exit_facts"]["stop_reason"], "RECONCILIATION_REQUIRED")
+        self.assertEqual(read["ended"]["incomplete_detail"], "INVENTORY_MISMATCH")
+        self.assertEqual(read["ended"]["incomplete_reason"], "FACT_INCOMPLETE")
+        reserve = next(event for event in events if event["market_id"] == "2"
+                       and event["event_kind"] == "reservation"
+                       and event["payload"]["action"] == "RESERVE")
+        for proposal in (reserve, send):
+            with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"], prefix="r22-refuse-") as root:
+                store = live.LiveEventStore(Path(root) / "run", *metadata(frames[0]))
+                try:
+                    index = events.index(proposal)
+                    for frame in frames[:index]:
+                        store.append(frame)
+                    # Only the hard-stop fact comes from the second native run.
+                    # Sequence, time and accounting belong to this valid prefix.
+                    context = events[index - 1]
+                    stop = dict(hard_stop, event_seq=proposal["event_seq"],
+                                event_time=context["event_time"], accounting=context["accounting"])
+                    store.append(live.EVENT_PREFIX + json.dumps(stop).encode() + b"\n")
+                    event_path = store.directory / "events.jsonl"
+                    before = event_path.read_bytes()
+                    acks = []
+                    after_stop = dict(proposal, event_seq=proposal["event_seq"] + 1)
+                    with self.assertRaisesRegex(live.LiveInvalid, "OUTPUT_INVALID"):
+                        store.append(live.EVENT_PREFIX + json.dumps(after_stop).encode() + b"\n", acks.append)
+                    self.assertEqual(acks, [])
+                    self.assertEqual(event_path.read_bytes(), before)
+                finally:
+                    store.close()
+
+    def test_r22_independent_cash_is_audited_once_per_claim(self) -> None:
+        frames = self._r22_frames("r22_independent_c_cash_requires_its_own_redemption")
+        batches: list[list[bytes]] = [[]]
+        for frame in frames:
+            batches[-1].append(frame)
+            if live.validate_live_event(frame)["event_kind"] == "final":
+                batches.append([])
+        self.assertEqual(len(batches), 3)
+        self.assertEqual(batches[-1], [])
+        for stream, success in zip(batches[:2], (True, False)):
+            with self.subTest(success=success), tempfile.TemporaryDirectory(
+                dir=os.environ["TMPDIR"], prefix="r22-independent-",
+            ) as root:
+                store = live.LiveEventStore(Path(root) / "run", *metadata(stream[0]))
+                try:
+                    confirmed = []
+                    for frame in stream:
+                        event = store.append(frame)
+                        if (event["event_kind"] == "payout"
+                                and event["payload"]["status"] == "CASH_CONFIRMED"):
+                            confirmed.append((event["token"], event["payload"]["cash_received_atoms"]))
+                    final = store.relations.final
+                    assert final is not None
+                    self.assertEqual(sorted(confirmed),
+                                     [("177", "2475000000000000000"), ("77", "2475000000000000000")]
+                                     if success else [])
+                    self.assertEqual(final["payload"]["cash_complete"], success)
+                    self.assertEqual(final["payload"]["stop_reason"],
+                                     "DEADLINE" if success else "RECONCILIATION_REQUIRED")
+                    ended = ended_from_native(final)
+                    if success:
+                        ended["incomplete_reason"] = None
+                    store.finish(ended)
+                    self.assertEqual(live.read_live_run(store.directory)["status"],
+                                     "COMPLETE" if success else "INCOMPLETE")
+                finally:
+                    store.close()
 
     def test_native_adapter_rejection_details_are_strict_valid_projections(self) -> None:
         cases = (

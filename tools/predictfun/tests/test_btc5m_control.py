@@ -440,6 +440,50 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(len(collection.documents), 1)
         self.assertEqual(next(iter(collection.documents.values()))["state"], "ARMED")
 
+    _r3_release = "data/reports/2026-11-27-btc5m-data-unavailable-stop/evidence/release-r3-4194"
+    _r3_live_sha = "4e9d2dd2d6557354c221b070062069344d232366406fdff60436b3529c83b48c"
+
+    def _assert_r3_identity(self, identity):
+        """Check the live consumer against the immutable R21 base and reviewed R3 delta."""
+        root = control.BOT.parents[4]
+        historical = (root / "data/reports/2026-11-27-btc5m-controlled-paper/evidence"
+                      / "btc5m-live-6f81c6cf5f724702/started.json").read_bytes()
+        self.assertEqual(hashlib.sha256(historical).hexdigest(),
+                         "07d82696d5fb39fe848c249b3e8481ed093c1ab5d140c0abbee3a5b64dc6d09d")
+        r21 = json.loads(historical)["candidate_identity"]
+        self.assertEqual(identity["binary_sha256"], self._r3_live_sha)
+        self.assertEqual({key: value for key, value in identity.items()
+                          if key not in {"files", "binary_sha256"}},
+                         {key: value for key, value in r21.items()
+                          if key not in {"files", "binary_sha256"}})
+        old_files, files = r21["files"], identity["files"]
+        added = "src/bot/runtime/live_control/tests/settlement_recheck.rs"
+        # Fixed post-image hashes from run-4193-r3-review.md.
+        reviewed = {
+            "src/bot/runtime/live_accounting.rs":
+                "e6f37dc13d1787f19f2f6048ffa7e000945d5c8a3856ee969cf704e583cbe2c8",
+            "src/bot/runtime/live_control.rs":
+                "d97cab80abb9b6d96e9dff507585b3fd5c472386acfb278df9fc75ade717803a",
+            "src/bot/runtime/live_control/tests.rs":
+                "6fd44d2f175f5af55cbd91ac2272f2f822d04d069a3c8c6fd93f34d5fc2f5bce",
+            added: "2904ced02ff1a0a6ab626a8424e653afd14dccfae665e997c0a0d77748e9ab30",
+        }
+        python_paths = {"tools/predictfun/btc5m_control.py", "tools/predictfun/local_signer.py",
+                        "tools/predictfun/tests/test_btc5m_control.py",
+                        "tools/predictfun/btc5m_launch.py", "tools/predictfun/btc5m_account_recovery.py",
+                        "tools/predictfun/tests/test_btc5m_launch.py"}
+        self.assertEqual((len(old_files), len(files)), (98, 99))
+        self.assertEqual(set(files) - set(old_files), {added})
+        self.assertFalse(set(old_files) - set(files))
+        self.assertEqual({path for path, digest in old_files.items() if files[path] != digest},
+                         (set(reviewed) - {added}) | python_paths)
+        for path, expected in reviewed.items():
+            self.assertEqual(files[path], expected, path)
+        for path in python_paths:
+            self.assertEqual(files[path], hashlib.sha256((control.BOT / path).read_bytes()).hexdigest(),
+                             path)
+        return r21
+
     def test_deployed_identity_reaches_original_signed_dispatch_and_fixed_manifest(self):
         """Actual identity and controller; only storage/secret/child transports are fake."""
         instant = datetime.datetime.now(datetime.timezone.utc)
@@ -459,9 +503,7 @@ sys.exit(int(sys.argv[2]))
         loader.assert_called_once()
         builder.assert_called_once()
         command = child.call_args.args[0]
-        expected = control.BOT.parents[4] / (
-            "data/reports/2026-11-27-btc5m-fact-incomplete-stop/evidence/"
-            "context-root-fixed-candidate/polymarket-toolkits")
+        expected = control.BOT.parents[4] / self._r3_release / "polymarket-toolkits"
         self.assertEqual(command[0], str(expected))
         directory = root / args[args.index("--run-id") + 1]
         self.assertEqual(command[command.index("--controlled-live-manifest") + 1],
@@ -480,13 +522,13 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(hashlib.sha256(bound.read_bytes()).hexdigest(),
                          "3d0921d3ee2eb609276c1b87c996446b5eec9f144dcb63cd17543d22bea78e6a")
         prior_files = json.loads(bound.read_bytes())["public_identity"]["files"]
-        dispatched_files = started["candidate_identity"]["files"]
-        self.assertEqual((len(prior_files), len(dispatched_files)), (96, 98))
-        self.assertEqual(set(dispatched_files) - set(prior_files), {
+        r21_files = self._assert_r3_identity(started["candidate_identity"])["files"]
+        self.assertEqual((len(prior_files), len(r21_files)), (96, 98))
+        self.assertEqual(set(r21_files) - set(prior_files), {
             "tools/predictfun/btc5m_pre_send_exit_recovery.py",
             "tools/predictfun/tests/test_btc5m_pre_send_exit_recovery.py"})
-        self.assertFalse(set(prior_files) - set(dispatched_files))
-        self.assertEqual({path for path, digest in prior_files.items() if dispatched_files[path] != digest}, {
+        self.assertFalse(set(prior_files) - set(r21_files))
+        self.assertEqual({path for path, digest in prior_files.items() if r21_files[path] != digest}, {
             "tools/predictfun/btc5m_launch.py", "tools/predictfun/btc5m_control.py",
             "tools/predictfun/tests/test_btc5m_control.py"})
         self.assertIn("src/bot/runtime/live/closed_execution.rs", started["candidate_identity"]["files"])
@@ -624,6 +666,7 @@ sys.exit(int(sys.argv[2]))
                      "tools/predictfun/btc5m_live_events.py", "tools/predictfun/tests/test_btc5m_live_guard.py",
                      "tools/predictfun/tests/test_btc5m_live_events.py"}
         identity = control.public_identity({}, live=True)
+        r21_identity = self._assert_r3_identity(identity)
         repair_root = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-live003-fact-incomplete/evidence"
         validation = repair_root / "validation.json"
         self.assertEqual(hashlib.sha256(validation.read_bytes()).hexdigest(),
@@ -752,12 +795,13 @@ sys.exit(int(sys.argv[2]))
                      "tools/predictfun/tests/test_btc5m_pre_send_exit_recovery.py"}
         r21_changed = {"tools/predictfun/btc5m_launch.py", "tools/predictfun/btc5m_control.py",
                        "tools/predictfun/tests/test_btc5m_control.py"}
-        self.assertEqual((len(prior_files), len(identity["files"])), (96, 98))
-        self.assertEqual(set(identity["files"]) ^ set(prior_files), r21_added)
+        r21_files = r21_identity["files"]
+        self.assertEqual((len(prior_files), len(r21_files)), (96, 98))
+        self.assertEqual(set(r21_files) ^ set(prior_files), r21_added)
         self.assertTrue(r21_added.isdisjoint(prior_files))
-        self.assertEqual({path for path, digest in prior_files.items() if identity["files"][path] != digest},
+        self.assertEqual({path for path, digest in prior_files.items() if r21_files[path] != digest},
                          r21_changed)
-        self.assertEqual({k: identity[k] for k in identity if k != "files"},
+        self.assertEqual({k: r21_identity[k] for k in r21_identity if k != "files"},
                          {k: prior_identity[k] for k in prior_identity if k != "files"})
         self.assertIn("tools/predictfun/tests/test_btc5m_read_unavailable_recovery.py", identity["files"])
         protected = set(old_files) - allowed
@@ -772,9 +816,18 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(control.PAPER72_BINARY, evidence / "candidate-v2/polymarket-toolkits")
         self.assertEqual(hashlib.sha256(control.PAPER72_BINARY.read_bytes()).hexdigest(),
                          "8d4bfa158011e9f15c52ab0a87eb284e86686347956aac3dc3ecc5366857ccaa")
-        self.assertEqual(control.LIVE_BINARY, control.BOT.parents[4] /
-                         "data/reports/2026-11-27-btc5m-fact-incomplete-stop/evidence/"
-                         "context-root-fixed-candidate/polymarket-toolkits")
+        self.assertEqual(control.LIVE_BINARY,
+                         control.BOT.parents[4] / self._r3_release / "polymarket-toolkits")
+        reconcile = control.BOT.parents[4] / self._r3_release / "btc5m_reconcile"
+        reconcile_sha = "4f7399598107b44d0a521a3bb35a0f9327bf842fa80f2630bac01f3169a9033f"
+        self.assertEqual(local_signer.RECONCILE_BINARY, reconcile)
+        self.assertEqual(local_signer.RECONCILE_SHA256, reconcile_sha)
+        self.assertEqual(hashlib.sha256(reconcile.read_bytes()).hexdigest(), reconcile_sha)
+        old_reconcile = control.BOT.parents[4] / (
+            "data/reports/2026-11-27-btc5m-fact-incomplete-stop/evidence/"
+            "closed-reread-bound-candidate/btc5m_reconcile")
+        self.assertEqual(hashlib.sha256(old_reconcile.read_bytes()).hexdigest(),
+                         "178b251f0e23fdbc6a282471418b75aeecccc20a155ecbce316bd7c23b259f08")
         old_live = control.BOT.parents[4] / "data/reports/2026-11-21-btc5m-gas-payer-fix/evidence/candidate/polymarket-toolkits"
         self.assertEqual(hashlib.sha256(old_live.read_bytes()).hexdigest(),
                          "f8171a45bc6ca09d5f1bbbe4d3f35bba6fdd31927f86974930e5960dfa624043")
@@ -921,7 +974,9 @@ sys.exit(int(sys.argv[2]))
         self.assertEqual(current["binary_sha256"], hashlib.sha256(historical_binary.read_bytes()).hexdigest())
         self.assertEqual(current["file_count"], 65)
         self.assertEqual(current["file_count"], len(current["candidate_identity"]["files"]))
-        self.assertEqual(final_sha, "66f1286dae49bfc9b4ce2d7e66897c42d1034d20cccd341bfeac8f65d3482f21")
+        old_bound_live = binding.parent / "context-root-fixed-candidate/polymarket-toolkits"
+        self.assertEqual(hashlib.sha256(old_bound_live.read_bytes()).hexdigest(),
+                         "66f1286dae49bfc9b4ce2d7e66897c42d1034d20cccd341bfeac8f65d3482f21")
         self.assertEqual(current["scope"],
                          "deployed and bound; pending independent Validate; not activated or started")
         self.assertEqual({key: current[key] for key in public if key != "sha256"},

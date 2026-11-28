@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod claims;
+pub(super) mod claims;
 mod closed_execution;
 pub(crate) mod order_wait;
 
@@ -976,7 +976,7 @@ pub(super) async fn check_runtime_account(
     broker: &Broker,
     include_pending: bool,
 ) -> anyhow::Result<()> {
-    let (version, closed, controlled) = {
+    let (version, closed, lane) = {
         let mut state = broker.state.lock();
         if state.live.baseline.is_none()
             || (!include_pending
@@ -989,19 +989,30 @@ pub(super) async fn check_runtime_account(
             return Ok(());
         }
         if let Some(run) = state.live.controlled.as_mut() {
+            if run.r22_wait.is_some() {
+                run.advance_r22_boundary()?;
+                if order_wait::R22_PROBE.try_with(|_| ()).is_err()
+                    && crate::service::predict_fun::account::runtime_claims::OFFICIAL_BATCH.try_with(|_| ()).is_err() {
+                    return Ok(());
+                }
+            }
             run.tick_started_elapsed_ms = Some(run.phase1.clock.now()?.elapsed_ms);
         }
         ((state.live.next_attempt_id, state.live.generation.clone()),
-            claims::closed_inventory(&state), state.live.controlled.is_some())
+            claims::closed_inventory(&state), state.live.controlled.as_ref().map(|run| run.operation_lane.clone()))
     };
+    let controlled = lane.is_some();
     let result = async {
         let venue = broker.taker.as_ref().ok_or_else(|| anyhow::anyhow!("MISSING_VENUE"))?;
-        let observation = if controlled {
-            venue.runtime_account_observation(&closed).await?
+        let (observation, anchor, official) = if controlled {
+            let (read, anchor) = claims::read_runtime_batch(broker, venue.as_ref(), &closed).await;
+            super::live_control::check_r22_boundary(&mut broker.state.lock())?;
+            let Some((observation, closure, official)) = claims::resolve_batch(broker, venue.as_ref(), &closed, &version, read)? else { return Ok(false); };
+            (observation, closure.or(anchor), official)
         } else {
-            crate::service::venue::RuntimeAccountObservation {
+            (crate::service::venue::RuntimeAccountObservation {
                 snapshot: venue.account_snapshot().await?, bound_claims: Vec::new(),
-            }
+            }, None, None)
         };
         let mut snapshot = observation.snapshot;
         let mut state = broker.state.lock();
@@ -1020,27 +1031,11 @@ pub(super) async fn check_runtime_account(
         let records: Vec<AttemptRecord> =
             state.live.attempts.values().map(|handle| handle.lock().clone()).collect();
         let own_order = only_in_flight_order(records.iter()).map(str::to_string);
-        let mut changes = Vec::new();
-        for (id, handle) in &state.live.attempts {
-            let record = handle.lock();
-            if let (Some(cash), Some(inventory)) = (
-                state.live.net_cash.get(id),
-                state.live.net_inventory.get(id),
-            ) {
-                changes.push((
-                    record.identity.token_id.clone(),
-                    record.identity.side,
-                    *cash,
-                    *inventory,
-                ));
-            } else if record.phase != AttemptPhase::Closed {
-                anyhow::bail!("RECONCILIATION_REQUIRED:LOCAL_ACCOUNTING_UNPROVEN");
-            }
-        }
+        let changes = claims::applied_deltas(&state)?;
         let (claims, fresh) = if controlled {
             claims::runtime_payouts(&state, &observation.bound_claims, &snapshot.settled_zero)?
         } else { claimed_payouts(&state, &snapshot)? };
-        let mut booked_claims: Vec<(u64, U256, U256)> = Vec::new();
+        let mut booked_claims: Vec<(u64, U256, U256)> = Vec::new(); let mut events = Vec::new();
         // This flag is an input to the full equality check below, not a
         // bypass: only the Broker's atom equations may explain bound positions.
         snapshot.positions_explained = true;
@@ -1048,6 +1043,8 @@ pub(super) async fn check_runtime_account(
             state.live.baseline.as_ref().unwrap(), &snapshot, own_order.as_deref(), changes, claims)
             .and_then(|()| {
                 let mut commit = || {
+                    super::live_control::check_r22_boundary(&mut state)?;
+                    for market in official.iter().flatten() { events.extend(claims::commit_r22_official(&mut state, market)?); }
                     super::live_control::record_account_read(&mut state, &snapshot, checked.clone())?;
                     // The account read proves the exact claimed atoms arrived; this
                     // is the one place a claimed payout becomes ledger cash, and the
@@ -1076,13 +1073,13 @@ pub(super) async fn check_runtime_account(
                 }
             });
         if let Err(error) = &reconciled {
+            if error.is::<order_wait::R22BatchExpired>() { return Err(order_wait::R22BatchExpired.into()); }
             if let Some(run) = state.live.controlled.as_mut() {
                 run.account_read = None;
                 run.stop_with_detail("RECONCILIATION_REQUIRED", &account_failure_code(error),
                     true, checked.map_or_else(chrono::Utc::now, |time| time.utc));
             }
         }
-        let mut events = Vec::new();
         if let Some(checked) = checked {
             if let Some(event) = super::live_events::prepare_reconciliation(&state, &observed,
                 checked.utc, "RUNTIME", reconciled.is_ok(),
@@ -1101,9 +1098,14 @@ pub(super) async fn check_runtime_account(
         }
         drop(state);
         super::live_events::flush_events(events).map_err(anyhow::Error::msg)?;
-        reconciled
+        if let (Ok(()), Some(anchor), Some(lane), Some(checked)) = (&reconciled, anchor, lane, checked) {
+            super::live_control::promote_cash_anchor(broker, venue.as_ref(), &closed, &version,
+                &lane, &snapshot, checked, anchor);
+        }
+        reconciled.map(|()| true)
     }
     .await;
+    if matches!(result, Ok(false)) || result.as_ref().is_err_and(|error| error.is::<order_wait::R22BatchExpired>()) { return result.map(|_| ()); }
     // A read that failed before its own stop still names the code it held: the
     // first stop of this run carries it.
     if let Err(error) = &result {
@@ -1149,7 +1151,7 @@ pub(super) async fn check_runtime_account(
             gate.record_read_success(identity, "runtime_account");
         }
     }
-    result.map_err(public_account_error)
+    result.map(|_| ()).map_err(public_account_error)
 }
 
 /// The reason a failed account read stops the window with.
@@ -1188,8 +1190,8 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
         let Some(hash) = record.identity.signed_hash else {
             continue;
         };
-        let snapshot = match venue.execution_snapshot(&hash).await {
-            Ok(snapshot) => snapshot,
+        let (read, cash_evidence) = claims::read_sync_execution(broker, venue.execution_snapshot(&hash)).await;
+        let snapshot = match read { Ok(snapshot) => snapshot,
             Err(error) => {
                 order_wait::note_read_error(broker, &error);
                 if let (Some(gate), Some(identity)) = (&broker.gate, &broker.identity) {
@@ -1227,12 +1229,9 @@ pub(super) async fn sync_predict(broker: &Broker) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("RECONCILIATION_REQUIRED:{reason}"));
         }
         let mut state = broker.state.lock();
+        claims::remember_applied_fill(&mut state, &snapshot, cash_evidence);
         let closed = handle.lock().phase == AttemptPhase::Closed;
-        for resting in state
-            .resting
-            .values_mut()
-            .filter(|resting| resting.hash == hash)
-        {
+        for resting in state.resting.values_mut().filter(|resting| resting.hash == hash) {
             resting.filled = snapshot
                 .gross_q()
                 .map(wei_to_shares)

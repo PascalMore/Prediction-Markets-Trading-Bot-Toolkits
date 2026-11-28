@@ -175,6 +175,12 @@ pub struct ControlledLiveState {
     pub account_read: Option<LiveAccountRead>,
     /// Cash wait metadata, never a second balance ledger.
     pub cash_wait: Option<cash_wait::CashWait>,
+    // Bound whole-read admission and the pre-commit check independently.
+    pub(super) r22_wait: Option<super::live::claims::R22Wait>,
+    /// Last full reconciliation committed and audited on this run's lane.
+    pub(super) cash_anchor: Option<(crate::service::predict_fun::account::runtime_claims::CashAnchor,
+        crate::service::observation::CheckTime)>,
+    pub(super) applied_fill_cash: HashMap<u64, crate::service::predict_fun::account::runtime_claims::FillCashEvidence>,
     /// The bounded wait for one accepted order's complete execution facts.
     ///
     /// It holds no quantity, no cash and no release: the ledger's own atomic
@@ -365,6 +371,7 @@ impl ControlledLiveState {
             && !self.degraded
             && self.order_wait.is_none()
             && self.settlement_recheck.is_none()
+            && self.r22_wait.is_none()
     }
 
     /// Bound the next scheduled read and its reconciliation by both original clocks.
@@ -1263,6 +1270,9 @@ impl ControlledLiveState {
             output_failed,
             account_read: None,
             cash_wait: None,
+            r22_wait: None,
+            cash_anchor: None,
+            applied_fill_cash: HashMap::new(),
             order_wait: None,
             settlement_recheck: None,
             run_deadline_elapsed_ms,
@@ -1332,6 +1342,35 @@ impl ControlledLiveState {
 tokio::task_local! {
     // Only the account owner called by the active recheck gets this deadline.
     pub(super) static RECHECK_ACCOUNT_CUTOFF: std::cell::Cell<Option<(&'static str, DateTime<Utc>)>>;
+}
+
+pub(super) fn check_r22_boundary(state: &mut State) -> Result<()> {
+    let Some(run) = state.live.controlled.as_mut() else { return Ok(()); };
+    if run.r22_wait.is_some() { run.advance_r22_boundary()?; }
+    Ok(())
+}
+
+impl ControlledLiveState {
+    pub(super) fn advance_r22_boundary(&mut self) -> Result<()> {
+        cash_wait::observe_budget(self);
+        anyhow::ensure!(!self.control.lock().must_end(), "DATA_UNAVAILABLE");
+        let now = self.phase1.clock.now()?;
+        let budget = chrono::Duration::from_std(READ_FAILURE_BUDGET).unwrap_or_default();
+        if [self.read_failures.as_ref(), self.execution_failures.as_ref(), self.settlement_failures.as_ref(),
+            self.valuation_failures.as_ref()].into_iter().flatten().any(|failure| now.utc - failure.since >= budget) {
+            self.stop("READ_UNAVAILABLE", true, now.utc);
+            anyhow::bail!("READ_UNAVAILABLE");
+        }
+        if let Some(wait) = self.r22_wait.as_mut() {
+            if wait.remaining(now).is_none() {
+                self.stop_with_detail("RECONCILIATION_REQUIRED", "INVENTORY_MISMATCH", true, now.utc);
+                return Err(crate::service::predict_fun::account::runtime_claims::inventory_mismatch().into());
+            }
+            wait.last = now;
+            super::live::order_wait::check_r22_batch(now)?;
+        }
+        Ok(())
+    }
 }
 
 /// Capture the controlled clock at the official account response, before later awaits.
@@ -1481,6 +1520,56 @@ pub(super) fn record_account_read(
         run.account_read = Some(read);
     }
     Ok(())
+}
+
+/// Publish A0 only after the original reconciliation events were flushed.
+/// This is optional evidence: a failed recheck must not change legacy accounting.
+pub(super) fn promote_cash_anchor(
+    broker: &Broker, venue: &dyn crate::service::venue::OrderVenue,
+    closed: &[crate::service::venue::RuntimeClaimInventory], version: &(u64, HashMap<u64, u64>),
+    lane: &Arc<tokio::sync::Mutex<()>>, snapshot: &crate::service::venue::AccountSnapshot,
+    checked: crate::service::observation::CheckTime,
+    anchor: crate::service::predict_fun::account::runtime_claims::CashAnchor,
+) {
+    let mut state = broker.state.lock();
+    if version.0 != state.live.next_attempt_id || version.1 != state.live.generation
+        || super::live::claims::closed_inventory(&state) != closed || state.entry_stop_reason.is_some()
+        || state.live.reservations.values().any(|amount| !amount.is_zero())
+        || state.live.attempts.values().any(|attempt| {
+            attempt.lock().phase != crate::service::venue::AttemptPhase::Closed
+        })
+    { return; }
+    let _ = venue.with_runtime_claim_read_fence(closed, &mut || {
+        let Some(run) = state.live.controlled.as_ref() else { return Ok(()); };
+        let Ok(Some(now)) = account_receipt(&state) else { return Ok(()); };
+        let closing_r22 = run.r22_wait.is_some();
+        let original_retry = RECHECK_ACCOUNT_CUTOFF.try_with(|_| ()).is_ok();
+        if !Arc::ptr_eq(lane, &run.operation_lane) || run.must_end() || run.loss_latched
+            || run.emitter.output_failed() || run.emitter.is_finished() || run.degraded
+            || run.cash_wait.is_some() || run.order_wait.is_some()
+            || (run.settlement_recheck.is_some() && !(closing_r22 && original_retry))
+            || !snapshot.open_orders.is_empty() || anchor.identity != run.identity
+            || snapshot.collateral_atoms != Some(anchor.collateral)
+            || !run.account_read.as_ref().is_some_and(|read| {
+                read.checked == checked && &read.snapshot == snapshot && read.matches(&state.live, now)
+            }) || run.cash_anchor.as_ref().is_some_and(|(prior, at)| {
+                checked.utc < at.utc || checked.elapsed_ms < at.elapsed_ms
+                    || anchor.number < prior.number || anchor.timestamp < prior.timestamp
+                    || (anchor.number == prior.number && anchor != *prior)
+            })
+        { return Ok(()); }
+        let run = state.live.controlled.as_mut().unwrap();
+        if closing_r22 {
+            run.advance_r22_boundary()?;
+            run.r22_wait = None;
+            // The original R3 retry still has to match this exact receipt.
+            // Its drive must collect a separate read before any later send.
+            if !original_retry { run.account_read = None; }
+            run.pending_candidate = None;
+        }
+        run.cash_anchor = Some((anchor.clone(), checked));
+        Ok(())
+    });
 }
 
 /// Receipt freshness uses both clocks and includes the original ten-second boundary.

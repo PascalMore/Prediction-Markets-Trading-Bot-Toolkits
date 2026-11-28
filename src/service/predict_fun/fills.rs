@@ -1252,6 +1252,8 @@ impl PredictFunTrader {
             snapshot.accounting.net_cash = Field::Unknown("SETTLEMENT_UNPROVEN".into());
             snapshot.accounting.net_inventory = Field::Unknown("SETTLEMENT_UNPROVEN".into());
             bound.handle.lock().last_reason = Some(error.to_string());
+        } else {
+            super::account::runtime_claims::finish_fill_read(&snapshot);
         }
         Ok(snapshot)
     }

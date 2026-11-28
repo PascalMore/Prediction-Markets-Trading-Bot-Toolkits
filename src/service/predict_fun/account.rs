@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod controlled;
-mod runtime_claims;
+pub(crate) mod runtime_claims;
 #[cfg(test)]
 mod r16_tests;
 #[cfg(test)]
@@ -161,6 +161,7 @@ pub(super) struct ChainRead<'a> {
     trader: &'a PredictFunTrader,
     pub block: String,
     pub timestamp: U256,
+    hash: B256,
 }
 
 impl PredictFunTrader {
@@ -172,7 +173,7 @@ impl PredictFunTrader {
                 | "eth_getBalance"
                 | "eth_call"
                 | "eth_getTransactionReceipt"
-                | "eth_getBlockByNumber"
+                | "eth_getBlockByNumber" | "eth_getBlockReceipts"
         ) {
             return Err(read_error("RPC_METHOD_NOT_ALLOWED"));
         }
@@ -202,16 +203,7 @@ impl PredictFunTrader {
             return Err(read_error("RPC_HTTP"));
         }
         let body: Value = response.json().await.map_err(|_| read_error("RPC_JSON"))?;
-        if body.get("error").is_some()
-            || body.get("id") != Some(&json!(1))
-            || body.get("jsonrpc") != Some(&json!("2.0"))
-        {
-            return Err(read_error("RPC_RESPONSE"));
-        }
-        body.get("result")
-            .filter(|value| !value.is_null())
-            .cloned()
-            .ok_or_else(|| read_error("RPC_RESULT_MISSING"))
+        runtime_claims::decode_rpc_reply(body)
     }
 
     pub(super) async fn chain_read(&self) -> Result<ChainRead<'_>, VenueError> {
@@ -229,7 +221,7 @@ impl PredictFunTrader {
         let block = block?;
         let number = rpc_quantity(&block["number"])?;
         let timestamp = rpc_quantity(&block["timestamp"])?;
-        let _: B256 = block["hash"]
+        let hash: B256 = block["hash"]
             .as_str()
             .ok_or_else(|| read_error("BLOCK_HASH"))?
             .parse()
@@ -237,7 +229,7 @@ impl PredictFunTrader {
         Ok(ChainRead {
             trader: self,
             block: format!("{number:#x}"),
-            timestamp,
+            timestamp, hash,
         })
     }
 }
@@ -812,6 +804,7 @@ impl ChainRead<'_> {
             {
                 return Ok(false);
             }
+            runtime_claims::observe_fill_receipt(&receipt, identity, [owner, exchange, usdt, ctf], token, &expected);
         }
         Ok(true)
     }
